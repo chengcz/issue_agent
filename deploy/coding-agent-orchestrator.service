@@ -1,0 +1,25 @@
+[Unit]
+Description=Coding Agent Orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agent
+Group=agent
+WorkingDirectory=/opt/coding-agent-orchestrator
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/etc/cao/environment
+ExecStart=/opt/coding-agent-orchestrator/.venv/bin/cao --config /etc/cao/orchestrator.toml serve
+Restart=always
+RestartSec=10
+TimeoutStopSec=2h
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/agent-dev /var/lib/cao
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

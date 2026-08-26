@@ -1,0 +1,39 @@
+[runtime]
+repo = "/opt/agent-dev/repo"
+worktrees = "/opt/agent-dev/worktrees"
+state_db = "/opt/agent-dev/state/orchestrator.sqlite3"
+poll_seconds = 60
+max_workers = 3
+max_attempts = 3
+default_agent = "codex"
+reviewer_agent = "claude"
+dry_run = false
+
+[github]
+repo = "chengcz/coding-agent-orchestrator"
+base_branch = "main"
+ready_label = "agent-ready"
+
+[checks]
+commands = ["ruff check .", "pytest -q"]
+
+# If {prompt} is absent, the prompt is sent through stdin (safer for long Issues).
+[agents.codex]
+command = "codex exec --sandbox workspace-write -"
+max_workers = 2
+timeout_seconds = 7200
+
+[agents.claude]
+command = "claude -p"
+max_workers = 1
+timeout_seconds = 7200
+
+[agents.opencode]
+command = "opencode run -"
+enabled = false
+max_workers = 1
+
+# Any CLI can be integrated. Use {prompt} only when it cannot read stdin.
+[agents.custom]
+command = "my-agent --prompt {prompt}"
+enabled = false

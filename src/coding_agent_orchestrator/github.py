@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from .models import Issue
+from .process import run
+
+
+class GitHub:
+    def __init__(self, repo: str, cwd: Path, *, dry_run: bool = False):
+        self.repo = repo
+        self.cwd = cwd
+        self.dry_run = dry_run
+
+    async def _gh(self, *args: str, check: bool = True) -> str:
+        command = ["gh", *args]
+        if self.repo and "--repo" not in args:
+            command.extend(("--repo", self.repo))
+        result = await run(command, cwd=self.cwd, check=check)
+        return result.stdout
+
+    async def ready_issues(self, label: str, limit: int = 20) -> list[Issue]:
+        output = await self._gh(
+            "issue", "list", "--state", "open", "--label", label,
+            "--limit", str(limit), "--json", "number,title,body,labels,url",
+        )
+        return [
+            Issue(
+                number=item["number"], title=item["title"], body=item.get("body") or "",
+                labels=tuple(label["name"] for label in item.get("labels", [])), url=item.get("url", ""),
+            )
+            for item in json.loads(output)
+        ]
+
+    async def runnable_issues(self, ready_label: str, limit: int = 20) -> list[Issue]:
+        """Include interrupted jobs whose ready label was already removed."""
+        issues = await self.ready_issues(ready_label, limit)
+        interrupted = await self.ready_issues("agent-running", limit)
+        return list({issue.number: issue for issue in (*issues, *interrupted)}.values())
+
+    async def labels(self, number: int, *, add: tuple[str, ...] = (), remove: tuple[str, ...] = ()) -> None:
+        if self.dry_run:
+            return
+        args = ["issue", "edit", str(number)]
+        for label in add:
+            args.extend(("--add-label", label))
+        for label in remove:
+            args.extend(("--remove-label", label))
+        await self._gh(*args)
+
+    async def create_pr(self, number: int, branch: str, base: str, title: str, checks: tuple[str, ...]) -> str:
+        if self.dry_run:
+            return f"dry-run://pr/{number}"
+        body = "\n".join((f"Closes #{number}", "", "Automated checks:", *(f"- `{c}`" for c in checks), "", "Human review required."))
+        return (await self._gh("pr", "create", "--base", base, "--head", branch, "--title", title, "--body", body)).strip()
+
+    async def comment(self, number: int, body: str) -> None:
+        if not self.dry_run:
+            await self._gh("issue", "comment", str(number), "--body", body)

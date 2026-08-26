@@ -1,0 +1,6 @@
+.git
+.venv
+.cao
+__pycache__
+*.pyc
+orchestrator.toml

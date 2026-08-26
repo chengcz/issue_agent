@@ -1,0 +1,18 @@
+services:
+  orchestrator:
+    build: .
+    restart: unless-stopped
+    init: true
+    environment:
+      GH_TOKEN: ${GH_TOKEN:?set GH_TOKEN in .env}
+    volumes:
+      - ./orchestrator.toml:/config/orchestrator.toml:ro
+      - ${TARGET_REPO:?set TARGET_REPO in .env}:/workspace
+      - cao-state:/data/state
+      - cao-worktrees:/data/worktrees
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  cao-state:
+  cao-worktrees:

@@ -1,0 +1,21 @@
+name: Coding Agent Task
+description: A bounded implementation task for the orchestrator
+title: "[Agent] "
+labels: ["agent-ready"]
+body:
+  - type: textarea
+    id: goal
+    attributes: {label: Goal, description: One concrete outcome}
+    validations: {required: true}
+  - type: textarea
+    id: context
+    attributes: {label: Context and relevant files}
+  - type: textarea
+    id: requirements
+    attributes: {label: Requirements}
+    validations: {required: true}
+  - type: textarea
+    id: tests
+    attributes: {label: Required tests and acceptance criteria}
+    validations: {required: true}
+
