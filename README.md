@@ -24,7 +24,31 @@
 
 ## 快速开始
 
-要求：Python 3.11+、Git、GitHub CLI，以及至少一个 Agent CLI。
+### 系统依赖
+
+生产运行支持 Linux 和 macOS，需要：
+
+- Python 3.11 或更高版本，包含 `venv` 和 `pip`。
+- Git 2.30 或更高版本，并支持 `git worktree`。
+- GitHub CLI（`gh`），已对目标仓库完成认证。
+- 至少一个可非交互运行的 Coding Agent CLI，例如 Codex、Claude Code 或 OpenCode。
+- 目标仓库检查命令所需的构建工具，例如 Node.js、Go、Rust、Java 或数据库客户端。
+- Linux 使用 systemd；macOS 使用 launchd。
+- 到 GitHub、Agent 服务和项目依赖源的稳定网络连接。
+
+推荐每个 Worker 至少预留 2 个 CPU 核心和 2–4 GB 内存，并为仓库、worktree、依赖缓存及日志预留足够磁盘。最终容量取决于目标项目的编译和测试负载。
+
+安装后先检查：
+
+```bash
+python3 --version
+git --version
+gh --version
+gh auth status
+codex --version  # 或实际使用的 Agent CLI
+```
+
+开发依赖只用于维护本项目；生产安装可使用 `pip install .`，无需安装 `pytest` 和 `ruff`。
 
 ```bash
 git clone https://github.com/chengcz/coding-agent-orchestrator.git
@@ -98,7 +122,9 @@ commands = ["./scripts/check.sh"]
 
 长期运行必须部署到 Linux 或 macOS，并保证目标仓库、SQLite 状态库和 worktrees 位于持久磁盘。不要在 Windows 开发机上承载 7×24 Worker。
 
-Linux 使用 [deploy/coding-agent-orchestrator.service](deploy/coding-agent-orchestrator.service)，修改用户和路径后：
+完整部署、单机多仓库、升级、备份和故障排查参见 [部署与运维指南](deploy/README.md)。
+
+Linux 单仓库可使用 [deploy/coding-agent-orchestrator.service](deploy/coding-agent-orchestrator.service)，多仓库推荐使用 [deploy/cao@.service](deploy/cao@.service)：
 
 ```bash
 sudo cp deploy/coding-agent-orchestrator.service /etc/systemd/system/
@@ -124,7 +150,8 @@ tail -f /opt/coding-agent-orchestrator/logs/stdout.log
 - `cao --config /etc/cao/orchestrator.toml status` 查看持久状态。
 - 服务重启会把中断的内部状态标记为可重试，并重新领取仍带 `agent-running` 的 Issue。
 - SQLite、worktrees 和目标仓库必须位于持久磁盘，并定期备份 SQLite。
-- 只运行一个 orchestrator 实例；当前版本的资源锁是进程内锁，不支持多机竞争。
+- 每个目标仓库只运行一个 orchestrator 实例；不同仓库可以使用独立配置、状态库和 worktree 根目录并行运行。
+- 当前版本的资源锁是进程内锁，不支持多机竞争，也不能协调多个实例访问同一共享资源。
 
 ## 安全边界
 
