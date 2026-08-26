@@ -119,34 +119,6 @@ tail -f /opt/coding-agent-orchestrator/logs/stdout.log
 
 如需无人登录时也持续运行，应把 plist 安装为系统级 LaunchDaemon，并使用专用非管理员账户。
 
-### Linux/macOS Docker Compose
-
-容器方式适合把 orchestrator、目标仓库和 Agent CLI 全部放在同一持久环境中。先复制配置并把容器内路径设为：
-
-```toml
-[runtime]
-repo = "/workspace"
-worktrees = "/data/worktrees"
-state_db = "/data/state/orchestrator.sqlite3"
-```
-
-然后创建 `.env`（不要提交）：
-
-```dotenv
-GH_TOKEN=github_pat_xxx
-TARGET_REPO=/absolute/path/to/target/repository
-```
-
-基础镜像只安装 Python、Git 和 GitHub CLI。请在 `Dockerfile` 中安装并认证实际使用的 Agent CLI，再执行：
-
-```bash
-docker compose build
-docker compose up -d
-docker compose logs -f orchestrator
-```
-
-目标仓库与 worktree 必须使用容器内稳定路径；迁移宿主机目录后应重新创建 worktree。Linux 生产常驻更推荐 systemd，macOS 更推荐 launchd：二者都能直接复用宿主机已有的 Agent CLI 登录态。Docker Compose 仅用于 Linux/macOS，不把 Windows Docker Desktop 作为 7×24 部署方案。
-
 ### 运维检查
 
 - `cao --config /etc/cao/orchestrator.toml status` 查看持久状态。
