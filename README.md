@@ -2,6 +2,14 @@
 
 一个本地常驻、GitHub Issue 驱动的通用 Coding Agent 调度器。支持 Codex、Claude Code、OpenCode，以及任意可从 CLI 调用的 Agent。
 
+## 平台定位
+
+- **Linux**：7×24 生产常驻的首选平台，使用 systemd 托管。
+- **macOS**：7×24 常驻的支持平台，使用 launchd 托管。
+- **Windows**：仅作为本项目的开发、测试环境，不作为不间断任务的部署目标。
+
+调度器保留 Windows 命令执行兼容性，以便当前开发验证；生产运维、进程托管和故障恢复以 Linux/macOS 为准。
+
 ## 工作流
 
 1. 轮询带 `agent-ready` 标签的 GitHub Issues。
@@ -88,6 +96,8 @@ commands = ["./scripts/check.sh"]
 
 ## 持续运行
 
+长期运行必须部署到 Linux 或 macOS，并保证目标仓库、SQLite 状态库和 worktrees 位于持久磁盘。不要在 Windows 开发机上承载 7×24 Worker。
+
 Linux 使用 [deploy/coding-agent-orchestrator.service](deploy/coding-agent-orchestrator.service)，修改用户和路径后：
 
 ```bash
@@ -97,9 +107,19 @@ sudo systemctl enable --now coding-agent-orchestrator
 journalctl -u coding-agent-orchestrator -f
 ```
 
-macOS 使用 [deploy/com.cao.orchestrator.plist](deploy/com.cao.orchestrator.plist)，修改路径后放入 `~/Library/LaunchAgents/` 并用 `launchctl bootstrap` 加载。
+macOS 使用 [deploy/com.cao.orchestrator.plist](deploy/com.cao.orchestrator.plist)，修改路径并创建日志目录后：
 
-### Docker Compose
+```bash
+mkdir -p /opt/coding-agent-orchestrator/logs
+cp deploy/com.cao.orchestrator.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cao.orchestrator.plist
+launchctl kickstart -k gui/$(id -u)/com.cao.orchestrator
+tail -f /opt/coding-agent-orchestrator/logs/stdout.log
+```
+
+如需无人登录时也持续运行，应把 plist 安装为系统级 LaunchDaemon，并使用专用非管理员账户。
+
+### Linux/macOS Docker Compose
 
 容器方式适合把 orchestrator、目标仓库和 Agent CLI 全部放在同一持久环境中。先复制配置并把容器内路径设为：
 
@@ -125,7 +145,7 @@ docker compose up -d
 docker compose logs -f orchestrator
 ```
 
-目标仓库与 worktree 必须使用容器内稳定路径；迁移宿主机目录后应重新创建 worktree。生产常驻更推荐 systemd：它能直接复用宿主机已有的 Agent CLI 登录态。
+目标仓库与 worktree 必须使用容器内稳定路径；迁移宿主机目录后应重新创建 worktree。Linux 生产常驻更推荐 systemd，macOS 更推荐 launchd：二者都能直接复用宿主机已有的 Agent CLI 登录态。Docker Compose 仅用于 Linux/macOS，不把 Windows Docker Desktop 作为 7×24 部署方案。
 
 ### 运维检查
 
