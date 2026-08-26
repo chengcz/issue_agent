@@ -107,6 +107,34 @@ Issue 标签示例：
 - `resource:database-schema`：全局串行，避免 Alembic 多头迁移。
 - `agent-running`、`agent-failed`、`human-review`：由调度器维护。
 
+### 为不同任务使用不同 Claude 模型
+
+可以为每个 Claude 模型定义一个独立的 Agent 名称。实现命令使用目标模型，`review_command`
+使用复审模型：
+
+```toml
+[agents.claude_opus]
+command = "/Users/chengchaoze/.local/bin/claude -p --model opus --permission-mode acceptEdits"
+review_command = "/Users/chengchaoze/.local/bin/claude -p --model sonnet --permission-mode plan"
+max_workers = 1
+timeout_seconds = 7200
+
+[agents.claude_sonnet]
+command = "/Users/chengchaoze/.local/bin/claude -p --model sonnet --permission-mode acceptEdits"
+review_command = "/Users/chengchaoze/.local/bin/claude -p --model haiku --permission-mode plan"
+max_workers = 1
+timeout_seconds = 7200
+```
+
+Issue 添加 `agent:claude_opus` 或 `agent:claude_sonnet` 后，编排器会选择相应的实现模型。
+`reviewer_agent = "claude_opus"` 则表示所有任务统一使用该 Agent 的 `review_command`，也就是
+上例中的 Sonnet Review。当前版本的 `reviewer_agent` 是全局配置，不能仅靠标签让不同 Issue
+选择不同 Reviewer。
+
+如果需要按 Issue 选择 Reviewer，可约定 `reviewer:<name>` 标签，例如
+`reviewer:claude_sonnet`，并扩展调度器读取该标签；没有标签时回退到全局
+`reviewer_agent`。Review 命令应使用只读的 `--permission-mode plan`，避免 Reviewer 修改工作区。
+
 ## 目标项目约定
 
 目标项目应包含 `AGENTS.md`，Claude 项目可增加一个很短的 `CLAUDE.md`，只引用 `AGENTS.md`，避免规则分叉。建议把目标项目的检查统一为 `scripts/check.sh`，然后配置：
