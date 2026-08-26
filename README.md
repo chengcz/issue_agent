@@ -57,10 +57,10 @@ python3 -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev]'
 gh auth login
-cp orchestrator.example.toml orchestrator.toml
+cp orchestrator.example.toml autocode.toml
 ```
 
-编辑 `orchestrator.toml`：
+编辑 `autocode.toml`：
 
 - `runtime.repo`：目标项目的主 checkout，必须已有 `origin`。
 - `runtime.worktrees`：每个 Issue 的隔离工作区根目录。
@@ -71,14 +71,14 @@ cp orchestrator.example.toml orchestrator.toml
 先运行一次：
 
 ```bash
-cao --config orchestrator.toml once
-cao --config orchestrator.toml status
+autocode --config autocode.toml once
+autocode --config autocode.toml status
 ```
 
 确认无误后常驻：
 
 ```bash
-cao --config orchestrator.toml serve
+autocode --config autocode.toml serve
 ```
 
 ## Agent 配置
@@ -118,40 +118,378 @@ commands = ["./scripts/check.sh"]
 
 `.agent/task.md` 由 orchestrator 创建，通常应加入目标项目的 `.gitignore`。如果希望 PR 保留任务快照，则不要忽略。
 
-## 持续运行
+## BioAgent 任务发布
 
-长期运行必须部署到 Linux 或 macOS，并保证目标仓库、SQLite 状态库和 worktrees 位于持久磁盘。不要在 Windows 开发机上承载 7×24 Worker。
+本目录保存 `chengcz/bioagent` 的本地编排运行数据与任务发布说明。运行数据位于
+`repo/`、`worktrees/`、`state/` 和 `logs/`，这些目录不会提交到本仓库。
 
-完整部署、单机多仓库、升级、备份和故障排查参见 [部署与运维指南](deploy/README.md)。
+## 发布流程
 
-Linux 单仓库可使用 [deploy/coding-agent-orchestrator.service](deploy/coding-agent-orchestrator.service)，多仓库推荐使用 [deploy/cao@.service](deploy/cao@.service)：
+1. 在 `chengcz/bioagent` 创建 GitHub Issue。
+2. 按本文后面的“GitHub Issue 模板”填写完整任务，确保范围可由一个 PR 完成。
+3. 选择实现 Agent：添加 `agent:codex` 或 `agent:claude` 标签；不添加时使用默认 Codex。
+4. 确认依赖任务已完成、验收标准可执行后，再添加 `agent-ready` 标签。
+5. 前台启动编排器：
+
+   ```bash
+   .venv/bin/autocode --config bioagent.toml --verbose serve
+   ```
+
+6. Agent 完成实现和检查后，编排器会提交分支、推送并创建 PR，同时把 Issue 标记为
+   `human-review`。必须由人审查和合并；编排器不会自动合并或部署。
+
+命令行发布示例：
 
 ```bash
-sudo cp deploy/coding-agent-orchestrator.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now coding-agent-orchestrator
-journalctl -u coding-agent-orchestrator -f
+gh issue create \
+  --repo chengcz/bioagent \
+  --title "[V1] Implement real volcano plot execution" \
+  --body "请按 README 中的 GitHub Issue 模板填写完整任务" \
+  --label enhancement \
+  --label agent:claude \
+  --label agent-ready
 ```
 
-macOS 使用 [deploy/com.cao.orchestrator.plist](deploy/com.cao.orchestrator.plist)，修改路径并创建日志目录后：
+也可以先创建草稿 Issue，补充清楚后再发布：
+
+```bash
+gh issue edit ISSUE_NUMBER \
+  --repo chengcz/bioagent \
+  --add-label agent:codex \
+  --add-label agent-ready
+```
+
+## 内容要求
+
+每个任务必须包含：
+
+- 背景与问题：说明当前行为、用户影响和可复现证据。
+- 目标：一句话描述完成后的可观察结果。
+- 范围：指出允许修改的模块、接口和数据结构。
+- 非目标：明确本任务不做的工作，防止范围蔓延。
+- 实现约束：兼容性、安全、迁移、权限和依赖限制。
+- 验收标准：使用可验证的清单，避免“优化一下”“完善功能”等模糊描述。
+- 测试要求：列出必须运行或新增的测试；需要外部服务时说明替代验证方式。
+- 依赖与风险：关联前置 Issue、资源锁和人工决策。
+
+任务不得要求编码 Agent 执行 push、创建或合并 PR、部署、修改 secrets、运行生产迁移或生产操作；
+这些操作必须留在编排器或人工流程中。
+
+## 标签规则
+
+- `agent-ready`：任务内容完整且允许领取；这是唯一的调度入口。
+- `agent:codex`：由 Codex 实现。
+- `agent:claude`：由 Claude Code 实现。
+- `resource:database-schema`：涉及数据库 schema 时添加，同一进程内串行执行。
+- `agent-running`、`agent-failed`、`human-review`：由编排器维护，不要手工用于发布任务。
+- `bug`、`enhancement`、`documentation`：描述任务类型，可与 Agent 标签组合。
+
+不要同时添加多个 `agent:<name>` 标签。一个 Issue 应对应一个可独立审查的 PR；大型需求应拆成有依赖关系的多个 Issue。
+
+## Agent 与 Review
+
+默认实现 Agent 是 Codex。Issue 使用 `agent:claude` 时由 Claude Code 实现。当前配置使用 Codex
+做只读 Review；因此 Claude 实现的任务会得到跨 Agent 复审。Review 未明确给出批准结论时，任务会被标记为失败并等待人工处理。
+
+### GitHub Issue 模板
+
+## 背景与问题
+
+说明当前行为、用户影响、复现步骤或相关代码位置。
+
+## 目标
+
+用一句话描述完成后可观察、可验证的结果。
+
+## 范围
+
+- 必须实现的行为：
+- 允许修改的模块/API/数据结构：
+- 需要保持兼容的行为：
+
+## 非目标
+
+- 本 Issue 明确不处理：
+
+## 实现约束
+
+- 安全与权限边界：
+- 向后兼容要求：
+- 数据迁移或回滚要求：
+- 不得 push、创建/合并 PR、部署、修改 secrets 或操作生产环境。
+
+## 验收标准
+
+- [ ] 给定……时，系统应……
+- [ ] 错误输入或失败路径应……
+- [ ] 现有兼容行为应……
+- [ ] 文档或 API 契约已同步更新。
+
+## 测试要求
+
+- [ ] 新增或更新针对本行为的自动化测试。
+- [ ] 运行与改动范围对应的单元/集成测试。
+- [ ] 记录无法自动化验证的项目和人工验证步骤。
+
+## 依赖与风险
+
+- 前置 Issue/PR：无
+- 资源锁标签：无；涉及数据库 schema 时使用 `resource:database-schema`
+- 已知风险或待人工决策：无
+
+---
+
+## 在 GitHub 网页发布给 Agent
+
+填写并检查完上述内容后，在 GitHub Issue 网页右侧的 **Labels** 区域发布任务：
+
+1. 打开 `chengcz/bioagent` 仓库的 **Issues** 页面，点击 **New issue**。
+2. 填写标题和本模板中的所有必填章节，然后点击 **Create** 或 **Submit new issue**。
+3. 在 Issue 右侧找到 **Labels**，点击齿轮图标或标签区域。
+4. 选择且只选择一个实现 Agent：
+   - `agent:codex`：由 Codex 实现；未选择 Agent 标签时也默认使用 Codex。
+   - `agent:claude`：由 Claude Code 实现。
+5. 根据任务性质选择 `bug`、`enhancement` 或 `documentation` 等普通标签。
+6. 确认任务范围、依赖和验收标准完整后，最后添加 `agent-ready`。
+7. 关闭标签选择框。无需额外按钮；标签保存后，前台编排器会在下一次轮询时领取任务。
+
+如果列表中没有 `agent-ready`：
+
+1. 打开仓库的 **Issues** 页面。
+2. 点击页面上方的 **Labels**。
+3. 点击 **New label**。
+4. Name 填写 `agent-ready`，Description 可填写 `Ready for coding-agent implementation`，颜色可使用 `0e8a16`。
+5. 点击 **Create label**，返回 Issue 后按上述步骤添加该标签。
+
+发布前检查：
+
+- [ ] Issue 可以由一个独立 PR 完成。
+- [ ] 已写明可执行的验收标准和测试要求。
+- [ ] 前置 Issue 已完成；否则暂时不要添加 `agent-ready`。
+- [ ] 没有同时添加 `agent:codex` 和 `agent:claude`。
+- [ ] 没有手工添加 `agent-running`、`agent-failed` 或 `human-review`；这些标签由编排器维护。
+
+需要暂停尚未领取的任务时，从 Issue 右侧 **Labels** 中移除 `agent-ready`。任务已出现
+`agent-running` 后不要靠修改标签强行停止，应先安全停止前台编排器并检查任务状态。
+
+## 部署与运维指南
+
+本项目只把 Linux 和 macOS 作为 7×24 部署目标。Windows 用于开发和测试，不承载常驻 Worker。当前版本面向单机运行：一个仓库对应一个 orchestrator 实例；一台机器可以运行多个相互隔离的实例。
+
+### 1. 部署前规划
+
+每个仓库必须拥有独立的主 checkout、worktree 根目录、SQLite 文件和配置文件：
+
+```text
+/opt/coding-agent-orchestrator/       程序与虚拟环境
+/etc/autocode/                             配置和非敏感环境文件
+/srv/autocode/repo-a/repo/                 repo-a 主 checkout
+/srv/autocode/repo-a/worktrees/            repo-a 工作区
+/var/lib/autocode/repo-a/state.sqlite3     repo-a 状态
+/srv/autocode/repo-b/repo/                 repo-b 主 checkout
+/srv/autocode/repo-b/worktrees/            repo-b 工作区
+/var/lib/autocode/repo-b/state.sqlite3     repo-b 状态
+```
+
+禁止两个实例共享同一 SQLite 文件、worktree 根目录或目标仓库。不同仓库如果会修改同一数据库 schema、共享生成文件或占用独占测试设备，需要在 orchestrator 之外提供机器级锁；当前 `resource:database-schema` 只在单个进程内生效。
+
+### 2. 系统依赖
+
+- Python 3.11+，包含 `venv`、`pip` 和 SQLite 支持。
+- Git 2.30+，以及对目标仓库的 fetch/push 权限。
+- GitHub CLI，并完成目标仓库认证。
+- 至少一个支持非交互调用的 Agent CLI。
+- 目标仓库自身的编译、测试和格式检查工具。
+- Linux 使用 systemd；macOS 使用 launchd。
+
+Debian/Ubuntu 的基础包示例：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-pip git ca-certificates
+```
+
+macOS 可通过 Homebrew 安装基础工具：
+
+```bash
+brew install python git gh
+```
+
+安装 Agent CLI 和 GitHub CLI 时应遵循各自官方说明。必须使用将要运行服务的同一个 OS 用户完成认证，并验证非交互命令在该用户环境中可用。
+
+### 3. 安装 orchestrator
+
+Linux 推荐创建专用账户：
+
+```bash
+sudo useradd --create-home --shell /bin/bash agent
+sudo install -d -o agent -g agent /opt/coding-agent-orchestrator /srv/autocode /var/lib/autocode
+sudo install -d -o root -g agent -m 0750 /etc/autocode
+```
+
+以该账户克隆和安装：
+
+```bash
+sudo -u agent git clone https://github.com/chengcz/coding-agent-orchestrator.git /opt/coding-agent-orchestrator
+sudo -u agent python3 -m venv /opt/coding-agent-orchestrator/.venv
+sudo -u agent /opt/coding-agent-orchestrator/.venv/bin/pip install /opt/coding-agent-orchestrator
+```
+
+如果这台机器也用于维护和验证 orchestrator 本身，可改为安装 `/opt/coding-agent-orchestrator[dev]`。
+
+目标仓库也由该账户克隆，且必须配置 `origin`：
+
+```bash
+sudo -u agent git clone git@github.com:OWNER/repo-a.git /srv/autocode/repo-a/repo
+```
+
+### 4. 每仓库配置
+
+将示例配置复制为 `/etc/autocode/repo-a.toml`，至少修改：
+
+```toml
+[runtime]
+repo = "/srv/autocode/repo-a/repo"
+worktrees = "/srv/autocode/repo-a/worktrees"
+state_db = "/var/lib/autocode/repo-a/state.sqlite3"
+poll_seconds = 60
+max_workers = 2
+max_attempts = 3
+default_agent = "codex"
+
+[github]
+repo = "OWNER/repo-a"
+base_branch = "main"
+ready_label = "agent-ready"
+
+[checks]
+commands = ["./scripts/check.sh"]
+
+[agents.codex]
+command = "codex exec --sandbox workspace-write -"
+max_workers = 2
+timeout_seconds = 7200
+```
+
+保护配置并创建状态目录：
+
+```bash
+sudo install -d -o agent -g agent /var/lib/autocode/repo-a /srv/autocode/repo-a/worktrees
+sudo chown root:agent /etc/autocode/repo-a.toml
+sudo chmod 0640 /etc/autocode/repo-a.toml
+```
+
+先以前台单次模式验收，确认 GitHub 和 Agent 登录态、仓库权限及检查命令均正常：
+
+```bash
+sudo -u agent /opt/coding-agent-orchestrator/.venv/bin/autocode --config /etc/autocode/repo-a.toml once
+sudo -u agent /opt/coding-agent-orchestrator/.venv/bin/autocode --config /etc/autocode/repo-a.toml status
+```
+
+### 5. Linux：systemd
+
+单仓库可以安装 `autocode.service`。多仓库推荐模板服务：
+
+```bash
+sudo cp deploy/autocode@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now autocode@repo-a
+sudo systemctl enable --now autocode@repo-b
+```
+
+服务名 `%i` 对应 `/etc/autocode/%i.toml`。常用操作：
+
+```bash
+systemctl status autocode@repo-a
+journalctl -u autocode@repo-a -f
+sudo systemctl restart autocode@repo-a
+sudo systemctl stop autocode@repo-a
+```
+
+模板默认只允许写入 `/srv/autocode`、`/var/lib/autocode` 和 Agent 常见的用户级缓存/配置目录。首次启动前创建实际 Agent CLI 所需的目录；若仓库或 Agent 状态位于其他位置，应精确修改 `ReadWritePaths`，不要放宽为整个根目录或用户主目录。
+
+### 6. macOS：launchd
+
+将项目放到稳定的绝对路径，修改 `com.autocode.orchestrator.plist` 中的程序、配置、工作目录和日志路径。每个仓库复制一份 plist，并为 `Label`、配置文件和日志使用唯一名称，例如：
+
+```text
+~/Library/LaunchAgents/com.autocode.repo-a.plist
+~/Library/LaunchAgents/com.autocode.repo-b.plist
+```
+
+加载并检查：
 
 ```bash
 mkdir -p /opt/coding-agent-orchestrator/logs
-cp deploy/com.cao.orchestrator.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cao.orchestrator.plist
-launchctl kickstart -k gui/$(id -u)/com.cao.orchestrator
-tail -f /opt/coding-agent-orchestrator/logs/stdout.log
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.autocode.repo-a.plist
+launchctl kickstart -k gui/$(id -u)/com.autocode.repo-a
+launchctl print gui/$(id -u)/com.autocode.repo-a
+tail -f /opt/coding-agent-orchestrator/logs/repo-a.stdout.log
 ```
 
-如需无人登录时也持续运行，应把 plist 安装为系统级 LaunchDaemon，并使用专用非管理员账户。
+LaunchAgent 只在用户登录会话中运行。需要开机后无人登录持续运行时，应由管理员创建系统级 LaunchDaemon，明确设置运行用户和最小文件权限，并验证 Agent CLI 的认证机制在无 GUI/钥匙串交互时仍可用。
 
-### 运维检查
+### 7. 多 Worker 与容量
 
-- `cao --config /etc/cao/orchestrator.toml status` 查看持久状态。
-- 服务重启会把中断的内部状态标记为可重试，并重新领取仍带 `agent-running` 的 Issue。
-- SQLite、worktrees 和目标仓库必须位于持久磁盘，并定期备份 SQLite。
-- 每个目标仓库只运行一个 orchestrator 实例；不同仓库可以使用独立配置、状态库和 worktree 根目录并行运行。
-- 当前版本的资源锁是进程内锁，不支持多机竞争，也不能协调多个实例访问同一共享资源。
+`runtime.max_workers` 限制单仓库总并发，`agents.<name>.max_workers` 限制特定 Agent 并发，实际并发取二者允许的较小值。一台机器上所有实例的 Worker 总数还应受 CPU、内存、磁盘 I/O 和 API 限额约束。
+
+建议从每仓库 1 个 Worker 开始，观察完整编译和测试的峰值资源后再增加。一般可按每个 Worker 至少 2 个 CPU 核心、2–4 GB 内存估算；大型项目应以实测为准。确保磁盘容量可以容纳主 checkout、并行 worktrees、构建产物和依赖缓存。
+
+### 8. GitHub 与凭据
+
+GitHub 凭据只授予目标仓库所需的 Issues、Contents 和 Pull requests 权限。不要把生产密钥、部署凭据或数据库管理员凭据放入服务环境。建议为常驻机器使用独立机器人账户，并通过以下命令验证身份：
+
+```bash
+sudo -u agent gh auth status
+sudo -u agent git -C /srv/autocode/repo-a/repo fetch origin main
+```
+
+如需通过环境变量提供凭据，将其放在 root 可读的凭据管理位置。`/etc/autocode/environment` 和 `%i.env` 只适合由权限严格控制的环境文件，不应提交到 Git。
+
+### 9. 升级与回滚
+
+升级前先停止实例，避免在 Worker 执行期间替换代码：
+
+```bash
+sudo systemctl stop 'autocode@*'
+sudo -u agent git -C /opt/coding-agent-orchestrator pull --ff-only
+sudo -u agent /opt/coding-agent-orchestrator/.venv/bin/pip install /opt/coding-agent-orchestrator
+sudo systemctl start autocode@repo-a autocode@repo-b
+```
+
+安装了 `[dev]` 依赖时，上线前运行项目自身检查：
+
+```bash
+cd /opt/coding-agent-orchestrator
+.venv/bin/ruff check .
+.venv/bin/pytest -q
+```
+
+回滚时检出已验证的 Git 提交、重新安装包并重启服务。不要删除 SQLite 或 worktree 来代替状态恢复。
+
+### 10. 备份与恢复
+
+备份范围包括每个仓库的 SQLite 状态文件、配置文件和必要的 Agent CLI 认证资料。仓库代码可从 GitHub 恢复，worktree 通常无需备份。复制 SQLite 前应停止对应实例，或使用 SQLite 在线备份工具生成一致快照。
+
+进程重启时，调度器会把中断状态标记为可重试，并重新读取仍带 `agent-running` 标签的 Issue。恢复后检查：
+
+```bash
+autocode --config /etc/autocode/repo-a.toml status
+git -C /srv/autocode/repo-a/repo worktree list
+gh issue list --repo OWNER/repo-a --label agent-running
+```
+
+### 11. 故障排查
+
+- 服务反复重启：查看 journal 或 launchd stderr，检查配置路径和 Python 环境。
+- 无法领取 Issue：确认标签名称、GitHub 仓库名和 `gh auth status`。
+- 无法创建 worktree：检查 `origin/<base_branch>`、目录权限和残留 worktree。
+- Agent 命令找不到：服务不会读取交互式 shell 配置，应在 TOML 中使用绝对路径或显式设置受控 PATH。
+- push/PR 失败：验证服务账户的 SSH key 或 GitHub token，以及仓库分支策略。
+- 任务长期占用：检查 Agent 超时、目标项目测试超时及机器资源；不要直接启动第二个同仓库实例绕过阻塞。
+
+当前版本不支持多机调度、跨实例锁、自动合并或生产部署。需要高可用多机运行时，应先引入集中式状态库、租约和分布式锁设计。
+
 
 ## 安全边界
 

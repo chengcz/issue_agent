@@ -10,7 +10,7 @@ from .orchestrator import Orchestrator
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(prog="cao")
+    result = argparse.ArgumentParser(prog="autocode")
     result.add_argument("--config", default="orchestrator.toml")
     result.add_argument("--verbose", action="store_true")
     sub = result.add_subparsers(dest="command", required=True)

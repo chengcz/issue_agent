@@ -37,7 +37,7 @@ def test_shell_uses_platform_shell(tmp_path: Path):
 
 
 def test_config_and_label_routing(tmp_path: Path):
-    config_file = tmp_path / "cao.toml"
+    config_file = tmp_path / "autocode.toml"
     config_file.write_text('''
 [runtime]
 repo = "."

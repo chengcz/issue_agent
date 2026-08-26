@@ -6,4 +6,9 @@ pytest-cache-files-*/
 .test-tmp/
 .ruff_cache/
 .cao/
-orchestrator.toml
+.autocode/
+/bioagent.toml
+/bioagent/repo/
+/bioagent/worktrees/
+/bioagent/state/
+/bioagent/logs/

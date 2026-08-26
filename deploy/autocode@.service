@@ -9,9 +9,9 @@ User=agent
 Group=agent
 WorkingDirectory=/opt/coding-agent-orchestrator
 Environment=PYTHONUNBUFFERED=1
-EnvironmentFile=-/etc/cao/environment
-EnvironmentFile=-/etc/cao/%i.env
-ExecStart=/opt/coding-agent-orchestrator/.venv/bin/cao --config /etc/cao/%i.toml serve
+EnvironmentFile=-/etc/autocode/environment
+EnvironmentFile=-/etc/autocode/%i.env
+ExecStart=/opt/coding-agent-orchestrator/.venv/bin/autocode --config /etc/autocode/%i.toml serve
 Restart=always
 RestartSec=10
 TimeoutStopSec=2h
@@ -19,7 +19,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/srv/cao /var/lib/cao -/home/agent/.cache -/home/agent/.config -/home/agent/.codex
+ReadWritePaths=/srv/autocode /var/lib/autocode -/home/agent/.cache -/home/agent/.config -/home/agent/.codex
 UMask=0077
 
 [Install]
