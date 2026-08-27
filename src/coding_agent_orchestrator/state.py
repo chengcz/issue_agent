@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .models import Issue, TaskStatus
+from .models import Issue, PlanTask, TaskStatus
+
+_ACTIVE = (
+    TaskStatus.CLAIMED,
+    TaskStatus.CODING,
+    TaskStatus.TESTING,
+    TaskStatus.REVIEWING,
+    TaskStatus.PUSHING,
+)
 
 
 class StateStore:
@@ -15,7 +24,20 @@ class StateStore:
             db.execute("""CREATE TABLE IF NOT EXISTS tasks (
                 issue_number INTEGER PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
                 agent TEXT, branch TEXT, worktree TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT, pr_url TEXT, updated_at TEXT NOT NULL
+                last_error TEXT, pr_url TEXT, plan TEXT, current_seq INTEGER NOT NULL DEFAULT -1,
+                updated_at TEXT NOT NULL
+            )""")
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
+            if "plan" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN plan TEXT")
+            if "current_seq" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN current_seq INTEGER NOT NULL DEFAULT -1")
+            db.execute("""CREATE TABLE IF NOT EXISTS plan_tasks (
+                issue_number INTEGER NOT NULL, seq INTEGER NOT NULL,
+                title TEXT NOT NULL, description TEXT NOT NULL,
+                status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT, commit_hash TEXT, updated_at TEXT NOT NULL,
+                PRIMARY KEY (issue_number, seq)
             )""")
 
     def connect(self) -> sqlite3.Connection:
@@ -27,7 +49,7 @@ class StateStore:
         now = datetime.now(UTC).isoformat()
         with self.connect() as db:
             row = db.execute("SELECT status FROM tasks WHERE issue_number=?", (issue.number,)).fetchone()
-            if row and row["status"] not in (TaskStatus.FAILED, TaskStatus.PENDING):
+            if row and row["status"] not in (TaskStatus.FAILED, TaskStatus.PENDING, TaskStatus.PLANNED):
                 return False
             db.execute(
                 """INSERT INTO tasks(issue_number,title,status,agent,updated_at)
@@ -38,12 +60,61 @@ class StateStore:
         return True
 
     def update(self, issue_number: int, status: TaskStatus, **values: object) -> None:
-        allowed = {"agent", "branch", "worktree", "attempts", "last_error", "pr_url"}
+        allowed = {"agent", "branch", "worktree", "attempts", "last_error", "pr_url", "current_seq"}
         fields = {key: value for key, value in values.items() if key in allowed}
         fields.update(status=str(status), updated_at=datetime.now(UTC).isoformat())
         sql = ",".join(f"{key}=?" for key in fields)
         with self.connect() as db:
             db.execute(f"UPDATE tasks SET {sql} WHERE issue_number=?", (*fields.values(), issue_number))
+
+    def save_plan(self, issue_number: int, plan: list[PlanTask]) -> None:
+        now = datetime.now(UTC).isoformat()
+        payload = json.dumps([task.to_dict() for task in plan], ensure_ascii=False)
+        with self.connect() as db:
+            db.execute("UPDATE tasks SET plan=?, updated_at=? WHERE issue_number=?", (payload, now, issue_number))
+            db.executemany(
+                """INSERT INTO plan_tasks(issue_number,seq,title,description,status,updated_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(issue_number,seq) DO UPDATE SET
+                title=excluded.title,description=excluded.description,updated_at=excluded.updated_at""",
+                [(issue_number, i, task.title, task.description, str(TaskStatus.PENDING), now)
+                 for i, task in enumerate(plan)],
+            )
+
+    def load_plan(self, issue_number: int) -> list[PlanTask] | None:
+        with self.connect() as db:
+            row = db.execute("SELECT plan FROM tasks WHERE issue_number=?", (issue_number,)).fetchone()
+        if not row or not row["plan"]:
+            return None
+        items = json.loads(row["plan"])
+        return [PlanTask.from_dict(item) for item in items]
+
+    def plan_task_statuses(self, issue_number: int) -> list[TaskStatus]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT seq,status FROM plan_tasks WHERE issue_number=? ORDER BY seq", (issue_number,)
+            ).fetchall()
+        return [TaskStatus(row["status"]) for row in rows]
+
+    def update_plan_task(self, issue_number: int, seq: int, **values: object) -> None:
+        fields = {
+            key: value for key, value in values.items() if key in {"status", "attempts", "last_error", "commit_hash"}
+        }
+        if "status" in fields:
+            fields["status"] = str(fields["status"])
+        fields["updated_at"] = datetime.now(UTC).isoformat()
+        sql = ",".join(f"{key}=?" for key in fields)
+        with self.connect() as db:
+            db.execute(
+                f"UPDATE plan_tasks SET {sql} WHERE issue_number=? AND seq=?",
+                (*fields.values(), issue_number, seq),
+            )
+
+    def plan_task_commit(self, issue_number: int, seq: int) -> str | None:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT commit_hash FROM plan_tasks WHERE issue_number=? AND seq=?", (issue_number, seq)
+            ).fetchone()
+        return row["commit_hash"] if row else None
 
     def rows(self) -> list[dict[str, object]]:
         with self.connect() as db:
@@ -51,26 +122,26 @@ class StateStore:
 
     def recover_interrupted(self) -> int:
         """Make work interrupted by a process restart claimable again."""
-        active = tuple(
-            str(status)
-            for status in (
-                TaskStatus.CLAIMED,
-                TaskStatus.CODING,
-                TaskStatus.TESTING,
-                TaskStatus.REVIEWING,
-                TaskStatus.PUSHING,
-            )
-        )
-        placeholders = ",".join("?" for _ in active)
+        now = datetime.now(UTC).isoformat()
+        placeholders = ",".join("?" for _ in _ACTIVE)
+        active = [str(status) for status in _ACTIVE]
         with self.connect() as db:
-            cursor = db.execute(
-                f"UPDATE tasks SET status=?, last_error=?, updated_at=? "
-                f"WHERE status IN ({placeholders})",
-                (
-                    str(TaskStatus.FAILED),
-                    "orchestrator restarted while task was active",
-                    datetime.now(UTC).isoformat(),
-                    *active,
-                ),
+            planning = db.execute(
+                "UPDATE tasks SET status=?, last_error=?, updated_at=? WHERE status=?",
+                (str(TaskStatus.PENDING), "orchestrator restarted during planning", now, str(TaskStatus.PLANNING)),
             )
-            return cursor.rowcount
+            resumed = db.execute(
+                f"UPDATE tasks SET status=?, last_error=?, updated_at=? "
+                f"WHERE status IN ({placeholders}) AND plan IS NOT NULL AND plan != ''",
+                (str(TaskStatus.PLANNED), "orchestrator restarted while task was active", now, *active),
+            )
+            failed = db.execute(
+                f"UPDATE tasks SET status=?, last_error=?, updated_at=? "
+                f"WHERE status IN ({placeholders}) AND (plan IS NULL OR plan = '')",
+                (str(TaskStatus.FAILED), "orchestrator restarted while task was active", now, *active),
+            )
+            db.execute(
+                f"UPDATE plan_tasks SET status=?, last_error=?, updated_at=? WHERE status IN ({placeholders})",
+                (str(TaskStatus.PENDING), "orchestrator restarted", now, *active),
+            )
+            return planning.rowcount + resumed.rowcount + failed.rowcount

@@ -13,13 +13,19 @@
 ## 工作流
 
 1. 轮询带 `agent-ready` 标签的 GitHub Issues。
-2. 根据 `agent:<name>` 标签选择 Agent；未指定则使用默认 Agent。
+2. 根据 `agent:<name>` 标签选择实现 Agent；未指定则使用默认 Agent。
 3. 从 `origin/main` 创建独立分支和 Git worktree。
-4. 把 Issue 保存为 `.agent/task.md`，Agent 只负责修改代码。
-5. orchestrator 独立执行检查；失败时把错误反馈给同一 Agent。
-6. 可选用另一个 Agent 做只读交叉 Review；Review 要求修改时也反馈给实现 Agent。编码、检查和
-   Review 共用 `max_attempts` 尝试预算。
-7. orchestrator 统一 commit、push、创建 PR，并停在 `human-review`。
+4. **Plan**：planner agent（配置 `planner_agent`）只读探索代码库，把 Issue 拆成 1..N 个顺序任务，
+   持久化到 SQLite 和 `.agent/plan.md`，并在 Issue 上评论 plan。未配置 `planner_agent` 时回退为单个任务。
+5. **逐任务执行**：每个任务写入 `.agent/task.md`。实现 Agent 完成后 orchestrator 独立执行检查，然后
+   commit（`feat: <task.title> (#N)`）；reviewer 对最近一个 commit 做只读 Review，要求修改时反馈给实现
+   Agent，修复后 amend 同一 commit 再 Review，直到通过。编码、检查和 Review 共用 `max_attempts` 预算。
+6. **最终阶段**：全部任务通过后，reviewer 对整条分支 diff 做整体 Review；要求修改时由实现 Agent 修复并
+   产生独立 commit（`feat: final review fixes (#N)`）；通过后再执行一次完整 checks。
+7. orchestrator 统一 push、创建 PR，并停在 `human-review`。
+
+一个 Issue 对应一个分支、一个 PR（多个顺序 commit）。分支在最终阶段前从不 push，因此 amend/reset 安全。
+task 失败时整个 Issue 标记失败并保留已完成任务的分支；重新领取后从第一个未完成任务断点续跑。
 
 它不会自动 merge、部署生产、运行生产迁移或修改 secrets。
 
@@ -145,7 +151,8 @@ Issue 添加 `agent:claude_opus` 或 `agent:claude_sonnet` 后，编排器会选
 commands = ["./scripts/check.sh"]
 ```
 
-`.agent/task.md` 由 orchestrator 创建，通常应加入目标项目的 `.gitignore`。如果希望 PR 保留任务快照，则不要忽略。
+`.agent/plan.md`（完整 plan）和 `.agent/task.md`（当前任务）由 orchestrator 创建，通常应加入目标项目的
+`.gitignore`。如果希望 PR 保留任务快照，则不要忽略。
 
 ## BioAgent 任务发布
 
@@ -164,7 +171,8 @@ commands = ["./scripts/check.sh"]
    .venv/bin/autocode --config bioagent.toml --verbose serve
    ```
 
-6. Agent 完成实现和检查后，编排器会提交分支、推送并创建 PR，同时把 Issue 标记为
+6. planner 先把 Issue 拆成多个任务，实现 Agent 逐个完成：每个任务独立检查、commit 与 Review；
+   全部任务通过后做整体 Review 和最终检查，编排器再统一推送并创建 PR，同时把 Issue 标记为
    `human-review`。必须由人审查和合并；编排器不会自动合并或部署。
 
 命令行发布示例：
@@ -219,6 +227,11 @@ gh issue edit ISSUE_NUMBER \
 
 默认实现 Agent 是 Codex。Issue 使用 `agent:claude` 时由 Claude Code 实现。当前配置使用 Codex
 做只读 Review；因此 Claude 实现的任务会得到跨 Agent 复审。Review 未明确给出批准结论时，任务会被标记为失败并等待人工处理。
+
+`runtime.planner_agent` 指定负责拆解 Issue 的规划 Agent（通常复用 reviewer 的只读命令，没有则用实现命令）；
+`runtime.max_tasks` 限制单个 plan 的任务数上限，防止 planner 失控。planner 输出解析失败或超过上限时，
+任务被标记为失败并可重领后重新规划。每个任务独立 commit 与 Review，任务之间的修复 amend 同一个 commit；
+最终阶段针对整条分支 Review，修复产生独立 commit。
 
 ### GitHub Issue 模板
 
@@ -385,6 +398,8 @@ poll_seconds = 60
 max_workers = 2
 max_attempts = 3
 default_agent = "codex"
+planner_agent = "claude"
+max_tasks = 8
 
 [github]
 repo = "OWNER/repo-a"

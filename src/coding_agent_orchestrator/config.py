@@ -29,6 +29,8 @@ class Config:
     checks: tuple[str, ...] = ("pytest -q",)
     default_agent: str = "codex"
     reviewer_agent: str = ""
+    planner_agent: str = ""
+    max_tasks: int = 8
     dry_run: bool = False
     agents: dict[str, AgentConfig] = field(default_factory=dict)
 
@@ -76,6 +78,8 @@ def load_config(path: str | Path) -> Config:
         checks=tuple(raw.get("checks", {}).get("commands", ["pytest -q"])),
         default_agent=runtime.get("default_agent", "codex"),
         reviewer_agent=runtime.get("reviewer_agent", ""),
+        planner_agent=runtime.get("planner_agent", ""),
+        max_tasks=int(runtime.get("max_tasks", 8)),
         dry_run=bool(runtime.get("dry_run", False)),
         agents=agents,
     )

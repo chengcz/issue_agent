@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .models import Issue
+from .models import Issue, PlanTask
 from .process import run
 
 
@@ -45,19 +45,43 @@ class WorkspaceManager:
             await run(command, cwd=self.repo)
         task_dir = path / ".agent"
         task_dir.mkdir(exist_ok=True)
-        (task_dir / "task.md").write_text(
-            f"# GitHub Issue #{issue.number}\n\n## {issue.title}\n\n{issue.body}\n\n## Labels\n\n" + "\n".join(f"- {x}" for x in issue.labels) + "\n",
-            encoding="utf-8",
-        )
+        self.write_task_file(path, issue, PlanTask(issue.title, issue.body))
         return path, branch
+
+    def write_plan_file(self, path: Path, plan: list[PlanTask]) -> None:
+        content = "# Plan\n\n" + "\n".join(
+            f"{i + 1}. **{task.title}**\n   {task.description}" for i, task in enumerate(plan)
+        ) + "\n"
+        (path / ".agent" / "plan.md").write_text(content, encoding="utf-8")
+
+    def write_task_file(self, path: Path, issue: Issue, task: PlanTask) -> None:
+        content = (
+            f"# GitHub Issue #{issue.number}\n\n## {issue.title}\n\n{issue.body}\n\n"
+            f"## 当前任务\n\n### {task.title}\n\n{task.description}\n\n## Labels\n\n"
+            + "\n".join(f"- {x}" for x in issue.labels)
+            + "\n"
+        )
+        (path / ".agent" / "task.md").write_text(content, encoding="utf-8")
 
     async def changed(self, path: Path) -> bool:
         result = await run(("git", "status", "--porcelain"), cwd=path)
         return bool(result.stdout.strip())
 
-    async def commit_push(self, path: Path, branch: str, issue: Issue, *, dry_run: bool) -> None:
-        if dry_run:
-            return
+    async def commit(self, path: Path, message: str) -> None:
         await run(("git", "add", "--all"), cwd=path)
-        await run(("git", "commit", "-m", f"feat: {issue.title} (#{issue.number})"), cwd=path)
-        await run(("git", "push", "--set-upstream", "origin", branch), cwd=path)
+        await run(("git", "commit", "-m", message), cwd=path)
+
+    async def amend(self, path: Path) -> None:
+        await run(("git", "add", "--all"), cwd=path)
+        await run(("git", "commit", "--amend", "--no-edit"), cwd=path)
+
+    async def push(self, path: Path, branch: str, *, dry_run: bool) -> None:
+        if not dry_run:
+            await run(("git", "push", "--set-upstream", "origin", branch), cwd=path)
+
+    async def reset(self, path: Path, target: str) -> None:
+        await run(("git", "reset", "--hard", target), cwd=path)
+
+    async def head_commit(self, path: Path) -> str:
+        result = await run(("git", "rev-parse", "--short", "HEAD"), cwd=path)
+        return result.stdout.strip()
