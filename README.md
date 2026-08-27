@@ -67,11 +67,52 @@ gh auth login
 cp orchestrator.example.toml autocode.toml
 ```
 
+### 初始化 GitHub Labels
+
+编排器完全按标签调度。首次使用前在目标仓库一次性创建全部标签（重复执行会自动更新已存在的标签，幂等）：
+
+```bash
+REPO="chengcz/bioagent"   # 换成编排器实际操作的目标仓库
+labels=(
+  "agent-ready|0e8a16|Ready for coding-agent implementation"
+  "agent-running|1d76db|Implementation in progress"
+  "agent-failed|d73a4a|Agent run failed"
+  "human-review|fbca04|Awaiting human review"
+  "agent:codex|a219d8|Implement with Codex"
+  "agent:claude|a219d8|Implement with Claude Code"
+  "agent:opencode|a219d8|Implement with OpenCode"
+  "agent:claude_opus|a219d8|Implement with Claude Opus"
+  "agent:claude_sonnet|a219d8|Implement with Claude Sonnet"
+  "reviewer:claude|008672|Review with Claude"
+  "reviewer:codex|008672|Review with Codex"
+  "resource:database-schema|5319e7|Serialize database schema work"
+  "bug|d73a4a|Something isn't working"
+  "enhancement|a2eeef|New feature or request"
+  "documentation|0075ca|Improvements or additions to documentation"
+)
+for entry in "${labels[@]}"; do
+  name="${entry%%|*}"
+  rest="${entry#*|}"
+  color="${rest%%|*}"
+  desc="${entry#*|*|}"
+  gh label create "$name" --repo "$REPO" --color "$color" --description "$desc" 2>/dev/null \
+    || gh label edit "$name" --repo "$REPO" --color "$color" --description "$desc" 2>/dev/null \
+    || true
+done
+```
+
+各标签的用途见后文「标签规则」：`agent-ready` 是唯一调度入口；`agent:<name>` 选择实现 Agent；
+`reviewer:<name>` 按 Issue 选择 Reviewer（当前 `reviewer_agent` 仍是全局配置，需要按 Issue 选择时扩展调度器）；
+`resource:database-schema` 对数据库 schema 任务全局串行；`agent-running`、`agent-failed`、`human-review`
+由编排器维护，不要手工使用。
+
 编辑 `autocode.toml`：
 
 - `runtime.repo`：目标项目的主 checkout，必须已有 `origin`。
 - `runtime.worktrees`：每个 Issue 的隔离工作区根目录。
-- `github.repo`：当前默认是 `chengcz/coding-agent-orchestrator`。
+- `github.repo`：目标仓库名，如 `chengcz/bioagent`。
+- `runtime.planner_agent`：规划 Agent（把 Issue 拆成多个任务）；不配置时回退为单任务流程。
+- `runtime.max_tasks`：单个 plan 的任务数上限，默认 8。
 - `checks.commands`：目标项目真实的验收命令。
 - 启用已经安装且完成认证的 Agent。
 
@@ -302,6 +343,8 @@ gh issue edit ISSUE_NUMBER \
 3. 点击 **New label**。
 4. Name 填写 `agent-ready`，Description 可填写 `Ready for coding-agent implementation`，颜色可使用 `0e8a16`。
 5. 点击 **Create label**，返回 Issue 后按上述步骤添加该标签。
+
+也可以直接运行「快速开始」里的「初始化 GitHub Labels」命令，一次性创建编排器用到的全部标签。
 
 发布前检查：
 
