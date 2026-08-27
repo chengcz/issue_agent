@@ -16,8 +16,9 @@
 2. 根据 `agent:<name>` 标签选择 Agent；未指定则使用默认 Agent。
 3. 从 `origin/main` 创建独立分支和 Git worktree。
 4. 把 Issue 保存为 `.agent/task.md`，Agent 只负责修改代码。
-5. orchestrator 独立执行检查；失败时把错误反馈给同一 Agent，最多重试三次。
-6. 可选用另一个 Agent 做只读交叉 Review。
+5. orchestrator 独立执行检查；失败时把错误反馈给同一 Agent。
+6. 可选用另一个 Agent 做只读交叉 Review；Review 要求修改时也反馈给实现 Agent。编码、检查和
+   Review 共用 `max_attempts` 尝试预算。
 7. orchestrator 统一 commit、push、创建 PR，并停在 `human-review`。
 
 它不会自动 merge、部署生产、运行生产迁移或修改 secrets。
@@ -530,6 +531,6 @@ gh issue list --repo OWNER/repo-a --label agent-running
 
 ## 当前边界与下一阶段
 
-MVP 使用 `gh` CLI 和 SQLite，适合单机 1–5 个并发 worker。多机部署时再替换为 GitHub App + PostgreSQL/Redis 分布式锁，并增加心跳、取消、PR review 循环和指标监控。不要在单机版上直接启动多个 orchestrator 实例。
+MVP 使用 `gh` CLI 和 SQLite，适合单机 1–5 个并发 worker。多机部署时再替换为 GitHub App + PostgreSQL/Redis 分布式锁，并增加心跳、取消、PR 创建后的 review 循环和指标监控。不要在单机版上直接启动多个 orchestrator 实例。
 
 Codex 的非交互自动化入口是 `codex exec`；官方也建议非交互运行使用 workspace-write sandbox。GitHub Actions 中可另行使用官方 Codex Action，但它不是本地常驻调度器的必需依赖。

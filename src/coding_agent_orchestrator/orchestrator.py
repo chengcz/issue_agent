@@ -14,6 +14,17 @@ from .workspace import WorkspaceManager
 log = logging.getLogger(__name__)
 
 
+def review_verdict(stdout: str) -> str | None:
+    """Return a review verdict only when it is the final non-empty output line."""
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    if not lines:
+        return None
+    verdict = lines[-1]
+    if verdict in {"VERDICT: APPROVE", "VERDICT: REQUEST_CHANGES"}:
+        return verdict
+    return None
+
+
 class Orchestrator:
     def __init__(self, config: Config):
         self.config = config
@@ -89,22 +100,32 @@ class Orchestrator:
                     self.state.update(issue.number, TaskStatus.TESTING)
                     for check in self.config.checks:
                         await shell(check, cwd=workspace)
+
+                    if not await self.workspaces.changed(workspace):
+                        raise CommandError("agent completed without changing files")
+
+                    if self.config.reviewer_agent:
+                        self.state.update(issue.number, TaskStatus.REVIEWING)
+                        review = await self.agents[self.config.reviewer_agent].execute(
+                            workspace, make_review_prompt(issue.number), review=True
+                        )
+                        verdict = review_verdict(review.stdout)
+                        if verdict == "VERDICT: REQUEST_CHANGES":
+                            raise CommandError(
+                                f"review requested changes:\n{review.stdout[-4000:]}"
+                            )
+                        if verdict != "VERDICT: APPROVE":
+                            raise CommandError(
+                                "review returned no valid final verdict; expected "
+                                "VERDICT: APPROVE or VERDICT: REQUEST_CHANGES\n"
+                                f"{review.stdout[-4000:]}"
+                            )
+
                     break
                 except CommandError as exc:
                     last_error = str(exc)
             else:
                 raise CommandError(last_error or "maximum attempts exceeded")
-
-            if not await self.workspaces.changed(workspace):
-                raise CommandError("agent completed without changing files")
-
-            if self.config.reviewer_agent:
-                self.state.update(issue.number, TaskStatus.REVIEWING)
-                review = await self.agents[self.config.reviewer_agent].execute(
-                    workspace, make_review_prompt(issue.number), review=True
-                )
-                if "VERDICT: APPROVE" not in review.stdout:
-                    raise CommandError(f"review requested changes:\n{review.stdout[-4000:]}")
 
             self.state.update(issue.number, TaskStatus.PUSHING)
             await self.workspaces.commit_push(workspace, branch, issue, dry_run=self.config.dry_run)
@@ -112,6 +133,11 @@ class Orchestrator:
             self.state.update(issue.number, TaskStatus.HUMAN_REVIEW, pr_url=pr_url)
             await self.github.labels(issue.number, add=("human-review",), remove=("agent-running", "agent-failed"))
             await self.github.comment(issue.number, f"Implementation ready for human review: {pr_url}")
+        except CommandError as exc:
+            log.error("issue #%s failed: %s", issue.number, exc)
+            self.state.update(issue.number, TaskStatus.FAILED, last_error=str(exc))
+            await self.github.labels(issue.number, add=("agent-failed",), remove=("agent-running",))
+            await self.github.comment(issue.number, f"Agent run failed.\n\n```text\n{str(exc)[-3000:]}\n```")
         except Exception as exc:
             log.exception("issue #%s failed", issue.number)
             self.state.update(issue.number, TaskStatus.BLOCKED, last_error=str(exc))

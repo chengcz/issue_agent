@@ -37,6 +37,7 @@ def make_review_prompt(issue_number: int) -> str:
     return f"""Review the uncommitted implementation for GitHub Issue #{issue_number}.
 Read AGENTS.md and .agent/task.md. Do not modify files.
 Check correctness, security, compatibility, migrations, tests, and unrelated changes.
-End with exactly VERDICT: APPROVE or VERDICT: REQUEST_CHANGES, followed by concrete reasons.
+Give concrete reasons before the verdict. End with exactly one of these lines:
+VERDICT: APPROVE
+VERDICT: REQUEST_CHANGES
 """
-
