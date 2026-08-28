@@ -29,13 +29,20 @@ def make_plan_prompt(issue: Issue, max_tasks: int) -> str:
     return f"""You are the planner for GitHub Issue #{issue.number}.
 Read AGENTS.md when present. Explore the codebase read-only. Do NOT modify files or commit.
 Split the issue into a sequence of {max_tasks} or fewer concrete implementation tasks. Each task must:
-- be independently committable and reviewable
+- be independently committable and reviewable (one logical change per task)
 - build on previous tasks (they execute in order on one branch)
 - together fully satisfy the issue
+
+Write each task VERY specifically. For every task description name the files or modules to create or
+modify, the key functions/components to add and how they connect to earlier tasks, and end with a
+checkable "Acceptance:" criterion (what the reviewer runs or verifies). Never be vague: "implement
+the feature" is not enough.
+
 Return ONLY a fenced JSON block with no prose outside it. Write every title and description as a
-single line with no raw line breaks and no trailing commas inside the JSON:
+single paragraph with no raw line breaks and no trailing commas inside the JSON. A long single line
+is fine; only raw line breaks break the format:
 ```json
-[{{"title": "short task title", "description": "what to implement and the acceptance intent"}}, ...]
+[{{"title": "short task title", "description": "which files, which functions, how it connects, and the Acceptance: check"}}]
 ```"""
 
 
