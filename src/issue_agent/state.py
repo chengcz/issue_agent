@@ -15,6 +15,16 @@ _ACTIVE = (
     TaskStatus.PUSHING,
 )
 
+RUNNING_STATUSES = (
+    TaskStatus.CLAIMED,
+    TaskStatus.PLANNING,
+    TaskStatus.PLANNED,
+    TaskStatus.CODING,
+    TaskStatus.TESTING,
+    TaskStatus.REVIEWING,
+    TaskStatus.PUSHING,
+)
+
 
 class StateStore:
     def __init__(self, path: Path):
@@ -155,6 +165,24 @@ class StateStore:
     def rows(self) -> list[dict[str, object]]:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM tasks ORDER BY updated_at DESC")]
+
+    def status_rows(self, *, active_only: bool = False) -> list[dict[str, object]]:
+        """Return task status with the current plan item joined for CLI display."""
+        sql = """SELECT tasks.issue_number, tasks.title, tasks.status, tasks.agent,
+            tasks.branch, tasks.attempts, tasks.failures, tasks.current_seq,
+            plan_tasks.title AS current_task, tasks.last_error, tasks.pr_url,
+            tasks.updated_at
+            FROM tasks
+            LEFT JOIN plan_tasks ON plan_tasks.issue_number = tasks.issue_number
+                AND plan_tasks.seq = tasks.current_seq"""
+        parameters: tuple[str, ...] = ()
+        if active_only:
+            placeholders = ",".join("?" for _ in RUNNING_STATUSES)
+            sql += f" WHERE tasks.status IN ({placeholders})"
+            parameters = tuple(str(status) for status in RUNNING_STATUSES)
+        sql += " ORDER BY tasks.updated_at DESC"
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(sql, parameters)]
 
     def recover_interrupted(self) -> int:
         """Make work interrupted by a process restart claimable again."""

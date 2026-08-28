@@ -5,11 +5,11 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from coding_agent_orchestrator.agents import make_plan_prompt
-from coding_agent_orchestrator.models import Issue, PlanTask, TaskStatus
-from coding_agent_orchestrator.orchestrator import Orchestrator, parse_plan, review_verdict
-from coding_agent_orchestrator.process import CommandError, Result
-from coding_agent_orchestrator.state import StateStore
+from issue_agent.agents import make_plan_prompt
+from issue_agent.models import Issue, PlanTask, TaskStatus
+from issue_agent.orchestrator import Orchestrator, parse_plan, review_verdict
+from issue_agent.process import CommandError, Result
+from issue_agent.state import StateStore
 
 APPROVE = "Looks good.\nVERDICT: APPROVE\n"
 
@@ -170,6 +170,8 @@ def test_single_task_fallback_without_planner(tmp_path):
     assert app.workspaces.commit.await_args_list[0].args[1] == "feat: Task (#4)"
     assert app.workspaces.amend.await_count == 0
     app.workspaces.push.assert_awaited_once()
+    assert app.state.load_plan(4) == [PlanTask("Task", "Body")]
+    assert app.state.plan_task_statuses(4) == [TaskStatus.DONE]
     assert app.state.rows()[0]["status"] == str(TaskStatus.HUMAN_REVIEW)
 
 
@@ -269,7 +271,7 @@ def test_final_checks_failure_triggers_a_fix_commit(tmp_path, monkeypatch):
             raise CommandError("pytest failed: 1 failed")
         return result()
 
-    monkeypatch.setattr("coding_agent_orchestrator.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
     app.workspaces.changed.side_effect = [True, True, False]
     issue = Issue(4, "Task", "Body")
     app.state.claim(issue, "worker")

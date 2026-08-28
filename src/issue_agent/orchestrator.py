@@ -257,11 +257,12 @@ class Orchestrator:
 
     async def _plan(self, workspace, issue: Issue) -> list[PlanTask]:
         if not self.config.planner_agent:
-            return [PlanTask(title=issue.title, description=issue.body)]
-        result = await self.agents[self.config.planner_agent].execute(
-            workspace, make_plan_prompt(issue, self.config.max_tasks), review=True
-        )
-        plan = parse_plan(result.stdout, self.config.max_tasks)
+            plan = [PlanTask(title=issue.title, description=issue.body)]
+        else:
+            result = await self.agents[self.config.planner_agent].execute(
+                workspace, make_plan_prompt(issue, self.config.max_tasks), review=True
+            )
+            plan = parse_plan(result.stdout, self.config.max_tasks)
         self.state.save_plan(issue.number, plan)
         return plan
 
