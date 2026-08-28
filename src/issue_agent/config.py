@@ -20,6 +20,7 @@ class Config:
     repo: Path
     worktrees: Path
     state_db: Path
+    log_dir: Path
     github_repo: str
     base_branch: str = "main"
     ready_label: str = "agent-ready"
@@ -31,6 +32,8 @@ class Config:
     reviewer_agent: str = ""
     planner_agent: str = ""
     max_tasks: int = 8
+    auto_plan_unlabeled: bool = False
+    auto_plan_limit: int = 20
     dry_run: bool = False
     agents: dict[str, AgentConfig] = field(default_factory=dict)
 
@@ -69,6 +72,7 @@ def load_config(path: str | Path) -> Config:
         repo=resolve(runtime.get("repo", ".")),
         worktrees=resolve(runtime.get("worktrees", "issue-agent/worktrees")),
         state_db=resolve(runtime.get("state_db", "issue-agent/state.sqlite3")),
+        log_dir=resolve(runtime.get("log_dir", "issue-agent/logs")),
         github_repo=github.get("repo", ""),
         base_branch=github.get("base_branch", "main"),
         ready_label=github.get("ready_label", "agent-ready"),
@@ -80,6 +84,8 @@ def load_config(path: str | Path) -> Config:
         reviewer_agent=runtime.get("reviewer_agent", ""),
         planner_agent=runtime.get("planner_agent", ""),
         max_tasks=int(runtime.get("max_tasks", 8)),
+        auto_plan_unlabeled=bool(runtime.get("auto_plan_unlabeled", False)),
+        auto_plan_limit=int(runtime.get("auto_plan_limit", 20)),
         dry_run=bool(runtime.get("dry_run", False)),
         agents=agents,
     )

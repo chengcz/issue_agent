@@ -20,11 +20,12 @@ class GitHub:
         result = await run(command, cwd=self.cwd, check=check)
         return result.stdout
 
-    async def ready_issues(self, label: str, limit: int = 20) -> list[Issue]:
-        output = await self._gh(
-            "issue", "list", "--state", "open", "--label", label,
-            "--limit", str(limit), "--json", "number,title,body,labels,url",
-        )
+    async def open_issues(self, limit: int = 20, *, label: str = "") -> list[Issue]:
+        args = ["issue", "list", "--state", "open"]
+        if label:
+            args.extend(("--label", label))
+        args.extend(("--limit", str(limit), "--json", "number,title,body,labels,url"))
+        output = await self._gh(*args)
         return [
             Issue(
                 number=item["number"], title=item["title"], body=item.get("body") or "",
@@ -32,6 +33,13 @@ class GitHub:
             )
             for item in json.loads(output)
         ]
+
+    async def ready_issues(self, label: str, limit: int = 20) -> list[Issue]:
+        return await self.open_issues(limit, label=label)
+
+    async def unlabeled_issues(self, limit: int = 20) -> list[Issue]:
+        """Return open Issues that have no labels at all."""
+        return [issue for issue in await self.open_issues(limit) if not issue.labels]
 
     async def runnable_issues(self, ready_label: str, limit: int = 20) -> list[Issue]:
         """Include interrupted jobs whose ready label was already removed."""

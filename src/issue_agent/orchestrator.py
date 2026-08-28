@@ -15,6 +15,7 @@ from .agents import (
 )
 from .config import Config
 from .github import GitHub
+from .issue_log import IssueLog
 from .models import Issue, PlanTask, TaskStatus
 from .process import CommandError, shell
 from .state import StateStore
@@ -155,8 +156,13 @@ class Orchestrator:
         return name
 
     async def run_once(self) -> None:
-        issues = await self.github.runnable_issues(self.config.ready_label)
-        for issue in issues:
+        runnable = await self.github.runnable_issues(self.config.ready_label)
+        planning = (
+            await self.github.unlabeled_issues(self.config.auto_plan_limit)
+            if self.config.auto_plan_unlabeled
+            else []
+        )
+        for issue in runnable:
             if issue.number in self.running:
                 continue
             try:
@@ -166,9 +172,26 @@ class Orchestrator:
                 continue
             if not self.state.claim(issue, agent_name, self.config.max_attempts):
                 continue
-            task = asyncio.create_task(self._guarded_process(issue, agent_name))
-            self.running[issue.number] = task
-            task.add_done_callback(lambda _task, number=issue.number: self.running.pop(number, None))
+            self._track(issue.number, self._guarded_process(issue, agent_name))
+
+        planner_name = self.config.planner_agent
+        if planner_name and planner_name not in self.agents:
+            log.error("unknown or disabled planner agent: %s", planner_name)
+            return
+        for issue in planning:
+            if issue.number in self.running:
+                continue
+            recorded_agent = planner_name or self.config.default_agent
+            if not self.state.claim_for_planning(
+                issue, recorded_agent, self.config.max_attempts
+            ):
+                continue
+            self._track(issue.number, self._guarded_plan_only(issue, planner_name))
+
+    def _track(self, issue_number: int, coroutine) -> None:
+        task = asyncio.create_task(coroutine)
+        self.running[issue_number] = task
+        task.add_done_callback(lambda _task, number=issue_number: self.running.pop(number, None))
 
     async def serve(self) -> None:
         while True:
@@ -192,9 +215,70 @@ class Orchestrator:
             else:
                 await self.process(issue, agent_name)
 
-    async def process(self, issue: Issue, agent_name: str) -> None:
+    async def _guarded_plan_only(self, issue: Issue, planner_name: str) -> None:
+        if planner_name:
+            async with self.global_limit, self.agent_limits[planner_name]:
+                await self.plan_only(issue)
+        else:
+            async with self.global_limit:
+                await self.plan_only(issue)
+
+    async def plan_only(self, issue: Issue) -> None:
+        """Create and publish a plan, then wait for a human to add agent-ready."""
+        issue_log = IssueLog(self.config.log_dir, issue.number)
+        issue_log.event("plan_only_started", title=issue.title, labels=issue.labels)
         try:
             workspace, branch = await self.workspaces.create(issue)
+            issue_log.event("workspace_ready", workspace=workspace, branch=branch)
+            self.state.update(
+                issue.number, TaskStatus.PLANNING, branch=branch, worktree=str(workspace)
+            )
+            plan = self.state.load_plan(issue.number)
+            if plan is None:
+                plan = await self._plan(workspace, issue)
+                issue_log.event("plan_generated", tasks=[task.to_dict() for task in plan])
+            else:
+                issue_log.event("plan_reused", tasks=[task.to_dict() for task in plan])
+            self.workspaces.write_plan_file(workspace, plan)
+            self.state.update(issue.number, TaskStatus.PLANNED, current_seq=0)
+            issue_log.event("awaiting_human_approval", plan_tasks=len(plan))
+            await self.github.comment(
+                issue.number,
+                "## Issue Agent Plan\n\n"
+                + format_plan(plan)
+                + "\n\n## Human approval required\n\n"
+                "Review or update this Issue and the plan above. Add the `agent-ready` "
+                "label when implementation may begin. Until then, Issue Agent will not "
+                "modify code, push a branch, or create a pull request.",
+            )
+        except CommandError as exc:
+            log.error("issue #%s planning failed: %s", issue.number, exc)
+            failures = self.state.record_failure(issue.number, TaskStatus.FAILED, str(exc))
+            issue_log.event("plan_failed", failures=failures, error=str(exc))
+            await self._comment_planning_failure(issue, failures, str(exc))
+        except Exception as exc:
+            log.exception("issue #%s planning blocked", issue.number)
+            failures = self.state.record_failure(issue.number, TaskStatus.BLOCKED, str(exc))
+            issue_log.event("plan_blocked", failures=failures, error=str(exc))
+            await self._comment_planning_failure(issue, failures, str(exc))
+
+    async def _comment_planning_failure(self, issue: Issue, failures: int, error: str) -> None:
+        retry = (
+            "Planning will be retried on the next poll."
+            if failures < self.config.max_attempts
+            else "Planning retry budget is exhausted; manual state reset is required."
+        )
+        await self.github.comment(
+            issue.number,
+            f"Issue Agent could not prepare a plan. {retry}\n\n```text\n{error[-3000:]}\n```",
+        )
+
+    async def process(self, issue: Issue, agent_name: str) -> None:
+        issue_log = IssueLog(self.config.log_dir, issue.number)
+        issue_log.event("implementation_started", title=issue.title, agent=agent_name, labels=issue.labels)
+        try:
+            workspace, branch = await self.workspaces.create(issue)
+            issue_log.event("workspace_ready", workspace=workspace, branch=branch)
             self.state.update(issue.number, TaskStatus.PLANNING, branch=branch, worktree=str(workspace))
             await self.github.labels(issue.number, add=("agent-running",), remove=(self.config.ready_label,))
 
@@ -202,6 +286,9 @@ class Orchestrator:
             if plan is None:
                 plan = await self._plan(workspace, issue)
                 await self.github.comment(issue.number, "## Agent Plan\n\n" + format_plan(plan))
+                issue_log.event("plan_generated", tasks=[task.to_dict() for task in plan])
+            else:
+                issue_log.event("plan_reused", tasks=[task.to_dict() for task in plan])
             self.workspaces.write_plan_file(workspace, plan)
 
             start_seq = self._resume_seq(issue.number, plan)
@@ -209,20 +296,23 @@ class Orchestrator:
             self.state.update(issue.number, TaskStatus.PLANNED, current_seq=start_seq)
 
             for seq in range(start_seq, len(plan)):
-                await self._run_task(workspace, issue, plan, seq, agent_name)
+                await self._run_task(workspace, issue, plan, seq, agent_name, issue_log)
 
-            await self._finalize(workspace, issue, plan, agent_name)
+            await self._finalize(workspace, issue, plan, agent_name, issue_log)
             self.state.update(issue.number, TaskStatus.PUSHING, current_seq=-1)
+            issue_log.event("push_started", branch=branch)
             await self.workspaces.push(workspace, branch, dry_run=self.config.dry_run)
             pr_url = await self.github.create_pr(
                 issue.number, branch, self.config.base_branch, issue.title, self.config.checks
             )
             self.state.update(issue.number, TaskStatus.HUMAN_REVIEW, pr_url=pr_url)
+            issue_log.event("implementation_complete", pr_url=pr_url)
             await self.github.labels(issue.number, add=("human-review",), remove=("agent-running", "agent-failed"))
             await self.github.comment(issue.number, f"Implementation ready for human review: {pr_url}")
         except CommandError as exc:
             log.error("issue #%s failed: %s", issue.number, exc)
             failures = self.state.record_failure(issue.number, TaskStatus.FAILED, str(exc))
+            issue_log.event("implementation_failed", failures=failures, error=str(exc))
             await self._park_or_requeue(issue, failures)
             note = (
                 "\n\nRetry budget exhausted; reset the task row and re-add the agent-ready "
@@ -234,6 +324,7 @@ class Orchestrator:
         except Exception as exc:
             log.exception("issue #%s failed", issue.number)
             failures = self.state.record_failure(issue.number, TaskStatus.BLOCKED, str(exc))
+            issue_log.event("implementation_blocked", failures=failures, error=str(exc))
             await self._park_or_requeue(issue, failures)
             note = (
                 "\n\nRetry budget exhausted; reset the task row and re-add the agent-ready "
@@ -286,12 +377,22 @@ class Orchestrator:
             return
         await self.workspaces.reset(workspace, f"origin/{self.config.base_branch}")
 
-    async def _run_task(self, workspace, issue: Issue, plan: list[PlanTask], seq: int, agent_name: str) -> None:
+    async def _run_task(
+        self,
+        workspace,
+        issue: Issue,
+        plan: list[PlanTask],
+        seq: int,
+        agent_name: str,
+        issue_log: IssueLog,
+    ) -> None:
         task = plan[seq]
+        issue_log.event("task_started", sequence=seq, task=task.to_dict(), agent=agent_name)
         self.workspaces.write_task_file(workspace, issue, task)
         task_committed = False
         last_error = ""
         for attempt in range(1, self.config.max_attempts + 1):
+            issue_log.event("task_attempt_started", sequence=seq, attempt=attempt)
             self.state.update(
                 issue.number, TaskStatus.CODING, current_seq=seq, attempts=attempt, last_error=last_error
             )
@@ -302,17 +403,21 @@ class Orchestrator:
                 await self.agents[agent_name].execute(
                     workspace, make_task_prompt(issue, task, plan, retry_error=last_error)
                 )
+                issue_log.event("agent_implementation_finished", sequence=seq, attempt=attempt)
                 self.state.update(issue.number, TaskStatus.TESTING)
                 for check in self.config.checks:
                     await shell(check, cwd=workspace)
+                    issue_log.event("check_passed", sequence=seq, attempt=attempt, command=check)
 
                 if not await self.workspaces.changed(workspace):
                     raise CommandError("agent completed without changing files")
                 if task_committed:
                     await self.workspaces.amend(workspace)
+                    issue_log.event("task_commit_amended", sequence=seq, attempt=attempt)
                 else:
                     await self.workspaces.commit(workspace, f"feat: {task.title} (#{issue.number})")
                     task_committed = True
+                    issue_log.event("task_committed", sequence=seq, attempt=attempt)
 
                 if self.config.reviewer_agent:
                     self.state.update(issue.number, TaskStatus.REVIEWING)
@@ -320,6 +425,14 @@ class Orchestrator:
                         workspace, make_task_review_prompt(issue, task), review=True
                     )
                     verdict = review_verdict(review.stdout)
+                    issue_log.review(
+                        "task",
+                        review.stdout,
+                        sequence=seq,
+                        attempt=attempt,
+                        task=task.title,
+                        verdict=verdict or "invalid",
+                    )
                     if verdict == "VERDICT: REQUEST_CHANGES":
                         raise CommandError(f"review requested changes:\n{review.stdout[-4000:]}")
                     if verdict != "VERDICT: APPROVE":
@@ -333,15 +446,25 @@ class Orchestrator:
                     issue.number, seq, status=TaskStatus.DONE,
                     commit_hash=await self.workspaces.head_commit(workspace),
                 )
+                issue_log.event("task_completed", sequence=seq, attempt=attempt)
                 return
             except CommandError as exc:
                 last_error = str(exc)
+                issue_log.event("task_attempt_failed", sequence=seq, attempt=attempt, error=last_error)
         raise CommandError(last_error or "maximum attempts exceeded")
 
-    async def _finalize(self, workspace, issue: Issue, plan: list[PlanTask], agent_name: str) -> None:
+    async def _finalize(
+        self,
+        workspace,
+        issue: Issue,
+        plan: list[PlanTask],
+        agent_name: str,
+        issue_log: IssueLog,
+    ) -> None:
         """Whole-branch review, fixes, and the final checks before push."""
         last_error = ""
         for attempt in range(1, self.config.max_attempts + 1):
+            issue_log.event("final_review_attempt_started", attempt=attempt)
             self.state.update(
                 issue.number, TaskStatus.REVIEWING, current_seq=-1, attempts=attempt, last_error=last_error
             )
@@ -351,6 +474,7 @@ class Orchestrator:
                         workspace, make_final_review_prompt(issue, plan, self.config.base_branch), review=True
                     )
                     verdict = review_verdict(review.stdout)
+                    issue_log.review("final", review.stdout, attempt=attempt, verdict=verdict or "invalid")
                     if verdict == "VERDICT: REQUEST_CHANGES":
                         raise CommandError(f"final review requested changes:\n{review.stdout[-4000:]}")
                     if verdict != "VERDICT: APPROVE":
@@ -362,15 +486,21 @@ class Orchestrator:
                 self.state.update(issue.number, TaskStatus.TESTING, current_seq=-1)
                 for check in self.config.checks:
                     await shell(check, cwd=workspace)
+                    issue_log.event("final_check_passed", attempt=attempt, command=check)
                 if await self.workspaces.changed(workspace):
                     await self.workspaces.commit(workspace, f"feat: final review fixes (#{issue.number})")
+                    issue_log.event("final_fix_committed", attempt=attempt)
+                issue_log.event("final_review_completed", attempt=attempt)
                 return
             except CommandError as exc:
                 last_error = str(exc)
+                issue_log.event("final_review_failed", attempt=attempt, error=last_error)
             self.state.update(issue.number, TaskStatus.CODING, current_seq=-1)
+            issue_log.event("final_fix_started", attempt=attempt)
             await self.agents[agent_name].execute(workspace, make_final_fix_prompt(issue, last_error))
             for check in self.config.checks:
                 await shell(check, cwd=workspace)
             if await self.workspaces.changed(workspace):
                 await self.workspaces.commit(workspace, f"feat: final review fixes (#{issue.number})")
+                issue_log.event("final_fix_committed", attempt=attempt)
         raise CommandError(last_error or "maximum attempts exceeded")

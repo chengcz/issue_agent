@@ -28,6 +28,10 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         max_tasks=8,
         base_branch="main",
         ready_label="agent-ready",
+        default_agent="worker",
+        auto_plan_unlabeled=True,
+        auto_plan_limit=20,
+        log_dir=tmp_path / "logs",
         dry_run=True,
     )
     app.state = StateStore(tmp_path / "state.db")
@@ -202,6 +206,12 @@ def test_task_review_changes_amend_the_task_commit(tmp_path):
     assert "Missing validation" in worker_prompts[1]
     assert app.state.plan_task_statuses(4) == [TaskStatus.DONE, TaskStatus.DONE]
     assert app.state.rows()[0]["status"] == str(TaskStatus.HUMAN_REVIEW)
+    review_log = (tmp_path / "logs" / "issue-4.reviews.jsonl").read_text(encoding="utf-8")
+    assert "REQUEST_CHANGES" in review_log
+    assert "APPROVE" in review_log
+    execution_log = (tmp_path / "logs" / "issue-4.jsonl").read_text(encoding="utf-8")
+    assert "task_attempt_failed" in execution_log
+    assert "implementation_complete" in execution_log
 
 
 def test_planner_output_is_persisted_and_commented(tmp_path):
@@ -214,6 +224,52 @@ def test_planner_output_is_persisted_and_commented(tmp_path):
     assert app.agents["planner"].execute.await_count == 1
     assert "## Agent Plan" in app.github.comment.await_args_list[0].args[1]
     assert app.state.plan_task_statuses(4) == [TaskStatus.DONE, TaskStatus.DONE]
+
+
+def test_unlabeled_issue_plan_waits_for_ready_before_coding(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Vague task", "Improve this module")
+    assert app.state.claim_for_planning(issue, "planner") is True
+
+    asyncio.run(app.plan_only(issue))
+
+    row = app.state.rows()[0]
+    assert row["status"] == str(TaskStatus.PLANNED)
+    assert app.agents["planner"].execute.await_count == 1
+    assert "agent-ready" in app.github.comment.await_args.args[1]
+    app.github.labels.assert_not_awaited()
+    app.workspaces.push.assert_not_awaited()
+    app.github.create_pr.assert_not_awaited()
+
+    app.workspaces.changed.side_effect = [True, True, False]
+    assert app.state.claim(issue, "worker") is True
+    asyncio.run(app.process(issue, "worker"))
+
+    assert app.agents["planner"].execute.await_count == 1
+    app.github.labels.assert_any_await(
+        4, add=("agent-running",), remove=("agent-ready",)
+    )
+    app.workspaces.push.assert_awaited_once()
+    app.github.create_pr.assert_awaited_once()
+
+
+def test_run_once_routes_unlabeled_issue_to_plan_only(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(12, "Needs planning", "A vague request")
+    app.running = {}
+    app.github.runnable_issues = AsyncMock(return_value=[])
+    app.github.unlabeled_issues = AsyncMock(return_value=[issue])
+    app._guarded_plan_only = AsyncMock()
+
+    async def run_scheduler() -> None:
+        await app.run_once()
+        await asyncio.gather(*tuple(app.running.values()))
+
+    asyncio.run(run_scheduler())
+
+    app.github.unlabeled_issues.assert_awaited_once_with(20)
+    app._guarded_plan_only.assert_awaited_once_with(issue, "planner")
+    assert app.state.rows()[0]["status"] == str(TaskStatus.CLAIMED)
 
 
 def test_resume_reuses_plan_and_resets_to_last_done_commit(tmp_path):
