@@ -17,7 +17,8 @@
 5. 从本地已创建的 Issue worktree 和持久化 Plan 继续执行；直接带 `agent-ready` 发布的 Issue 则在执行前生成 Plan。
 6. **逐任务执行**：每个任务写入 `.agent/task.md`。实现 Agent 完成后 orchestrator 独立执行检查，然后
    commit（`feat: <task.title> (#N)`）；reviewer 对最近一个 commit 做只读 Review，要求修改时反馈给实现
-   Agent，修复后 amend 同一 commit 再 Review，直到通过。编码、检查和 Review 共用 `max_attempts` 预算。
+   Agent，修复后 amend 同一 commit 再 Review。第二次 Review 未通过时立即停止，不自动进行更多返修；
+   人工检查 review 日志后可重新添加 `agent-ready` 再次尝试。
 7. **最终阶段**：全部任务通过后，reviewer 对整条分支 diff 做整体 Review；要求修改时由实现 Agent 修复并
    产生独立 commit（`feat: final review fixes (#N)`）；通过后再执行一次完整 checks。
 8. orchestrator 统一 push、创建 PR，并停在 `human-review`。
