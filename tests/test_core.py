@@ -1,12 +1,13 @@
 import asyncio
 from pathlib import Path
 
-from coding_agent_orchestrator.config import load_config
-from coding_agent_orchestrator.models import Issue, TaskStatus
-from coding_agent_orchestrator.orchestrator import Orchestrator
-from coding_agent_orchestrator.process import shell
-from coding_agent_orchestrator.state import StateStore
-from coding_agent_orchestrator.workspace import slugify
+from issue_agent.cli import format_status, parser
+from issue_agent.config import load_config
+from issue_agent.models import Issue, PlanTask, TaskStatus
+from issue_agent.orchestrator import Orchestrator
+from issue_agent.process import shell
+from issue_agent.state import StateStore
+from issue_agent.workspace import slugify
 
 
 def test_slugify_is_branch_safe():
@@ -70,7 +71,7 @@ def test_shell_uses_platform_shell(tmp_path: Path):
 
 
 def test_config_and_label_routing(tmp_path: Path):
-    config_file = tmp_path / "autocode.toml"
+    config_file = tmp_path / "issue-agent.toml"
     config_file.write_text('''
 [runtime]
 repo = "."
@@ -85,3 +86,43 @@ command = "claude -p"
 ''')
     app = Orchestrator(load_config(config_file))
     assert app.select_agent(Issue(1, "x", "", ("agent:claude",))) == "claude"
+
+
+def test_status_rows_include_current_plan_task_and_filter_active(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(1, "Active issue", "Body"), "codex")
+    state.save_plan(1, [PlanTask("Implement status", "Description")])
+    state.update(1, TaskStatus.CODING, current_seq=0)
+    state.claim(Issue(2, "Finished issue", "Body"), "codex")
+    state.update(2, TaskStatus.DONE)
+
+    rows = state.status_rows(active_only=True)
+
+    assert [row["issue_number"] for row in rows] == [1]
+    assert rows[0]["current_task"] == "Implement status"
+
+
+def test_status_parser_and_human_format():
+    args = parser().parse_args(["status", "--active", "--json"])
+    assert args.active is True
+    assert args.json is True
+    output = format_status(
+        [
+            {
+                "issue_number": 7,
+                "status": "testing",
+                "title": "Check CLI",
+                "agent": "codex",
+                "updated_at": "2026-08-28T12:34:56+00:00",
+            }
+        ]
+    )
+    assert "#7" in output
+    assert "testing" in output
+    assert "Check CLI" in output
+
+
+def test_cli_uses_public_issue_agent_name():
+    command = parser()
+    assert command.prog == "issue-agent"
+    assert command.parse_args(["status"]).config == "issue-agent.toml"

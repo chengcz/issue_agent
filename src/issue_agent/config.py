@@ -67,8 +67,8 @@ def load_config(path: str | Path) -> Config:
 
     return Config(
         repo=resolve(runtime.get("repo", ".")),
-        worktrees=resolve(runtime.get("worktrees", "autocode/worktrees")),
-        state_db=resolve(runtime.get("state_db", "autocode/state.sqlite3")),
+        worktrees=resolve(runtime.get("worktrees", "issue-agent/worktrees")),
+        state_db=resolve(runtime.get("state_db", "issue-agent/state.sqlite3")),
         github_repo=github.get("repo", ""),
         base_branch=github.get("base_branch", "main"),
         ready_label=github.get("ready_label", "agent-ready"),
