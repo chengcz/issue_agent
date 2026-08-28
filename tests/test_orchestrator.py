@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from coding_agent_orchestrator.agents import make_plan_prompt
 from coding_agent_orchestrator.models import Issue, PlanTask, TaskStatus
 from coding_agent_orchestrator.orchestrator import Orchestrator, parse_plan, review_verdict
 from coding_agent_orchestrator.process import CommandError, Result
@@ -69,6 +70,16 @@ def test_review_verdict_must_be_the_final_line():
     assert review_verdict("Looks good.\nVERDICT: APPROVE\n") == "VERDICT: APPROVE"
     assert review_verdict("VERDICT: APPROVE\nBut this is not done") is None
     assert review_verdict("No verdict") is None
+
+
+def test_plan_prompt_demands_detail_but_single_line():
+    """The planner must be pushed for concrete specs + acceptance criteria while
+    being told that the single-line JSON rule limits line breaks, not length."""
+    prompt = make_plan_prompt(Issue(9, "T", "B"), 8)
+    assert "Acceptance:" in prompt
+    assert "files or modules" in prompt
+    assert "no raw line breaks" in prompt
+    assert "long single line" in prompt
 
 
 def test_parse_plan_accepts_fenced_json_with_prose():
