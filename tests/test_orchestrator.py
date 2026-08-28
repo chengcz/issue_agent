@@ -98,6 +98,55 @@ def test_parse_plan_rejects_too_many_tasks():
         parse_plan('```json\n[{"title": "A"}, {"title": "B"}, {"title": "C"}]\n```', 2)
 
 
+def test_parse_plan_tolerates_trailing_comma():
+    plan = parse_plan('```json\n[{"title": "A", "description": "B",},]\n```', 8)
+    assert [t.title for t in plan] == ["A"]
+    assert plan[0].description == "B"
+
+
+def test_parse_plan_tolerates_newline_inside_string():
+    plan = parse_plan('```json\n[{"title": "A", "description": "line1\nline2"}]\n```', 8)
+    assert [t.title for t in plan] == ["A"]
+    assert plan[0].description == "line1\nline2"
+
+
+def test_parse_plan_tolerates_realistic_llm_output():
+    """Regression: deepseek-pro-0813 output a plan whose descriptions had raw newlines
+    and trailing commas; parse must not reject it."""
+    raw = '''```json
+[
+  {
+    "title": "Add body-map classification and counting service",
+    "description": "Create src/services/body_map.py defining an anatomical body-map
+data model and pure helpers.",
+  },
+  {
+    "title": "Add body-map SVG silhouette asset",
+    "description": "Add a self-authored human silhouette with a fixed viewBox.",
+  }
+]
+```'''
+    plan = parse_plan(raw, 8)
+    assert [t.title for t in plan] == [
+        "Add body-map classification and counting service",
+        "Add body-map SVG silhouette asset",
+    ]
+    assert "data model and pure helpers." in plan[0].description
+
+
+def test_parse_plan_tolerates_prose_quotes_inside_string():
+    """Stray double quotes used as prose punctuation must not split the string."""
+    plan = parse_plan('```json\n[{"title": "call "body" map", "description": "use the "x" filter" }]\n```', 8)
+    assert plan[0].title == 'call "body" map'
+    assert plan[0].description == 'use the "x" filter'
+
+
+def test_parse_plan_error_includes_context_snippet():
+    """An unrepairable plan should surface the offending text in the error message."""
+    with pytest.raises(CommandError, match="near:"):
+        parse_plan('```json\n[{"title": "A", "description: B"}]\n```', 8)
+
+
 def test_single_task_fallback_without_planner(tmp_path):
     app = make_orchestrator(tmp_path)
     app.config.planner_agent = ""
@@ -264,6 +313,52 @@ def test_unexpected_errors_remain_blocked(tmp_path):
     run_process(app, Issue(4, "Task", "Body"))
 
     assert app.state.rows()[0]["status"] == str(TaskStatus.BLOCKED)
+
+
+def test_failure_restores_ready_until_attempt_budget_exhausted(tmp_path):
+    app = make_orchestrator(tmp_path, attempts=2)
+    app.agents["planner"].execute.side_effect = CommandError("plan boom")
+    issue = Issue(4, "Task", "Body")
+
+    assert app.state.claim(issue, "worker", max_attempts=2) is True
+    asyncio.run(app.process(issue, "worker"))
+    # first failure: attempts=1 < 2 -> kept runnable via agent-ready
+    adds = app.github.labels.await_args_list[-1].kwargs["add"]
+    removes = app.github.labels.await_args_list[-1].kwargs["remove"]
+    assert "agent-ready" in adds
+    assert "agent-failed" in adds
+    assert "agent-running" in removes
+    assert app.state.rows()[0]["failures"] == 1
+
+    app.github.labels.reset_mock()
+    app.github.comment.reset_mock()
+    assert app.state.claim(issue, "worker", max_attempts=2) is True
+    asyncio.run(app.process(issue, "worker"))
+    # second failure: failures=2 >= budget -> parked, no agent-ready restored
+    adds = app.github.labels.await_args_list[-1].kwargs["add"]
+    assert "agent-ready" not in adds
+    assert app.state.rows()[0]["failures"] == 2
+    assert "agent-ready" in app.github.comment.await_args.args[1]
+
+
+def test_blocked_restores_ready_until_attempt_budget_exhausted(tmp_path):
+    app = make_orchestrator(tmp_path, attempts=2)
+    app.workspaces.create.side_effect = RuntimeError("database unavailable")
+    issue = Issue(4, "Task", "Body")
+
+    run_process(app, issue)
+    # BLOCKED under budget -> kept runnable
+    assert "agent-ready" in app.github.labels.await_args_list[-1].kwargs["add"]
+    assert app.state.rows()[0]["status"] == str(TaskStatus.BLOCKED)
+    assert app.state.rows()[0]["failures"] == 1
+
+    app.github.labels.reset_mock()
+    app.github.comment.reset_mock()
+    run_process(app, issue)
+    # second BLOCKED: budget exhausted -> parked
+    adds = app.github.labels.await_args_list[-1].kwargs["add"]
+    assert "agent-ready" not in adds
+    assert app.state.rows()[0]["failures"] == 2
 
 
 def test_recovery_replans_planning_and_resumes_planned(tmp_path):

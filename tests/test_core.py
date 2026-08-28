@@ -22,6 +22,39 @@ def test_state_claim_is_idempotent(tmp_path: Path):
     assert state.claim(issue, "claude") is True
 
 
+def test_claim_gates_failed_issue_by_attempt_budget(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(1, "Task", "Body")
+    state.claim(issue, "codex")
+    state.record_failure(1, TaskStatus.FAILED, "boom")
+    # one failure stays below the budget -> reclaimable
+    assert state.claim(issue, "codex", max_attempts=2) is True
+    state.record_failure(1, TaskStatus.FAILED, "boom")
+    # budget exhausted -> parked, needs a human reset
+    assert state.claim(issue, "codex", max_attempts=2) is False
+
+
+def test_claim_allows_blocked_under_attempt_budget(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(1, "Task", "Body")
+    state.claim(issue, "codex")
+    state.record_failure(1, TaskStatus.BLOCKED, "crash")
+    assert state.claim(issue, "codex", max_attempts=2) is True
+    state.record_failure(1, TaskStatus.BLOCKED, "crash")
+    assert state.claim(issue, "codex", max_attempts=2) is False
+
+
+def test_record_failure_increments_failures_and_sets_status(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(1, "Task", "Body"), "codex")
+    assert state.record_failure(1, TaskStatus.FAILED, "boom") == 1
+    assert state.record_failure(1, TaskStatus.BLOCKED, "crash") == 2
+    row = state.rows()[0]
+    assert row["status"] == str(TaskStatus.BLOCKED)
+    assert row["last_error"] == "crash"
+    assert row["failures"] == 2
+
+
 def test_state_recovery_makes_interrupted_task_claimable(tmp_path: Path):
     state = StateStore(tmp_path / "state.db")
     issue = Issue(7, "Restart", "Body")

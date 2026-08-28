@@ -24,14 +24,16 @@ class StateStore:
             db.execute("""CREATE TABLE IF NOT EXISTS tasks (
                 issue_number INTEGER PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
                 agent TEXT, branch TEXT, worktree TEXT, attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT, pr_url TEXT, plan TEXT, current_seq INTEGER NOT NULL DEFAULT -1,
-                updated_at TEXT NOT NULL
+                failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, pr_url TEXT, plan TEXT,
+                current_seq INTEGER NOT NULL DEFAULT -1, updated_at TEXT NOT NULL
             )""")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
             if "plan" not in columns:
                 db.execute("ALTER TABLE tasks ADD COLUMN plan TEXT")
             if "current_seq" not in columns:
                 db.execute("ALTER TABLE tasks ADD COLUMN current_seq INTEGER NOT NULL DEFAULT -1")
+            if "failures" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN failures INTEGER NOT NULL DEFAULT 0")
             db.execute("""CREATE TABLE IF NOT EXISTS plan_tasks (
                 issue_number INTEGER NOT NULL, seq INTEGER NOT NULL,
                 title TEXT NOT NULL, description TEXT NOT NULL,
@@ -45,12 +47,30 @@ class StateStore:
         db.row_factory = sqlite3.Row
         return db
 
-    def claim(self, issue: Issue, agent: str) -> bool:
+    def claim(self, issue: Issue, agent: str, max_attempts: int = 3) -> bool:
+        """Transition an issue to CLAIMED when it can be worked.
+
+        Fresh issues and issues in PENDING/PLANNED are always re-claimable.
+        FAILED and BLOCKED issues are re-claimed only while their failure budget
+        lasts (``failures < max_attempts``); past that they are parked and need
+        a human reset. Resources renamed: ``failures`` is the whole-issue retry
+        counter; ``attempts`` stays the in-cycle attempt marker written by the
+        task loop, so the two counters stay independent.
+        """
         now = datetime.now(UTC).isoformat()
         with self.connect() as db:
-            row = db.execute("SELECT status FROM tasks WHERE issue_number=?", (issue.number,)).fetchone()
-            if row and row["status"] not in (TaskStatus.FAILED, TaskStatus.PENDING, TaskStatus.PLANNED):
-                return False
+            row = db.execute(
+                "SELECT status, failures FROM tasks WHERE issue_number=?", (issue.number,)
+            ).fetchone()
+            if row:
+                status = row["status"]
+                if status in (str(TaskStatus.PENDING), str(TaskStatus.PLANNED)):
+                    pass
+                elif status in (str(TaskStatus.FAILED), str(TaskStatus.BLOCKED)):
+                    if int(row["failures"]) >= max_attempts:
+                        return False
+                else:
+                    return False
             db.execute(
                 """INSERT INTO tasks(issue_number,title,status,agent,updated_at)
                 VALUES(?,?,?,?,?) ON CONFLICT(issue_number) DO UPDATE SET
@@ -58,6 +78,22 @@ class StateStore:
                 (issue.number, issue.title, TaskStatus.CLAIMED, agent, now),
             )
         return True
+
+    def record_failure(self, issue_number: int, status: TaskStatus, last_error: str) -> int:
+        """Record a whole-issue failure, incrementing the retry-budget counter.
+
+        Returns the new failure count so callers can decide whether the issue is
+        still re-claimable (``failures < max_attempts``) or parked.
+        """
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as db:
+            row = db.execute("SELECT failures FROM tasks WHERE issue_number=?", (issue_number,)).fetchone()
+            failures = int(row["failures"]) + 1 if row else 1
+            db.execute(
+                "UPDATE tasks SET status=?, failures=?, last_error=?, updated_at=? WHERE issue_number=?",
+                (str(status), failures, last_error, now, issue_number),
+            )
+        return failures
 
     def update(self, issue_number: int, status: TaskStatus, **values: object) -> None:
         allowed = {"agent", "branch", "worktree", "attempts", "last_error", "pr_url", "current_seq"}

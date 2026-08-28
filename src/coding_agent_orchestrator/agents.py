@@ -32,7 +32,8 @@ Split the issue into a sequence of {max_tasks} or fewer concrete implementation 
 - be independently committable and reviewable
 - build on previous tasks (they execute in order on one branch)
 - together fully satisfy the issue
-Return ONLY a fenced JSON block with no prose outside it:
+Return ONLY a fenced JSON block with no prose outside it. Write every title and description as a
+single line with no raw line breaks and no trailing commas inside the JSON:
 ```json
 [{{"title": "short task title", "description": "what to implement and the acceptance intent"}}, ...]
 ```"""
