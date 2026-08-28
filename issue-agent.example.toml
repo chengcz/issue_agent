@@ -12,7 +12,7 @@ max_tasks = 8
 dry_run = false
 
 [github]
-repo = "chengcz/coding-agent-orchestrator"
+repo = "OWNER/REPO"
 base_branch = "main"
 ready_label = "agent-ready"
 
