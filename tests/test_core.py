@@ -1,8 +1,10 @@
 import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from issue_agent.cli import format_status, parser
 from issue_agent.config import load_config
+from issue_agent.github import GitHub
 from issue_agent.models import Issue, PlanTask, TaskStatus
 from issue_agent.orchestrator import Orchestrator
 from issue_agent.process import shell
@@ -21,6 +23,15 @@ def test_state_claim_is_idempotent(tmp_path: Path):
     assert state.claim(issue, "claude") is False
     state.update(42, TaskStatus.FAILED, last_error="boom")
     assert state.claim(issue, "claude") is True
+
+
+def test_unlabeled_issue_is_planned_only_once(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(8, "Needs a plan", "Vague request")
+    assert state.claim_for_planning(issue, "planner") is True
+    state.save_plan(8, [PlanTask("Clarify implementation", "Acceptance: reviewed")])
+    state.update(8, TaskStatus.PLANNED)
+    assert state.claim_for_planning(issue, "planner") is False
 
 
 def test_claim_gates_failed_issue_by_attempt_budget(tmp_path: Path):
@@ -77,6 +88,8 @@ def test_config_and_label_routing(tmp_path: Path):
 repo = "."
 state_db = "state.db"
 default_agent = "codex"
+auto_plan_unlabeled = true
+auto_plan_limit = 7
 [github]
 repo = "a/b"
 [agents.codex]
@@ -86,6 +99,23 @@ command = "claude -p"
 ''')
     app = Orchestrator(load_config(config_file))
     assert app.select_agent(Issue(1, "x", "", ("agent:claude",))) == "claude"
+    assert app.config.auto_plan_unlabeled is True
+    assert app.config.auto_plan_limit == 7
+
+
+def test_github_unlabeled_issues_filters_any_labeled_issue(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(
+        return_value='''[
+            {"number": 1, "title": "Plan me", "body": "", "labels": [], "url": "u1"},
+            {"number": 2, "title": "Skip me", "body": "", "labels": [{"name": "bug"}], "url": "u2"}
+        ]'''
+    )
+
+    issues = asyncio.run(github.unlabeled_issues())
+
+    assert [issue.number for issue in issues] == [1]
+    assert "--label" not in github._gh.await_args.args
 
 
 def test_status_rows_include_current_plan_task_and_filter_active(tmp_path: Path):
@@ -95,6 +125,8 @@ def test_status_rows_include_current_plan_task_and_filter_active(tmp_path: Path)
     state.update(1, TaskStatus.CODING, current_seq=0)
     state.claim(Issue(2, "Finished issue", "Body"), "codex")
     state.update(2, TaskStatus.DONE)
+    state.claim(Issue(3, "Awaiting approval", "Body"), "codex")
+    state.update(3, TaskStatus.PLANNED)
 
     rows = state.status_rows(active_only=True)
 

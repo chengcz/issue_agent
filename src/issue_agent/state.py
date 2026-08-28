@@ -18,7 +18,6 @@ _ACTIVE = (
 RUNNING_STATUSES = (
     TaskStatus.CLAIMED,
     TaskStatus.PLANNING,
-    TaskStatus.PLANNED,
     TaskStatus.CODING,
     TaskStatus.TESTING,
     TaskStatus.REVIEWING,
@@ -85,6 +84,33 @@ class StateStore:
                 """INSERT INTO tasks(issue_number,title,status,agent,updated_at)
                 VALUES(?,?,?,?,?) ON CONFLICT(issue_number) DO UPDATE SET
                 status=excluded.status,agent=excluded.agent,updated_at=excluded.updated_at""",
+                (issue.number, issue.title, TaskStatus.CLAIMED, agent, now),
+            )
+        return True
+
+    def claim_for_planning(self, issue: Issue, agent: str, max_attempts: int = 3) -> bool:
+        """Claim an unlabeled Issue for planning exactly once unless planning was interrupted."""
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT status, failures, plan FROM tasks WHERE issue_number=?", (issue.number,)
+            ).fetchone()
+            if row:
+                if row["plan"]:
+                    return False
+                status = row["status"]
+                if status == str(TaskStatus.PENDING):
+                    pass
+                elif status in (str(TaskStatus.FAILED), str(TaskStatus.BLOCKED)):
+                    if int(row["failures"]) >= max_attempts:
+                        return False
+                else:
+                    return False
+            db.execute(
+                """INSERT INTO tasks(issue_number,title,status,agent,updated_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(issue_number) DO UPDATE SET
+                title=excluded.title,status=excluded.status,agent=excluded.agent,
+                updated_at=excluded.updated_at""",
                 (issue.number, issue.title, TaskStatus.CLAIMED, agent, now),
             )
         return True

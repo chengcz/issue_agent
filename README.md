@@ -9,17 +9,18 @@
 
 ## 工作流
 
-1. 轮询带 `agent-ready` 标签的 GitHub Issues。
-2. 根据 `agent:<name>` 标签选择实现 Agent；未指定则使用默认 Agent。
-3. 从 `origin/main` 创建独立分支和 Git worktree。
-4. **Plan**：planner agent（配置 `planner_agent`）只读探索代码库，把 Issue 拆成 1..N 个顺序任务，
-   持久化到 SQLite 和 `.agent/plan.md`，并在 Issue 上评论 plan。未配置 `planner_agent` 时回退为单个任务。
-5. **逐任务执行**：每个任务写入 `.agent/task.md`。实现 Agent 完成后 orchestrator 独立执行检查，然后
+1. 开启 `auto_plan_unlabeled` 后，轮询没有任何 Label 的新 GitHub Issue。
+2. **Plan-only**：planner agent 只读探索代码库，把 Issue 拆成 1..N 个顺序任务，将 Plan 持久化到
+   SQLite 和 `.agent/plan.md`，并评论到 GitHub Issue。此阶段不修改业务代码、不 commit、不 push、不创建 PR。
+3. 人工审核 Plan、补充需求，然后手动添加 `agent-ready`。
+4. 根据 `agent:<name>` 标签选择实现 Agent；未指定则使用默认 Agent。
+5. 从本地已创建的 Issue worktree 和持久化 Plan 继续执行；直接带 `agent-ready` 发布的 Issue 则在执行前生成 Plan。
+6. **逐任务执行**：每个任务写入 `.agent/task.md`。实现 Agent 完成后 orchestrator 独立执行检查，然后
    commit（`feat: <task.title> (#N)`）；reviewer 对最近一个 commit 做只读 Review，要求修改时反馈给实现
    Agent，修复后 amend 同一 commit 再 Review，直到通过。编码、检查和 Review 共用 `max_attempts` 预算。
-6. **最终阶段**：全部任务通过后，reviewer 对整条分支 diff 做整体 Review；要求修改时由实现 Agent 修复并
+7. **最终阶段**：全部任务通过后，reviewer 对整条分支 diff 做整体 Review；要求修改时由实现 Agent 修复并
    产生独立 commit（`feat: final review fixes (#N)`）；通过后再执行一次完整 checks。
-7. orchestrator 统一 push、创建 PR，并停在 `human-review`。
+8. orchestrator 统一 push、创建 PR，并停在 `human-review`。
 
 一个 Issue 对应一个分支、一个 PR（多个顺序 commit）。分支在最终阶段前从不 push，因此 amend/reset 安全。
 task 失败时整个 Issue 标记失败并保留已完成任务的分支；重新领取后从第一个未完成任务断点续跑。
@@ -65,7 +66,8 @@ cp issue-agent.example.toml issue-agent.toml
 
 ### 初始化 GitHub Labels
 
-编排器完全按标签调度。首次使用前在目标仓库一次性创建全部标签（重复执行会自动更新已存在的标签，幂等）：
+无 Label Issue 可以自动进入 Plan-only；编码阶段仍然完全由 `agent-ready` 控制。首次使用前在目标仓库
+一次性创建执行阶段所需标签（重复执行会自动更新已存在的标签，幂等）：
 
 ```bash
 REPO="chengcz/bioagent"   # 换成编排器实际操作的目标仓库
@@ -97,7 +99,8 @@ for entry in "${labels[@]}"; do
 done
 ```
 
-各标签的用途见后文「标签规则」：`agent-ready` 是唯一调度入口；`agent:<name>` 选择实现 Agent；
+各标签的用途见后文「标签规则」：无 Label 是可选的自动规划入口；`agent-ready` 是编码执行入口；
+`agent:<name>` 选择实现 Agent；
 `reviewer:<name>` 按 Issue 选择 Reviewer（当前 `reviewer_agent` 仍是全局配置，需要按 Issue 选择时扩展调度器）；
 `resource:database-schema` 对数据库 schema 任务全局串行；`agent-running`、`agent-failed`、`human-review`
 由编排器维护，不要手工使用。
@@ -109,6 +112,9 @@ done
 - `github.repo`：目标仓库名，如 `chengcz/bioagent`。
 - `runtime.planner_agent`：规划 Agent（把 Issue 拆成多个任务）；不配置时回退为单任务流程。
 - `runtime.max_tasks`：单个 plan 的任务数上限，默认 8。
+- `runtime.auto_plan_unlabeled`：是否自动为完全没有 Label 的新 Issue 生成 Plan。
+- `runtime.auto_plan_limit`：每轮最多扫描多少个无 Label Issue。
+- `runtime.log_dir`：每个 Issue 的执行和 Review JSONL 日志目录。
 - `checks.commands`：目标项目真实的验收命令。
 - 启用已经安装且完成认证的 Agent。
 
@@ -272,6 +278,19 @@ gh issue edit ISSUE_NUMBER \
 任务被标记为失败并可重领后重新规划。每个任务独立 commit 与 Review，任务之间的修复 amend 同一个 commit；
 最终阶段针对整条分支 Review，修复产生独立 commit。
 
+### Issue 执行与 Review 日志
+
+`runtime.log_dir` 下会按 Issue 写入两份 JSONL 文件：
+
+```text
+issue-42.jsonl          # 规划、编码尝试、检查、commit、返修、push、PR 与失败状态
+issue-42.reviews.jsonl  # 每次 task review 和 final review 的完整输出及 verdict
+```
+
+执行日志会记录当前 plan 子任务、尝试次数、检查命令、错误和最终 PR 地址；review 日志会保留
+`REQUEST_CHANGES` 的具体反馈，方便分析是否因 Issue 描述、计划、实现或测试不足而返修。日志可能包含
+Issue 内容和 Agent 输出，应按目标仓库的访问控制保护 `log_dir`，不要写入公开目录。
+
 ### GitHub Issue 模板
 
 ## 背景与问题
@@ -322,17 +341,19 @@ gh issue edit ISSUE_NUMBER \
 
 ## 在 GitHub 网页发布给 Agent
 
-填写并检查完上述内容后，在 GitHub Issue 网页右侧的 **Labels** 区域发布任务：
+新建 Issue 后可以先不添加任何 Label，让 Issue Agent 只生成 Plan：
 
 1. 打开 `chengcz/bioagent` 仓库的 **Issues** 页面，点击 **New issue**。
 2. 填写标题和本模板中的所有必填章节，然后点击 **Create** 或 **Submit new issue**。
-3. 在 Issue 右侧找到 **Labels**，点击齿轮图标或标签区域。
-4. 选择且只选择一个实现 Agent：
+3. 保持 Issue 完全没有 Label。下一轮轮询会发布 Plan 评论，但不会修改代码或创建 PR。
+4. 人工审核 Plan；需要时编辑 Issue 补充需求。
+5. 准备执行时，在 Issue 右侧找到 **Labels**，选择且只选择一个实现 Agent：
    - `agent:codex`：由 Codex 实现；未选择 Agent 标签时也默认使用 Codex。
    - `agent:claude`：由 Claude Code 实现。
-5. 根据任务性质选择 `bug`、`enhancement` 或 `documentation` 等普通标签。
-6. 确认任务范围、依赖和验收标准完整后，最后添加 `agent-ready`。
-7. 关闭标签选择框。无需额外按钮；标签保存后，前台编排器会在下一次轮询时领取任务。
+6. 最后添加 `agent-ready`。标签保存后，前台编排器会在下一次轮询时使用已审核的 Plan 开始编码。
+
+如果创建 Issue 时已经添加了 `bug`、`enhancement` 等普通 Label，它不属于“完全无 Label Issue”，不会
+自动进入 Plan-only。此时可直接添加 `agent-ready`，执行阶段会先生成 Plan 再继续编码。
 
 如果列表中没有 `agent-ready`：
 
@@ -347,7 +368,7 @@ gh issue edit ISSUE_NUMBER \
 发布前检查：
 
 - [ ] Issue 可以由一个独立 PR 完成。
-- [ ] 已写明可执行的验收标准和测试要求。
+- [ ] 已审核 Issue Agent 发布的 Plan，或已写明足够明确的验收标准和测试要求。
 - [ ] 前置 Issue 已完成；否则暂时不要添加 `agent-ready`。
 - [ ] 没有同时添加 `agent:codex` 和 `agent:claude`。
 - [ ] 没有手工添加 `agent-running`、`agent-failed` 或 `human-review`；这些标签由编排器维护。
