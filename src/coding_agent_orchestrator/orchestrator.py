@@ -34,15 +34,86 @@ def review_verdict(stdout: str) -> str | None:
     return None
 
 
+_STRUCTURAL = ':,]}'
+
+
+def _repair_json(text: str) -> str:
+    """Repair common LLM JSON defects before json.loads.
+
+    Handles trailing commas, raw newlines/tabs inside strings, and stray double
+    quotes used as prose punctuation inside strings (escaped via a lookahead:
+    a quote only closes a string when followed by a structural character).
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                i += 1
+            elif ch == "\\":
+                out.append(ch)
+                escaped = True
+                i += 1
+            elif ch == '"':
+                j = i + 1
+                while j < len(text) and text[j] in " \t\r\n":
+                    j += 1
+                if j < len(text) and text[j] in _STRUCTURAL:
+                    out.append(ch)
+                    in_string = False
+                    i += 1
+                else:
+                    out.append('\\"')
+                    i += 1
+            elif ch == "\n":
+                out.append("\\n")
+                i += 1
+            elif ch == "\r":
+                out.append("\\r")
+                i += 1
+            elif ch == "\t":
+                out.append("\\t")
+                i += 1
+            else:
+                out.append(ch)
+                i += 1
+        elif ch == ",":
+            j = i + 1
+            while j < len(text) and text[j] in " \t\r\n":
+                j += 1
+            if j < len(text) and text[j] in "}]":
+                i = j  # drop a trailing comma before a closing bracket
+            else:
+                out.append(ch)
+                i += 1
+        elif ch == '"':
+            in_string = True
+            out.append(ch)
+            i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def parse_plan(stdout: str, max_tasks: int) -> list[PlanTask]:
     """Parse the planner's fenced JSON block into PlanTasks, validating bounds."""
     match = re.search(r"```json\s*(.*?)\s*```", stdout, re.DOTALL)
     if not match:
         raise CommandError("plan output contained no fenced ```json block")
+    raw = match.group(1)
     try:
-        items = json.loads(match.group(1))
+        items = json.loads(_repair_json(raw), strict=False)
     except json.JSONDecodeError as exc:
-        raise CommandError(f"plan JSON is invalid: {exc}") from exc
+        # Include a context snippet so a future planner regression is
+        # diagnosable from the issue comment alone, without re-running the model.
+        snippet = raw[max(0, exc.pos - 120): exc.pos + 120].replace("\n", "\\n")
+        raise CommandError(f"plan JSON is invalid: {exc} near: {snippet}") from exc
     if not isinstance(items, list) or not items:
         raise CommandError("plan must be a non-empty list of tasks")
     if len(items) > max_tasks:
@@ -93,7 +164,7 @@ class Orchestrator:
             except ValueError as exc:
                 log.error("issue #%s: %s", issue.number, exc)
                 continue
-            if not self.state.claim(issue, agent_name):
+            if not self.state.claim(issue, agent_name, self.config.max_attempts):
                 continue
             task = asyncio.create_task(self._guarded_process(issue, agent_name))
             self.running[issue.number] = task
@@ -151,14 +222,38 @@ class Orchestrator:
             await self.github.comment(issue.number, f"Implementation ready for human review: {pr_url}")
         except CommandError as exc:
             log.error("issue #%s failed: %s", issue.number, exc)
-            self.state.update(issue.number, TaskStatus.FAILED, last_error=str(exc))
-            await self.github.labels(issue.number, add=("agent-failed",), remove=("agent-running",))
-            await self.github.comment(issue.number, f"Agent run failed.\n\n```text\n{str(exc)[-3000:]}\n```")
+            failures = self.state.record_failure(issue.number, TaskStatus.FAILED, str(exc))
+            await self._park_or_requeue(issue, failures)
+            note = (
+                "\n\nRetry budget exhausted; reset the task row and re-add the agent-ready "
+                "label to rerun."
+                if failures >= self.config.max_attempts
+                else ""
+            )
+            await self.github.comment(issue.number, f"Agent run failed.\n\n```text\n{str(exc)[-3000:]}\n```{note}")
         except Exception as exc:
             log.exception("issue #%s failed", issue.number)
-            self.state.update(issue.number, TaskStatus.BLOCKED, last_error=str(exc))
+            failures = self.state.record_failure(issue.number, TaskStatus.BLOCKED, str(exc))
+            await self._park_or_requeue(issue, failures)
+            note = (
+                "\n\nRetry budget exhausted; reset the task row and re-add the agent-ready "
+                "label to rerun."
+                if failures >= self.config.max_attempts
+                else ""
+            )
+            await self.github.comment(issue.number, f"Agent run blocked.\n\n```text\n{str(exc)[-3000:]}\n```{note}")
+
+    async def _park_or_requeue(self, issue: Issue, failures: int) -> None:
+        """Keep a failed issue in the runnable pool while its retry budget holds.
+
+        Under budget the agent-ready label is restored so the next scheduler poll
+        re-claims the issue; once the whole-issue failure budget is exhausted the
+        issue is parked (no agent-ready) until a human resets the task row.
+        """
+        if failures < self.config.max_attempts:
+            await self.github.labels(issue.number, add=("agent-failed", "agent-ready"), remove=("agent-running",))
+        else:
             await self.github.labels(issue.number, add=("agent-failed",), remove=("agent-running",))
-            await self.github.comment(issue.number, f"Agent run blocked.\n\n```text\n{str(exc)[-3000:]}\n```")
 
     async def _plan(self, workspace, issue: Issue) -> list[PlanTask]:
         if not self.config.planner_agent:
