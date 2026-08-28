@@ -360,6 +360,45 @@ def test_exhausted_task_review_fails_and_keeps_issue_reclaimable(tmp_path):
     assert app.state.plan_task_statuses(4) != [TaskStatus.DONE]
 
 
+def test_second_task_review_rejection_stops_without_auto_retry(tmp_path):
+    app = make_orchestrator(tmp_path, attempts=3)
+    app.agents["reviewer"].execute.return_value = result("Still incomplete.\nVERDICT: REQUEST_CHANGES\n")
+    app.workspaces.changed.side_effect = [True, True]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    asyncio.run(app.process(issue, "worker"))
+
+    assert app.agents["worker"].execute.await_count == 2
+    assert app.agents["reviewer"].execute.await_count == 2
+    app.workspaces.push.assert_not_awaited()
+    adds = app.github.labels.await_args_list[-1].kwargs["add"]
+    removes = app.github.labels.await_args_list[-1].kwargs["remove"]
+    assert adds == ("agent-failed",)
+    assert "agent-ready" in removes
+
+
+def test_second_final_review_rejection_stops_without_auto_retry(tmp_path):
+    app = make_orchestrator(tmp_path, attempts=3)
+    app.agents["reviewer"].execute.side_effect = [
+        result(APPROVE),
+        result("Need docs.\nVERDICT: REQUEST_CHANGES\n"),
+        result("Still missing docs.\nVERDICT: REQUEST_CHANGES\n"),
+    ]
+    app.workspaces.changed.side_effect = [True, True]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    asyncio.run(app.process(issue, "worker"))
+
+    assert app.agents["worker"].execute.await_count == 2
+    assert app.agents["reviewer"].execute.await_count == 3
+    app.workspaces.push.assert_not_awaited()
+    assert app.github.labels.await_args_list[-1].kwargs["add"] == ("agent-failed",)
+
+
 def test_command_errors_from_coding_are_retried(tmp_path):
     app = make_orchestrator(tmp_path)
     app.agents["worker"].execute.side_effect = [CommandError("first failure"), result()]

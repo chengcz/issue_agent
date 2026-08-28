@@ -22,6 +22,11 @@ from .state import StateStore
 from .workspace import WorkspaceManager
 
 log = logging.getLogger(__name__)
+_REVIEW_ATTEMPTS = 2
+
+
+class ReviewRejected(CommandError):
+    """A review remains rejected after its single allowed fix cycle."""
 
 
 def review_verdict(stdout: str) -> str | None:
@@ -313,9 +318,15 @@ class Orchestrator:
             log.error("issue #%s failed: %s", issue.number, exc)
             failures = self.state.record_failure(issue.number, TaskStatus.FAILED, str(exc))
             issue_log.event("implementation_failed", failures=failures, error=str(exc))
-            await self._park_or_requeue(issue, failures)
+            if isinstance(exc, ReviewRejected):
+                await self._park_after_review_failure(issue)
+            else:
+                await self._park_or_requeue(issue, failures)
             note = (
-                "\n\nRetry budget exhausted; reset the task row and re-add the agent-ready "
+                "\n\nReview fix cycle exhausted; inspect the review log, then manually re-add "
+                "the agent-ready label to retry."
+                if isinstance(exc, ReviewRejected)
+                else "\n\nRetry budget exhausted; reset the task row and re-add the agent-ready "
                 "label to rerun."
                 if failures >= self.config.max_attempts
                 else ""
@@ -345,6 +356,14 @@ class Orchestrator:
             await self.github.labels(issue.number, add=("agent-failed", "agent-ready"), remove=("agent-running",))
         else:
             await self.github.labels(issue.number, add=("agent-failed",), remove=("agent-running",))
+
+    async def _park_after_review_failure(self, issue: Issue) -> None:
+        """Stop automatic retries after the coding-review-fix-review cycle is rejected."""
+        await self.github.labels(
+            issue.number,
+            add=("agent-failed",),
+            remove=("agent-running", self.config.ready_label),
+        )
 
     async def _plan(self, workspace, issue: Issue) -> list[PlanTask]:
         if not self.config.planner_agent:
@@ -391,7 +410,8 @@ class Orchestrator:
         self.workspaces.write_task_file(workspace, issue, task)
         task_committed = False
         last_error = ""
-        for attempt in range(1, self.config.max_attempts + 1):
+        attempt_limit = _REVIEW_ATTEMPTS if self.config.reviewer_agent else self.config.max_attempts
+        for attempt in range(1, attempt_limit + 1):
             issue_log.event("task_attempt_started", sequence=seq, attempt=attempt)
             self.state.update(
                 issue.number, TaskStatus.CODING, current_seq=seq, attempts=attempt, last_error=last_error
@@ -434,9 +454,14 @@ class Orchestrator:
                         verdict=verdict or "invalid",
                     )
                     if verdict == "VERDICT: REQUEST_CHANGES":
+                        if attempt == _REVIEW_ATTEMPTS:
+                            raise ReviewRejected(
+                                "review requested changes after the allowed fix cycle:\n"
+                                f"{review.stdout[-4000:]}"
+                            )
                         raise CommandError(f"review requested changes:\n{review.stdout[-4000:]}")
                     if verdict != "VERDICT: APPROVE":
-                        raise CommandError(
+                        raise ReviewRejected(
                             "review returned no valid final verdict; expected "
                             "VERDICT: APPROVE or VERDICT: REQUEST_CHANGES\n"
                             f"{review.stdout[-4000:]}"
@@ -451,6 +476,8 @@ class Orchestrator:
             except CommandError as exc:
                 last_error = str(exc)
                 issue_log.event("task_attempt_failed", sequence=seq, attempt=attempt, error=last_error)
+                if isinstance(exc, ReviewRejected):
+                    raise
         raise CommandError(last_error or "maximum attempts exceeded")
 
     async def _finalize(
@@ -463,7 +490,8 @@ class Orchestrator:
     ) -> None:
         """Whole-branch review, fixes, and the final checks before push."""
         last_error = ""
-        for attempt in range(1, self.config.max_attempts + 1):
+        attempt_limit = _REVIEW_ATTEMPTS if self.config.reviewer_agent else self.config.max_attempts
+        for attempt in range(1, attempt_limit + 1):
             issue_log.event("final_review_attempt_started", attempt=attempt)
             self.state.update(
                 issue.number, TaskStatus.REVIEWING, current_seq=-1, attempts=attempt, last_error=last_error
@@ -476,9 +504,14 @@ class Orchestrator:
                     verdict = review_verdict(review.stdout)
                     issue_log.review("final", review.stdout, attempt=attempt, verdict=verdict or "invalid")
                     if verdict == "VERDICT: REQUEST_CHANGES":
+                        if attempt == _REVIEW_ATTEMPTS:
+                            raise ReviewRejected(
+                                "final review requested changes after the allowed fix cycle:\n"
+                                f"{review.stdout[-4000:]}"
+                            )
                         raise CommandError(f"final review requested changes:\n{review.stdout[-4000:]}")
                     if verdict != "VERDICT: APPROVE":
-                        raise CommandError(
+                        raise ReviewRejected(
                             "final review returned no valid final verdict; expected "
                             "VERDICT: APPROVE or VERDICT: REQUEST_CHANGES\n"
                             f"{review.stdout[-4000:]}"
@@ -495,6 +528,8 @@ class Orchestrator:
             except CommandError as exc:
                 last_error = str(exc)
                 issue_log.event("final_review_failed", attempt=attempt, error=last_error)
+                if isinstance(exc, ReviewRejected):
+                    raise
             self.state.update(issue.number, TaskStatus.CODING, current_seq=-1)
             issue_log.event("final_fix_started", attempt=attempt)
             await self.agents[agent_name].execute(workspace, make_final_fix_prompt(issue, last_error))
