@@ -28,6 +28,70 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
 
 它不会自动 merge、部署生产、运行生产迁移或修改 secrets。
 
+## 任务实现流水线
+
+`issue-agent` 是单机调度器：`once` 轮询一轮并等 worker 结束，`serve` 持续轮询。每次调度对每个
+可运行的 Issue 领取后走以下流水线。一个 Issue 对应一个分支、一个 PR（多个顺序 commit）。
+
+### 调度与领取
+
+- `run_once` 拉取带 `agent-ready` 标签的 open Issue（额外包含中断时残留 `agent-running` 的任务）；
+  开启 `auto_plan_unlabeled` 时还会拉取无标签 Issue 进入 plan-only。
+- 按 `agent:<name>` 标签选实现 Agent，未指定用 `default_agent`。
+- 领取幂等：`pending`/`planned` 总可领；`failed`/`blocked` 只在失败预算内可领；
+  `failures >= max_attempts` 后搁置，需人工 `reset`。
+
+### 工作区与 Plan
+
+- 在 `runtime.worktrees/<issue号>` 创建/复用 git worktree，分支 `agent/<N>-<slug>`；
+  已有 worktree 目录直接复用，不重复创建。
+- 打上 `agent-running`、移除 `agent-ready`。
+- 已有持久化 Plan 则复用（断点续跑）；否则 planner agent 把 Issue 拆成 1..N 个顺序任务，
+  存 SQLite 与 `.agent/plan.md`。planner 未配置时退化为单任务（整条 Issue 作为唯一任务）。
+- 从第一个未完成的任务继续；执行前把工作区硬重置到上一个已完成任务的 commit，
+  丢弃半截提交，保证重试干净。
+
+### 逐任务实现与 Review
+
+对 plan 里每个任务（最多返修 2 轮）：
+
+1. 写 `.agent/task.md`，状态 `coding`。
+2. 实现 Agent 在 worktree 中执行（prompt 走 stdin）。
+3. orchestrator 独立执行 `checks.commands` 验收。
+4. 校验确实修改了文件，然后 commit：`feat: <task.title> (#N)`。
+5. 配置了 reviewer 时，对最近一个 commit 做只读 Review：
+   - `VERDICT: REQUEST_CHANGES` → 把反馈回喂给实现 Agent 修复并 amend 同一 commit 再 Review；
+     第二次仍不通过立即停止（不再自动返修），等人工检查 review 日志后重试。
+   - 无合法 verdict → 按失败处理。
+6. 通过后该 plan 任务标记 `done`，记录 commit hash。
+
+### 整分支 Review（最终阶段）
+
+- 全部任务通过后，reviewer 对整条分支 diff 做整体 Review（同样最多 2 轮）。
+- 要求修改 → 实现 Agent 修复并产生独立 commit：`feat: final review fixes (#N)`
+  （与任务内的 amend 不同）。
+- 通过后再完整执行一遍 `checks.commands`，若仍产生改动则再提交。
+
+### Push 与 PR
+
+orchestrator 统一 push 分支（finalize 前从不 push，因此 amend/reset 安全）、创建 PR、
+标记 `human-review` 并评论 PR 地址，流程结束。
+
+### 失败与重试预算
+
+- 可重试错误（命令/检查/Review 要求修改）记 `failed`；意外异常记 `blocked`。
+- 每次失败递增该 Issue 的失败计数 `failures`：
+  - 预算内：恢复 `agent-ready`，下一轮自动重跑。
+  - 预算耗尽：摘掉 `agent-ready` 搁置，需人工 `reset`。
+- 重新领取后从第一个未完成任务断点续跑。
+
+### reset 命令
+
+`issue-agent --config issue-agent.toml reset <issue> [--no-label]` 用于重置搁置的
+`failed`/`blocked` 任务：清零失败计数与重试标记、状态回 `pending`（保留 Plan 与已完成的
+plan 任务），默认重新添加 `agent-ready`，下一次轮询即重新领取并从断点续跑。只允许重置
+`pending`/`planned`/`failed`/`blocked`；运行中或已到 `human-review`/`done` 的任务会被拒绝。
+
 ## 快速开始
 
 ### 系统依赖
