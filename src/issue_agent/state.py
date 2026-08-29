@@ -235,3 +235,30 @@ class StateStore:
                 (str(TaskStatus.PENDING), "orchestrator restarted", now, *active),
             )
             return planning.rowcount + resumed.rowcount + failed.rowcount
+
+    def reset(self, issue_number: int) -> str | None:
+        """Reset a task row back to a claimable state, returning its old status.
+
+        Clears the whole-issue retry budget (``failures``) and the in-cycle
+        ``attempts`` marker and returns the row to PENDING so a parked
+        FAILED/BLOCKED issue can be claimed again. Any existing plan is kept;
+        DONE plan items stay DONE so execution resumes from the first unfinished
+        task. Returns None when no row exists for the issue.
+        """
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as db:
+            row = db.execute("SELECT status FROM tasks WHERE issue_number=?", (issue_number,)).fetchone()
+            if not row:
+                return None
+            old_status = str(row["status"])
+            db.execute(
+                "UPDATE tasks SET status=?, failures=0, attempts=0, last_error='', "
+                "current_seq=-1, updated_at=? WHERE issue_number=?",
+                (str(TaskStatus.PENDING), now, issue_number),
+            )
+            db.execute(
+                "UPDATE plan_tasks SET status=?, attempts=0, last_error='', updated_at=? "
+                "WHERE issue_number=? AND status != ?",
+                (str(TaskStatus.PENDING), now, issue_number, str(TaskStatus.DONE)),
+            )
+        return old_status

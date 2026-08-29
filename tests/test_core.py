@@ -76,6 +76,71 @@ def test_state_recovery_makes_interrupted_task_claimable(tmp_path: Path):
     assert state.claim(issue, "codex")
 
 
+def test_state_reset_makes_parked_issue_claimable_again(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(4, "Task", "Body")
+    state.claim(issue, "codex")
+    state.save_plan(4, [PlanTask("One", "D"), PlanTask("Two", "D")])
+    state.update_plan_task(4, 0, status=TaskStatus.DONE, commit_hash="aaaa1111")
+    state.update_plan_task(4, 1, status=TaskStatus.REVIEWING, last_error="stuck")
+    state.record_failure(4, TaskStatus.BLOCKED, "database unavailable")
+    state.record_failure(4, TaskStatus.BLOCKED, "database unavailable")
+    # budget exhausted -> parked, claim refused until reset
+    assert state.claim(issue, "codex", max_attempts=2) is False
+
+    old = state.reset(4)
+
+    assert old == str(TaskStatus.BLOCKED)
+    row = state.rows()[0]
+    assert row["status"] == str(TaskStatus.PENDING)
+    assert row["failures"] == 0
+    assert row["attempts"] == 0
+    # DONE plan items survive; unfinished ones return to pending
+    assert state.plan_task_statuses(4) == [TaskStatus.DONE, TaskStatus.PENDING]
+    assert state.claim(issue, "codex", max_attempts=2) is True
+
+
+def test_state_reset_returns_none_for_unknown_issue(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    assert state.reset(99) is None
+
+
+def test_cli_reset_requeues_and_guards_running_tasks(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text(
+        """\
+[runtime]
+repo = "."
+state_db = "state.db"
+log_dir = "logs"
+dry_run = true
+[github]
+repo = "a/b"
+"""
+    )
+    config = load_config(config_file)
+    state = StateStore(config.state_db)
+    issue = Issue(4, "Task", "Body")
+    state.claim(issue, "codex")
+    state.record_failure(4, TaskStatus.BLOCKED, "boom")
+    state.record_failure(4, TaskStatus.BLOCKED, "boom")
+
+    from issue_agent.cli import reset_issue
+
+    exit_code = asyncio.run(reset_issue(config, 4, no_label=False))
+    assert exit_code == 0
+    row = state.rows()[0]
+    assert row["status"] == str(TaskStatus.PENDING)
+    assert row["failures"] == 0
+
+    # a running task must not be reset
+    state.claim(issue, "codex")
+    state.update(4, TaskStatus.CODING)
+    exit_code = asyncio.run(reset_issue(config, 4, no_label=True))
+    assert exit_code == 1
+    assert state.rows()[0]["status"] == str(TaskStatus.CODING)
+
+
 def test_shell_uses_platform_shell(tmp_path: Path):
     result = asyncio.run(shell("echo available", cwd=tmp_path))
     assert "available" in result.stdout
