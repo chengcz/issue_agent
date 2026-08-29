@@ -575,8 +575,22 @@ gh issue list --repo OWNER/repo-a --label agent-running
 - Agent 命令找不到：确认当前终端的 PATH，或在 TOML 中使用绝对路径。
 - push/PR 失败：验证服务账户的 SSH key 或 GitHub token，以及仓库分支策略。
 - 任务长期占用：检查 Agent 超时、目标项目测试超时及机器资源；不要直接启动第二个同仓库实例绕过阻塞。
+- 任务停在 `failed`/`blocked` 且不再被领取：失败预算（`failures >= max_attempts`）耗尽，任务被搁置，需用 `reset` 命令重置。
 
 当前版本不支持多机调度、跨实例锁、自动合并或生产部署。需要高可用多机运行时，应先引入集中式状态库、租约和分布式锁设计。
+
+### 11. 重置失败/阻塞任务
+
+`failed` 或 `blocked` 的任务在重试预算耗尽后会被搁置（不再自动恢复 `agent-ready`），需要人工重置后才能再次运行：
+
+```bash
+issue-agent --config issue-agent.toml reset 42            # 重置状态并重新入队
+issue-agent --config issue-agent.toml reset 42 --no-label # 只重置本地状态，稍后手动加 agent-ready
+```
+
+- 重置会清空该 Issue 的失败计数（`failures`）和重试标记，把状态改回 `pending`，保留已存在的 Plan 并从第一个未完成任务断点续跑；已完成（`done`）的 plan 项不会被清掉。
+- 默认会重新添加 `agent-ready` 标签（并移除 `agent-failed`/`agent-running`），下一次轮询即重新领取；`--no-label` 跳过标签操作，适合需要先修改 Issue 描述或 Plan 再放行的情况。
+- 只允许重置 `pending`/`planned`/`failed`/`blocked` 状态；运行中或已进入 `human-review`/`done` 的任务会被拒绝，避免干扰进行中的 worker 或重复创建 PR。
 
 
 ## 安全边界
