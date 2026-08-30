@@ -66,8 +66,12 @@ class WorkspaceManager:
         (path / ".agent" / "task.md").write_text(content, encoding="utf-8")
 
     async def changed(self, path: Path) -> bool:
-        result = await run(("git", "status", "--porcelain"), cwd=path)
-        return bool(result.stdout.strip())
+        return bool(await self.status(path))
+
+    async def status(self, path: Path) -> str:
+        """Return tracked and non-ignored untracked repository changes."""
+        result = await run(("git", "status", "--porcelain", "--untracked-files=all"), cwd=path)
+        return result.stdout.strip()
 
     async def commit(self, path: Path, message: str) -> None:
         await run(("git", "add", "--all"), cwd=path)

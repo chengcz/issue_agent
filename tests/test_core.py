@@ -21,6 +21,22 @@ def test_slugify_is_branch_safe():
     assert slugify("Add Regimen / API!") == "add-regimen-api"
 
 
+def test_workspace_status_uses_complete_porcelain_output(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_run(command, *, cwd, timeout=3600, stdin=None, check=True):
+        calls.append((command, cwd))
+        return Result(0, " M src/app.py\n?? new/file.py\n", "")
+
+    monkeypatch.setattr("issue_agent.workspace.run", fake_run)
+    app = _app(tmp_path, [])
+    status = asyncio.run(app.workspaces.status(tmp_path))
+    assert status == "M src/app.py\n?? new/file.py"
+    assert calls == [
+        (("git", "status", "--porcelain", "--untracked-files=all"), tmp_path)
+    ]
+
+
 def test_state_claim_is_idempotent(tmp_path: Path):
     state = StateStore(tmp_path / "state.db")
     issue = Issue(42, "Task", "Body")
