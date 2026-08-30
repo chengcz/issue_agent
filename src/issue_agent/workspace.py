@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 from pathlib import Path
 
 from .models import Issue, PlanTask
@@ -13,16 +15,38 @@ def slugify(title: str) -> str:
 
 
 class WorkspaceManager:
-    def __init__(self, repo: Path, root: Path, base_branch: str):
+    def __init__(
+        self,
+        repo: Path,
+        root: Path,
+        base_branch: str,
+        *,
+        fetch_ttl_seconds: int = 30,
+    ):
         self.repo = repo
         self.root = root
         self.base_branch = base_branch
+        self.fetch_ttl_seconds = fetch_ttl_seconds
+        self._fetch_lock = asyncio.Lock()
+        self._last_fetch = 0.0
+
+    async def fetch_base(self) -> None:
+        """Fetch the base branch once for concurrent/recent workspace requests."""
+        now = time.monotonic()
+        if now - self._last_fetch < self.fetch_ttl_seconds:
+            return
+        async with self._fetch_lock:
+            now = time.monotonic()
+            if now - self._last_fetch < self.fetch_ttl_seconds:
+                return
+            await run(("git", "fetch", "origin", self.base_branch), cwd=self.repo)
+            self._last_fetch = time.monotonic()
 
     async def create(self, issue: Issue) -> tuple[Path, str]:
         self.root.mkdir(parents=True, exist_ok=True)
         branch = f"agent/{issue.number}-{slugify(issue.title)}"
         path = self.root / str(issue.number)
-        await run(("git", "fetch", "origin", self.base_branch), cwd=self.repo)
+        await self.fetch_base()
         if not path.exists():
             branch_exists = await run(
                 ("git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"),
