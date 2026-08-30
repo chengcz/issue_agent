@@ -565,6 +565,23 @@ def test_final_review_retry_resumes_from_final_fix_commit(tmp_path):
     assert app.state.final_context(4) == ("final222", "")
 
 
+def test_final_fix_agent_error_is_persisted(tmp_path):
+    app = make_orchestrator(tmp_path, attempts=3)
+    app.agents["reviewer"].execute.side_effect = [
+        result(APPROVE),
+        result("Need docs.\nVERDICT: REQUEST_CHANGES\n"),
+    ]
+    app.agents["worker"].execute.side_effect = [result(), CommandError("final agent unavailable")]
+    app.workspaces.changed.side_effect = [True]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    asyncio.run(app.process(issue, "worker"))
+
+    assert "final agent unavailable" in app.state.final_context(4)[1]
+
+
 def test_invalid_final_review_verdict_requeues_without_coding_fix(tmp_path):
     app = make_orchestrator(tmp_path, attempts=3)
     app.agents["reviewer"].execute.side_effect = [
