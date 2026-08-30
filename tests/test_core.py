@@ -62,6 +62,27 @@ def test_workspace_fetch_is_shared_within_ttl(tmp_path, monkeypatch):
     assert calls == 1
 
 
+def test_existing_worktree_reuses_its_actual_branch_after_issue_rename(tmp_path, monkeypatch):
+    commands = []
+    worktree = tmp_path / "worktrees" / "42"
+    worktree.mkdir(parents=True)
+
+    async def fake_run(command, *, cwd, timeout=3600, stdin=None, check=True):
+        commands.append((command, cwd))
+        if command == ("git", "branch", "--show-current"):
+            return Result(0, "agent/42-original-title\n", "")
+        return Result(0, "", "")
+
+    monkeypatch.setattr("issue_agent.workspace.run", fake_run)
+    manager = WorkspaceManager(tmp_path, tmp_path / "worktrees", "main")
+
+    path, branch = asyncio.run(manager.create(Issue(42, "Renamed title", "Body")))
+
+    assert path == worktree
+    assert branch == "agent/42-original-title"
+    assert (("git", "branch", "--show-current"), worktree) in commands
+
+
 def test_state_claim_is_idempotent(tmp_path: Path):
     state = StateStore(tmp_path / "state.db")
     issue = Issue(42, "Task", "Body")
