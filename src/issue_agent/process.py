@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,19 +30,27 @@ async def run(
     check: bool = True,
 ) -> Result:
     log.info("run cwd=%s command=%s", cwd, command[0])
+    process_options = {"start_new_session": True} if os.name != "nt" else {}
     process = await asyncio.create_subprocess_exec(
         *command,
         cwd=cwd,
         stdin=asyncio.subprocess.PIPE if stdin is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **process_options,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
             process.communicate(stdin.encode() if stdin is not None else None), timeout=timeout
         )
     except TimeoutError:
-        process.kill()
+        if os.name == "nt":
+            process.kill()
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         await process.wait()
         raise CommandError(f"command timed out after {timeout}s: {command[0]}") from None
     result = Result(process.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace"))

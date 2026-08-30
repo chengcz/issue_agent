@@ -23,6 +23,7 @@ ready_label = "agent-ready"
 
 [checks]
 commands = ["ruff check .", "pytest -q"]
+timeout_seconds = 1800
 
 # If {prompt} is absent, the prompt is sent through stdin (safer for long Issues).
 [agents.codex]

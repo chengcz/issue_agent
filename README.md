@@ -200,6 +200,8 @@ done
 - `runtime.auto_plan_limit`：每轮最多扫描多少个无 Label Issue。
 - `runtime.log_dir`：每个 Issue 的执行和 Review JSONL 日志目录。
 - `checks.commands`：目标项目真实的验收命令。
+- `checks.timeout_seconds`：每条检查命令的超时，默认 1800 秒；超时会终止整个命令进程组，避免残留
+  测试进程持续占用资源。
 - 启用已经安装且完成认证的 Agent。
 
 先运行一次：
