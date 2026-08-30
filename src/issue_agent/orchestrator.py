@@ -527,7 +527,12 @@ class Orchestrator:
                 return cached
         baseline: dict[str, CheckBaseline] = {}
         for check in self.config.checks:
-            result = await shell(check, cwd=workspace, check=False)
+            result = await shell(
+                check,
+                cwd=workspace,
+                timeout=self.config.check_timeout_seconds,
+                check=False,
+            )
             if result.returncode != 0:
                 output = f"{result.stdout}\n{result.stderr}".strip()
                 baseline[check] = CheckBaseline(
@@ -558,7 +563,12 @@ class Orchestrator:
         """
         prefix = "final_" if stage == "final" else ""
         for check in self.config.checks:
-            result = await shell(check, cwd=workspace, check=False)
+            result = await shell(
+                check,
+                cwd=workspace,
+                timeout=self.config.check_timeout_seconds,
+                check=False,
+            )
             if result.returncode == 0:
                 issue_log.event(f"{prefix}check_passed", sequence=seq, attempt=attempt, command=check)
                 continue

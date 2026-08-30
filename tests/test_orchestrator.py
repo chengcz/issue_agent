@@ -24,6 +24,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         max_attempts=attempts,
         max_task_attempts=attempts,
         checks=(),
+        check_timeout_seconds=1800,
         reviewer_agent=reviewer,
         planner_agent="planner",
         max_tasks=8,

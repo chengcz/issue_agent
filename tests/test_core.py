@@ -197,6 +197,11 @@ def test_shell_can_return_nonzero_result_for_baseline_checks(tmp_path: Path):
     assert result.returncode == 7
 
 
+def test_shell_timeout_terminates_the_command(tmp_path: Path):
+    with pytest.raises(CommandError, match="timed out"):
+        asyncio.run(shell("sleep 10", cwd=tmp_path, timeout=0.01))
+
+
 def test_config_and_label_routing(tmp_path: Path):
     config_file = tmp_path / "issue-agent.toml"
     config_file.write_text('''
@@ -212,11 +217,15 @@ repo = "a/b"
 command = "codex exec -"
 [agents.claude]
 command = "claude -p"
+[checks]
+commands = ["pytest -q"]
+timeout_seconds = 17
 ''')
     app = Orchestrator(load_config(config_file))
     assert app.select_agent(Issue(1, "x", "", ("agent:claude",))) == "claude"
     assert app.config.auto_plan_unlabeled is True
     assert app.config.auto_plan_limit == 7
+    assert app.config.check_timeout_seconds == 17
 
 
 def test_github_unlabeled_issues_filters_any_labeled_issue(tmp_path: Path):

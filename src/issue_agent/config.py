@@ -30,6 +30,7 @@ class Config:
     max_attempts: int = 3
     max_task_attempts: int = 2
     checks: tuple[str, ...] = ("pytest -q",)
+    check_timeout_seconds: int = 1800
     default_agent: str = "codex"
     reviewer_agent: str = ""
     planner_agent: str = ""
@@ -84,6 +85,7 @@ def load_config(path: str | Path) -> Config:
         max_attempts=int(runtime.get("max_attempts", 3)),
         max_task_attempts=int(runtime.get("max_task_attempts", 2)),
         checks=tuple(raw.get("checks", {}).get("commands", ["pytest -q"])),
+        check_timeout_seconds=int(raw.get("checks", {}).get("timeout_seconds", 1800)),
         default_agent=runtime.get("default_agent", "codex"),
         reviewer_agent=runtime.get("reviewer_agent", ""),
         planner_agent=runtime.get("planner_agent", ""),
