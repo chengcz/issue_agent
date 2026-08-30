@@ -185,6 +185,9 @@ class Orchestrator:
         }
         self.database_lock = asyncio.Lock()
         self.running: dict[int, asyncio.Task[None]] = {}
+        self._baseline_cache: dict[
+            tuple[str, tuple[str, ...]], dict[str, CheckBaseline]
+        ] = {}
 
     def recover(self) -> int:
         return self.state.recover_interrupted()
@@ -515,6 +518,13 @@ class Orchestrator:
         pre-existing on the base and are not the agent's responsibility; later
         checks only fail on failures *new* relative to this baseline.
         """
+        cache = getattr(self, "_baseline_cache", None)
+        cache_key: tuple[str, tuple[str, ...]] | None = None
+        if cache is not None:
+            cache_key = (await self.workspaces.head_commit(workspace), self.config.checks)
+            cached = cache.get(cache_key)
+            if cached is not None:
+                return cached
         baseline: dict[str, CheckBaseline] = {}
         for check in self.config.checks:
             result = await shell(check, cwd=workspace, check=False)
@@ -525,6 +535,8 @@ class Orchestrator:
                     failed_tests=frozenset(failed_tests(output)),
                     output=output,
                 )
+        if cache_key is not None:
+            cache[cache_key] = baseline
         return baseline
 
     async def _run_checks(
