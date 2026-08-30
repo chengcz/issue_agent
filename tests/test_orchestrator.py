@@ -110,6 +110,31 @@ def test_read_only_agent_honors_its_own_concurrency_limit(tmp_path):
     assert max_active == 1
 
 
+def test_coding_agent_honors_limit_per_cli_invocation(tmp_path):
+    app = make_orchestrator(tmp_path)
+    active = 0
+    max_active = 0
+
+    async def execute(workspace, prompt, *, review=False):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return result()
+
+    app.agents["worker"].execute = execute
+
+    async def run_workers():
+        await asyncio.gather(
+            app._execute_agent("worker", tmp_path, "one"),
+            app._execute_agent("worker", tmp_path, "two"),
+        )
+
+    asyncio.run(run_workers())
+    assert max_active == 1
+
+
 def test_plan_prompt_demands_detail_but_single_line():
     """The planner must be pushed for concrete specs + acceptance criteria while
     being told that the single-line JSON rule limits line breaks, not length."""

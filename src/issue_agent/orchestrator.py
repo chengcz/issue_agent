@@ -261,7 +261,7 @@ class Orchestrator:
         await asyncio.gather(*tuple(self.running.values()), return_exceptions=True)
 
     async def _guarded_process(self, issue: Issue, agent_name: str) -> None:
-        async with self.global_limit, self.agent_limits[agent_name]:
+        async with self.global_limit:
             if "resource:database-schema" in issue.labels:
                 async with self.database_lock:
                     await self.process(issue, agent_name)
@@ -269,12 +269,8 @@ class Orchestrator:
                 await self.process(issue, agent_name)
 
     async def _guarded_plan_only(self, issue: Issue, planner_name: str) -> None:
-        if planner_name:
-            async with self.global_limit, self.agent_limits[planner_name]:
-                await self.plan_only(issue)
-        else:
-            async with self.global_limit:
-                await self.plan_only(issue)
+        async with self.global_limit:
+            await self.plan_only(issue)
 
     async def plan_only(self, issue: Issue) -> None:
         """Create and publish a plan, then wait for a human to add agent-ready."""
@@ -288,7 +284,11 @@ class Orchestrator:
             )
             plan = self.state.load_plan(issue.number)
             if plan is None:
-                plan = await self._plan(workspace, issue)
+                plan = await self._plan(
+                    workspace,
+                    issue,
+                    acquire_agent_limit=bool(self.config.planner_agent),
+                )
                 issue_log.event("plan_generated", tasks=[task.to_dict() for task in plan])
             else:
                 issue_log.event("plan_reused", tasks=[task.to_dict() for task in plan])
@@ -340,7 +340,7 @@ class Orchestrator:
                 plan = await self._plan(
                     workspace,
                     issue,
-                    acquire_agent_limit=self.config.planner_agent != agent_name,
+                    acquire_agent_limit=bool(self.config.planner_agent),
                 )
                 await self.github.comment(issue.number, "## Agent Plan\n\n" + format_plan(plan))
                 issue_log.event("plan_generated", tasks=[task.to_dict() for task in plan])
@@ -480,6 +480,11 @@ class Orchestrator:
             await self.workspaces.clean(workspace)
             raise ReadOnlyViolation(f"read-only {role} modified the workspace")
         return result
+
+    async def _execute_agent(self, agent_name: str, workspace, prompt: str):
+        """Run one coding-agent invocation under that agent's own limit."""
+        async with self.agent_limits[agent_name]:
+            return await self.agents[agent_name].execute(workspace, prompt)
 
     def _resume_seq(self, issue_number: int, plan: list[PlanTask]) -> int:
         """First plan index that is not DONE; len(plan) when all tasks are done (final phase)."""
@@ -640,8 +645,10 @@ class Orchestrator:
                 issue.number, seq, status=TaskStatus.CODING, attempts=attempt, last_error=last_error
             )
             try:
-                await self.agents[agent_name].execute(
-                    workspace, make_task_prompt(issue, task, plan, retry_error=last_error)
+                await self._execute_agent(
+                    agent_name,
+                    workspace,
+                    make_task_prompt(issue, task, plan, retry_error=last_error),
                 )
                 issue_log.event("agent_implementation_finished", sequence=seq, attempt=attempt)
                 self.state.update(issue.number, TaskStatus.TESTING)
@@ -664,7 +671,7 @@ class Orchestrator:
                         workspace,
                         make_task_review_prompt(issue, task),
                         role="task reviewer",
-                        acquire_agent_limit=self.config.reviewer_agent != agent_name,
+                        acquire_agent_limit=True,
                     )
                     verdict = review_verdict(review.stdout)
                     issue_log.review(
@@ -739,7 +746,7 @@ class Orchestrator:
                         workspace,
                         make_final_review_prompt(issue, plan, self.config.base_branch),
                         role="final reviewer",
-                        acquire_agent_limit=self.config.reviewer_agent != agent_name,
+                        acquire_agent_limit=True,
                     )
                     verdict = review_verdict(review.stdout)
                     issue_log.review("final", review.stdout, attempt=attempt, verdict=verdict or "invalid")
@@ -783,7 +790,9 @@ class Orchestrator:
                     raise
             self.state.update(issue.number, TaskStatus.CODING, current_seq=-1)
             issue_log.event("final_fix_started", attempt=attempt)
-            await self.agents[agent_name].execute(workspace, make_final_fix_prompt(issue, last_error))
+            await self._execute_agent(
+                agent_name, workspace, make_final_fix_prompt(issue, last_error)
+            )
             try:
                 await self._run_checks(workspace, issue_log, baseline, attempt=attempt, stage="final")
                 checks_current = True
