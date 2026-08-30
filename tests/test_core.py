@@ -249,6 +249,35 @@ timeout_seconds = 17
     assert app.config.check_timeout_seconds == 17
 
 
+def test_config_rejects_unknown_reviewer_and_zero_limits(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text(
+        """
+[runtime]
+repo = "."
+reviewer_agent = "missing"
+[github]
+repo = "a/b"
+[agents.codex]
+command = "codex exec -"
+"""
+    )
+    with pytest.raises(ValueError, match="reviewer_agent"):
+        load_config(config_file)
+
+    config_file.write_text(
+        """
+[runtime]
+repo = "."
+max_workers = 0
+[github]
+repo = "a/b"
+"""
+    )
+    with pytest.raises(ValueError, match="max_workers"):
+        load_config(config_file)
+
+
 def test_github_unlabeled_issues_filters_any_labeled_issue(tmp_path: Path):
     github = GitHub("owner/repo", tmp_path)
     github._gh = AsyncMock(

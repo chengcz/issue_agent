@@ -45,6 +45,39 @@ def _expand(value: str) -> str:
     return os.path.expandvars(os.path.expanduser(value))
 
 
+def validate_config(config: Config) -> None:
+    """Reject invalid execution limits and named Agent references early."""
+    positive = {
+        "runtime.poll_seconds": config.poll_seconds,
+        "runtime.max_workers": config.max_workers,
+        "runtime.max_attempts": config.max_attempts,
+        "runtime.max_task_attempts": config.max_task_attempts,
+        "runtime.max_tasks": config.max_tasks,
+        "runtime.auto_plan_limit": config.auto_plan_limit,
+        "checks.timeout_seconds": config.check_timeout_seconds,
+    }
+    for name, value in positive.items():
+        if value <= 0:
+            raise ValueError(f"{name} must be greater than zero")
+    if config.fetch_ttl_seconds < 0:
+        raise ValueError("runtime.fetch_ttl_seconds must not be negative")
+    for name, agent in config.agents.items():
+        if not agent.command:
+            raise ValueError(f"agents.{name}.command must not be empty")
+        if agent.max_workers <= 0:
+            raise ValueError(f"agents.{name}.max_workers must be greater than zero")
+        if agent.timeout_seconds <= 0:
+            raise ValueError(f"agents.{name}.timeout_seconds must be greater than zero")
+    if config.agents and config.default_agent not in config.agents:
+        raise ValueError(f"unknown or disabled default_agent: {config.default_agent}")
+    for role, name in (
+        ("planner_agent", config.planner_agent),
+        ("reviewer_agent", config.reviewer_agent),
+    ):
+        if name and name not in config.agents:
+            raise ValueError(f"unknown or disabled {role}: {name}")
+
+
 def load_config(path: str | Path) -> Config:
     config_path = Path(path).resolve()
     with config_path.open("rb") as handle:
@@ -71,7 +104,7 @@ def load_config(path: str | Path) -> Config:
         candidate = Path(_expand(value))
         return candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
 
-    return Config(
+    config = Config(
         repo=resolve(runtime.get("repo", ".")),
         worktrees=resolve(runtime.get("worktrees", "issue-agent/worktrees")),
         state_db=resolve(runtime.get("state_db", "issue-agent/state.sqlite3")),
@@ -95,3 +128,5 @@ def load_config(path: str | Path) -> Config:
         dry_run=bool(runtime.get("dry_run", False)),
         agents=agents,
     )
+    validate_config(config)
+    return config
