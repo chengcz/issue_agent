@@ -205,6 +205,8 @@ CLI 启动时会验证 Agent 名称、并发数、重试次数和 timeout；无�
 - `checks.commands`：目标项目真实的验收命令。
 - `checks.timeout_seconds`：每条检查命令的超时，默认 1800 秒；超时会终止整个命令进程组，避免残留
   测试进程持续占用资源；任务取消时也会执行同样的进程树清理。
+- `checks.baseline_cache_ttl_seconds`：同一 anchor/checks 基线缓存有效期，默认 300 秒；设为 `0` 可
+  禁用缓存，适用于强依赖外部环境的集成检查。
 - 启用已经安装且完成认证的 Agent。
 
 先运行一次：

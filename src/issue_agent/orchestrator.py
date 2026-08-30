@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 
 from .agents import (
@@ -186,7 +187,7 @@ class Orchestrator:
         self.database_lock = asyncio.Lock()
         self.running: dict[int, asyncio.Task[None]] = {}
         self._baseline_cache: dict[
-            tuple[str, tuple[str, ...]], dict[str, CheckBaseline]
+            tuple[str, tuple[str, ...]], tuple[float, dict[str, CheckBaseline]]
         ] = {}
 
     def recover(self) -> int:
@@ -534,11 +535,11 @@ class Orchestrator:
         """
         cache = getattr(self, "_baseline_cache", None)
         cache_key: tuple[str, tuple[str, ...]] | None = None
-        if cache is not None:
+        if cache is not None and self.config.baseline_cache_ttl_seconds > 0:
             cache_key = (await self.workspaces.head_commit(workspace), self.config.checks)
             cached = cache.get(cache_key)
-            if cached is not None:
-                return cached
+            if cached is not None and time.monotonic() - cached[0] < self.config.baseline_cache_ttl_seconds:
+                return cached[1]
         baseline: dict[str, CheckBaseline] = {}
         for check in self.config.checks:
             result = await shell(
@@ -555,7 +556,7 @@ class Orchestrator:
                     output=output,
                 )
         if cache_key is not None:
-            cache[cache_key] = baseline
+            cache[cache_key] = (time.monotonic(), baseline)
         return baseline
 
     async def _run_checks(
