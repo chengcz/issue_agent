@@ -30,6 +30,10 @@ class ReviewRejected(CommandError):
     """A review remains rejected after its single allowed fix cycle."""
 
 
+class InvalidReviewVerdict(CommandError):
+    """A reviewer response cannot be acted on safely and should be retried later."""
+
+
 def review_verdict(stdout: str) -> str | None:
     """Return a review verdict only when it is the final non-empty output line."""
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
@@ -565,7 +569,7 @@ class Orchestrator:
                             )
                         raise CommandError(f"review requested changes:\n{review.stdout[-4000:]}")
                     if verdict != "VERDICT: APPROVE":
-                        raise ReviewRejected(
+                        raise InvalidReviewVerdict(
                             "review returned no valid final verdict; expected "
                             "VERDICT: APPROVE or VERDICT: REQUEST_CHANGES\n"
                             f"{review.stdout[-4000:]}"
@@ -580,7 +584,7 @@ class Orchestrator:
             except CommandError as exc:
                 last_error = str(exc)
                 issue_log.event("task_attempt_failed", sequence=seq, attempt=attempt, error=last_error)
-                if isinstance(exc, ReviewRejected):
+                if isinstance(exc, (InvalidReviewVerdict, ReviewRejected)):
                     self.state.update_plan_task(
                         issue.number, seq, status=TaskStatus.PENDING, last_error=last_error
                     )
@@ -626,7 +630,7 @@ class Orchestrator:
                             )
                         raise CommandError(f"final review requested changes:\n{review.stdout[-4000:]}")
                     if verdict != "VERDICT: APPROVE":
-                        raise ReviewRejected(
+                        raise InvalidReviewVerdict(
                             "final review returned no valid final verdict; expected "
                             "VERDICT: APPROVE or VERDICT: REQUEST_CHANGES\n"
                             f"{review.stdout[-4000:]}"
@@ -641,7 +645,7 @@ class Orchestrator:
             except CommandError as exc:
                 last_error = str(exc)
                 issue_log.event("final_review_failed", attempt=attempt, error=last_error)
-                if isinstance(exc, ReviewRejected):
+                if isinstance(exc, (InvalidReviewVerdict, ReviewRejected)):
                     raise
             self.state.update(issue.number, TaskStatus.CODING, current_seq=-1)
             issue_log.event("final_fix_started", attempt=attempt)
