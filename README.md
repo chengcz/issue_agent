@@ -186,6 +186,9 @@ done
 
 编辑 `issue-agent.toml`：
 
+CLI 启动时会验证 Agent 名称、并发数、重试次数和 timeout；无效配置会立即报错退出，不会在任务
+执行到一半后才进入 `blocked`。
+
 - `runtime.repo`：目标项目的主 checkout，必须已有 `origin`。
 - `runtime.worktrees`：每个 Issue 的隔离工作区根目录。
 - `github.repo`：目标仓库名，如 `chengcz/bioagent`。
