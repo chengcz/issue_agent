@@ -188,6 +188,14 @@ class StateStore:
             ).fetchone()
         return row["commit_hash"] if row else None
 
+    def plan_task_last_error(self, issue_number: int, seq: int) -> str:
+        """Return the last recorded error for a plan task, so a retry can start informed."""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT last_error FROM plan_tasks WHERE issue_number=? AND seq=?", (issue_number, seq)
+            ).fetchone()
+        return (row["last_error"] if row else None) or ""
+
     def rows(self) -> list[dict[str, object]]:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM tasks ORDER BY updated_at DESC")]

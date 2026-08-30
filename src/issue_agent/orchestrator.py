@@ -513,7 +513,9 @@ class Orchestrator:
         issue_log.event("task_started", sequence=seq, task=task.to_dict(), agent=agent_name)
         self.workspaces.write_task_file(workspace, issue, task)
         task_committed = False
-        last_error = ""
+        # A whole-issue retry resets the worktree to the anchor, so seed the
+        # first attempt with the last recorded task failure.
+        last_error = self.state.plan_task_last_error(issue.number, seq)
         attempt_limit = _REVIEW_ATTEMPTS if self.config.reviewer_agent else self.config.max_attempts
         for attempt in range(1, attempt_limit + 1):
             issue_log.event("task_attempt_started", sequence=seq, attempt=attempt)
@@ -579,6 +581,12 @@ class Orchestrator:
                 last_error = str(exc)
                 issue_log.event("task_attempt_failed", sequence=seq, attempt=attempt, error=last_error)
                 if isinstance(exc, ReviewRejected):
+                    self.state.update_plan_task(
+                        issue.number, seq, status=TaskStatus.PENDING, last_error=last_error
+                    )
+                    self.state.update(
+                        issue.number, TaskStatus.FAILED, current_seq=-1, last_error=last_error
+                    )
                     raise
         # Leave the DB in a retryable state: the task is no longer being worked,
         # so its plan row and the whole-issue cursor must not stay stuck on CODING.
