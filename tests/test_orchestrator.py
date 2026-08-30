@@ -320,6 +320,25 @@ def test_run_once_routes_unlabeled_issue_to_plan_only(tmp_path):
     assert app.state.rows()[0]["status"] == str(TaskStatus.CLAIMED)
 
 
+def test_run_once_reconciles_labels_for_persisted_human_review(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Task", "Body", ("agent-running",))
+    app.running = {}
+    app.github.runnable_issues = AsyncMock(return_value=[issue])
+    app.github.unlabeled_issues = AsyncMock(return_value=[])
+    app.state.claim(issue, "worker")
+    app.state.update(4, TaskStatus.HUMAN_REVIEW, pr_url="https://example.test/pr/4")
+
+    asyncio.run(app.run_once())
+
+    app.github.labels.assert_awaited_once_with(
+        4,
+        add=("human-review",),
+        remove=("agent-running", "agent-failed", "agent-ready"),
+    )
+    assert app.running == {}
+
+
 def test_resume_reuses_plan_and_resets_to_last_done_commit(tmp_path):
     app = make_orchestrator(tmp_path)
     app.workspaces.changed.side_effect = [True, False]

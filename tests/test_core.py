@@ -264,6 +264,17 @@ def test_github_unlabeled_issues_filters_any_labeled_issue(tmp_path: Path):
     assert "--label" not in github._gh.await_args.args
 
 
+def test_create_pr_reuses_existing_branch_pr(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(return_value='[{"url": "https://example.test/pr/42"}]')
+
+    url = asyncio.run(github.create_pr(42, "agent/42-task", "main", "Task", ("pytest",)))
+
+    assert url == "https://example.test/pr/42"
+    assert github._gh.await_count == 1
+    assert github._gh.await_args.args[:2] == ("pr", "list")
+
+
 def test_status_rows_include_current_plan_task_and_filter_active(tmp_path: Path):
     state = StateStore(tmp_path / "state.db")
     state.claim(Issue(1, "Active issue", "Body"), "codex")
