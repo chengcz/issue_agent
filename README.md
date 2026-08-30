@@ -34,6 +34,8 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
 `issue-agent` 是单机调度器：`once` 轮询一轮并等 worker 结束，`serve` 持续轮询。每次调度对每个
 可运行的 Issue 领取后走以下流水线。一个 Issue 对应一个分支、一个 PR（多个顺序 commit）。
 
+完整的分支、失败与人工恢复路径见 [开发流程图](docs/development-flow.md)。
+
 ### 调度与领取
 
 - `run_once` 拉取带 `agent-ready` 标签的 open Issue（额外包含中断时残留 `agent-running` 的任务）；
