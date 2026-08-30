@@ -62,7 +62,8 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
 5. 配置了 reviewer 时，对最近一个 commit 做只读 Review：
    - `VERDICT: REQUEST_CHANGES` → 把反馈回喂给实现 Agent 修复并 amend 同一 commit 再 Review；
      第二次仍不通过立即停止（不再自动返修），等人工检查 review 日志后重试。
-   - 无合法 verdict → 按失败处理。
+   - 无合法 verdict → 按普通失败处理；预算内恢复 `agent-ready` 后重试，不要求实现 Agent
+     根据无效 Review 输出修改代码。
 6. 通过后该 plan 任务标记 `done`，记录 commit hash。
 
 > 检查是**基线感知**的：agent 开始前，orchestrator 先在锚点提交（`origin/main` 或上一个已完成任务的 commit）逐条运行 `checks.commands`，按命令记录**预存失败**；pytest 失败按 node ID 比较，其他命令仅在退出码和输出均未变化时视为同一个预存失败。之后每次 check 只把"新失败"判为回归并报给 agent 精修。预存失败（例如目标仓库 main 上本就挂掉的测试）被容忍并通过，避免 agent 在不相关的预存错误上反复空耗重试预算——这也是检查报错不再逐轮"漂移"的原因。每个任务失败后其 plan 状态会回退到 `pending`、cursor 复位，可干净断点续跑。
