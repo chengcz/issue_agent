@@ -687,6 +687,7 @@ class Orchestrator:
     ) -> None:
         """Whole-branch review, fixes, and the final checks before push."""
         _, last_error = self.state.final_context(issue.number)
+        checks_current = False
         attempt_limit = (
             _REVIEW_ATTEMPTS if self.config.reviewer_agent else self.config.max_task_attempts
         )
@@ -720,7 +721,13 @@ class Orchestrator:
                             f"{review.stdout[-4000:]}"
                         )
                 self.state.update(issue.number, TaskStatus.TESTING, current_seq=-1)
-                await self._run_checks(workspace, issue_log, baseline, attempt=attempt, stage="final")
+                if not checks_current:
+                    await self._run_checks(
+                        workspace, issue_log, baseline, attempt=attempt, stage="final"
+                    )
+                    checks_current = True
+                else:
+                    issue_log.event("final_check_reused", attempt=attempt)
                 if await self.workspaces.changed(workspace):
                     await self.workspaces.commit(workspace, f"feat: final review fixes (#{issue.number})")
                     self.state.update_final_context(
@@ -733,6 +740,7 @@ class Orchestrator:
                 return
             except CommandError as exc:
                 last_error = str(exc)
+                checks_current = False
                 self.state.update_final_context(issue.number, last_error=last_error)
                 issue_log.event("final_review_failed", attempt=attempt, error=last_error)
                 if isinstance(exc, (InvalidReviewVerdict, ReadOnlyViolation, ReviewRejected)):
@@ -742,6 +750,7 @@ class Orchestrator:
             await self.agents[agent_name].execute(workspace, make_final_fix_prompt(issue, last_error))
             try:
                 await self._run_checks(workspace, issue_log, baseline, attempt=attempt, stage="final")
+                checks_current = True
             except CommandError as exc:
                 self.state.update_final_context(issue.number, last_error=str(exc))
                 raise

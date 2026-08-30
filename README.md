@@ -78,6 +78,8 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
 - 要求修改 → 实现 Agent 修复并产生独立 commit：`feat: final review fixes (#N)`
   （与任务内的 amend 不同）。
 - 通过后再完整执行一遍 `checks.commands`，若仍产生改动则再提交。
+- 最终修复后 checks 已通过且只读 Reviewer 未改变 HEAD 时，复用该结果，不对同一 commit 连续执行
+  两次完整 checks。
 
 ### Push 与 PR
 

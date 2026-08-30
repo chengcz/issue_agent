@@ -387,6 +387,7 @@ def test_final_checks_failure_triggers_a_fix_commit(tmp_path, monkeypatch):
     assert messages == ["feat: One (#4)", "feat: final review fixes (#4)"]
     worker_prompts = [call.args[1] for call in app.agents["worker"].execute.await_args_list]
     assert "pytest failed" in worker_prompts[1]
+    assert calls["n"] == 4
     app.workspaces.push.assert_awaited_once()
 
 
