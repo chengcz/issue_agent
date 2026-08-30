@@ -790,9 +790,13 @@ class Orchestrator:
                     raise
             self.state.update(issue.number, TaskStatus.CODING, current_seq=-1)
             issue_log.event("final_fix_started", attempt=attempt)
-            await self._execute_agent(
-                agent_name, workspace, make_final_fix_prompt(issue, last_error)
-            )
+            try:
+                await self._execute_agent(
+                    agent_name, workspace, make_final_fix_prompt(issue, last_error)
+                )
+            except CommandError as exc:
+                self.state.update_final_context(issue.number, last_error=str(exc))
+                raise
             try:
                 await self._run_checks(workspace, issue_log, baseline, attempt=attempt, stage="final")
                 checks_current = True
