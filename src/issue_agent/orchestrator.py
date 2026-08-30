@@ -517,10 +517,12 @@ class Orchestrator:
             return
         if start_seq > 0:
             anchor = self.state.plan_task_commit(issue_number, start_seq - 1)
-            if anchor:
-                await self.workspaces.reset(workspace, anchor)
-                await self.workspaces.clean(workspace)
-                return
+            if not anchor:
+                raise CommandError(
+                    f"missing commit anchor for issue #{issue_number} task {start_seq - 1}"
+                )
+            await self.workspaces.reset(workspace, anchor)
+            await self.workspaces.clean(workspace)
             return
         await self.workspaces.reset(workspace, f"origin/{self.config.base_branch}")
         await self.workspaces.clean(workspace)
