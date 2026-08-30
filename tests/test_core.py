@@ -11,7 +11,7 @@ from issue_agent.config import load_config
 from issue_agent.github import GitHub
 from issue_agent.issue_log import IssueLog
 from issue_agent.models import Issue, PlanTask, TaskStatus
-from issue_agent.orchestrator import Orchestrator, failed_tests
+from issue_agent.orchestrator import CheckBaseline, Orchestrator, failed_tests
 from issue_agent.process import CommandError, Result, shell
 from issue_agent.state import StateStore
 from issue_agent.workspace import slugify
@@ -283,7 +283,17 @@ def test_run_checks_tolerates_pre_existing_failures(tmp_path, monkeypatch):
     monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
     log = _Log()
     asyncio.run(
-        app._run_checks(tmp_path, log, {"backend/tests/test_teams.py::test_a"})
+        app._run_checks(
+            tmp_path,
+            log,
+            {
+                "pytest": CheckBaseline(
+                    1,
+                    frozenset({"backend/tests/test_teams.py::test_a"}),
+                    "FAILED backend/tests/test_teams.py::test_a - x",
+                )
+            },
+        )
     )
     assert log.events[0][0] == "check_passed_pre_existing"
     assert log.events[0][1]["pre_existing"] == ["backend/tests/test_teams.py::test_a"]
@@ -302,7 +312,19 @@ def test_run_checks_flags_new_failures_and_blames_only_them(tmp_path, monkeypatc
 
     monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
     with pytest.raises(CommandError) as exc:
-        asyncio.run(app._run_checks(tmp_path, _Log(), {"backend/tests/test_teams.py::test_a"}))
+        asyncio.run(
+            app._run_checks(
+                tmp_path,
+                _Log(),
+                {
+                    "pytest": CheckBaseline(
+                        1,
+                        frozenset({"backend/tests/test_teams.py::test_a"}),
+                        "FAILED backend/tests/test_teams.py::test_a - x",
+                    )
+                },
+            )
+        )
     assert "1 new failure(s)" in str(exc.value)
     # the summary block only names the new failure, never the pre-existing one
     summary = str(exc.value).split("\n\n")[0]
@@ -318,7 +340,54 @@ def test_run_checks_still_fails_without_failed_lines(tmp_path, monkeypatch):
 
     monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
     with pytest.raises(CommandError):
-        asyncio.run(app._run_checks(tmp_path, _Log(), set()))
+        asyncio.run(app._run_checks(tmp_path, _Log(), {}))
+
+
+def test_run_checks_tolerates_unchanged_non_pytest_failure(tmp_path, monkeypatch):
+    app = _app(tmp_path, ["python -m compileall src"])
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        return Result(1, "SyntaxError: existing bad input\n", "")
+
+    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    baseline = asyncio.run(app._capture_baseline(tmp_path))
+    log = _Log()
+    asyncio.run(app._run_checks(tmp_path, log, baseline))
+    assert log.events[0][0] == "check_passed_pre_existing"
+
+
+def test_run_checks_flags_changed_non_pytest_failure(tmp_path, monkeypatch):
+    app = _app(tmp_path, ["python -m compileall src"])
+    results = iter(
+        [
+            Result(1, "SyntaxError: existing bad input\n", ""),
+            Result(1, "SyntaxError: new bad input\n", ""),
+        ]
+    )
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        return next(results)
+
+    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    baseline = asyncio.run(app._capture_baseline(tmp_path))
+    with pytest.raises(CommandError, match="new bad input"):
+        asyncio.run(app._run_checks(tmp_path, _Log(), baseline))
+
+
+def test_run_checks_keeps_baselines_isolated_by_command(tmp_path, monkeypatch):
+    app = _app(tmp_path, ["pytest unit", "pytest integration"])
+    baseline = {
+        "pytest unit": CheckBaseline(1, frozenset({"tests/test_api.py::test_a"}), "old"),
+    }
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        if command == "pytest unit":
+            return Result(0, "", "")
+        return Result(1, "FAILED tests/test_api.py::test_a - new\n", "")
+
+    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    with pytest.raises(CommandError, match="1 new failure"):
+        asyncio.run(app._run_checks(tmp_path, _Log(), baseline))
 
 
 def test_capture_baseline_collects_pre_existing_failures(tmp_path, monkeypatch):
@@ -331,7 +400,13 @@ def test_capture_baseline_collects_pre_existing_failures(tmp_path, monkeypatch):
 
     monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
     baseline = asyncio.run(app._capture_baseline(tmp_path))
-    assert baseline == {"backend/tests/test_teams.py::test_a"}
+    assert baseline == {
+        "pytest": CheckBaseline(
+            1,
+            frozenset({"backend/tests/test_teams.py::test_a"}),
+            "FAILED backend/tests/test_teams.py::test_a - x",
+        )
+    }
 
 
 def test_run_task_cleans_state_after_failure(tmp_path, monkeypatch):
@@ -373,7 +448,7 @@ command = "fake -"
     with pytest.raises(CommandError):
         asyncio.run(
             app._run_task(
-                tmp_path, issue, [PlanTask("Implement", "Description")], 0, "codex", issue_log, set()
+                tmp_path, issue, [PlanTask("Implement", "Description")], 0, "codex", issue_log, {}
             )
         )
 
@@ -382,3 +457,4 @@ command = "fake -"
     row = app.state.rows()[0]
     assert row["current_seq"] == -1
     assert "test_new.py::test_b" in str(row["last_error"])
+
