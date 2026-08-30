@@ -309,7 +309,9 @@ repo = "a/b"
 commands = {json.dumps(checks)}
 """
     )
-    return Orchestrator(load_config(config_file))
+    app = Orchestrator(load_config(config_file))
+    app._baseline_cache = None
+    return app
 
 
 class _Log:
@@ -453,6 +455,29 @@ def test_capture_baseline_collects_pre_existing_failures(tmp_path, monkeypatch):
             "FAILED backend/tests/test_teams.py::test_a - x",
         )
     }
+
+
+def test_capture_baseline_is_reused_for_same_anchor(tmp_path, monkeypatch):
+    app = _app(tmp_path, ["pytest"])
+    app._baseline_cache = {}
+    calls = 0
+
+    async def fake_head_commit(path):
+        return "anchor123"
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        nonlocal calls
+        calls += 1
+        return Result(1, "FAILED tests/test_api.py::test_a - existing\n", "")
+
+    monkeypatch.setattr(app.workspaces, "head_commit", fake_head_commit)
+    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+
+    first = asyncio.run(app._capture_baseline(tmp_path))
+    second = asyncio.run(app._capture_baseline(tmp_path))
+
+    assert first == second
+    assert calls == 1
 
 
 def test_run_task_cleans_state_after_failure(tmp_path, monkeypatch):
