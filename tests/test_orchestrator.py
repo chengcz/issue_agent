@@ -364,7 +364,10 @@ def test_exhausted_task_review_fails_and_keeps_issue_reclaimable(tmp_path):
 
 def test_second_task_review_rejection_stops_without_auto_retry(tmp_path):
     app = make_orchestrator(tmp_path, attempts=3)
-    app.agents["reviewer"].execute.return_value = result("Still incomplete.\nVERDICT: REQUEST_CHANGES\n")
+    app.agents["reviewer"].execute.side_effect = [
+        result("First feedback.\nVERDICT: REQUEST_CHANGES\n"),
+        result("Latest feedback.\nVERDICT: REQUEST_CHANGES\n"),
+    ]
     app.workspaces.changed.side_effect = [True, True]
     issue = Issue(4, "Task", "Body")
     app.state.claim(issue, "worker")
@@ -379,6 +382,8 @@ def test_second_task_review_rejection_stops_without_auto_retry(tmp_path):
     removes = app.github.labels.await_args_list[-1].kwargs["remove"]
     assert adds == ("agent-failed",)
     assert "agent-ready" in removes
+    assert app.state.plan_task_statuses(4) == [TaskStatus.PENDING]
+    assert "Latest feedback" in app.state.plan_task_last_error(4, 0)
 
 
 def test_second_final_review_rejection_stops_without_auto_retry(tmp_path):

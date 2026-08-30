@@ -458,3 +458,70 @@ command = "fake -"
     assert row["current_seq"] == -1
     assert "test_new.py::test_b" in str(row["last_error"])
 
+
+def test_plan_task_last_error_roundtrip(tmp_path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(1, "Task", "Body"), "codex")
+    state.save_plan(1, [PlanTask("One", "D")])
+    assert state.plan_task_last_error(1, 0) == ""
+    state.update_plan_task(1, 0, last_error="boom")
+    assert state.plan_task_last_error(1, 0) == "boom"
+
+
+def test_run_task_seeds_first_prompt_with_persisted_error(tmp_path, monkeypatch):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text(
+        """
+[runtime]
+repo = "."
+state_db = "state.db"
+log_dir = "logs"
+default_agent = "codex"
+dry_run = true
+[github]
+repo = "a/b"
+[checks]
+commands = ["pytest"]
+[agents.codex]
+command = "fake -"
+"""
+    )
+    app = Orchestrator(load_config(config_file))
+    issue = Issue(1, "Task", "Body")
+    app.state.claim(issue, "codex")
+    app.state.save_plan(1, [PlanTask("Implement", "Description")])
+    app.state.update(1, TaskStatus.PLANNED, current_seq=0)
+    app.state.update_plan_task(1, 0, last_error="persisted boom")
+
+    prompts = []
+
+    async def fake_execute(workspace, prompt, *, review=False):
+        prompts.append(prompt)
+        return Result(0, "done", "")
+
+    app.agents["codex"] = SimpleNamespace(execute=fake_execute)
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        return Result(0, "", "")
+
+    async def fake_changed(path):
+        return True
+
+    async def fake_commit(path, message):
+        return None
+
+    async def fake_head_commit(path):
+        return "abc1234"
+
+    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr(app.workspaces, "changed", fake_changed)
+    monkeypatch.setattr(app.workspaces, "commit", fake_commit)
+    monkeypatch.setattr(app.workspaces, "head_commit", fake_head_commit)
+
+    issue_log = IssueLog(tmp_path / "logs", 1)
+    asyncio.run(
+        app._run_task(
+            tmp_path, issue, [PlanTask("Implement", "Description")], 0, "codex", issue_log, {}
+        )
+    )
+    assert "persisted boom" in prompts[0]
