@@ -34,7 +34,8 @@ class StateStore:
                 issue_number INTEGER PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
                 agent TEXT, branch TEXT, worktree TEXT, attempts INTEGER NOT NULL DEFAULT 0,
                 failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, pr_url TEXT, plan TEXT,
-                current_seq INTEGER NOT NULL DEFAULT -1, updated_at TEXT NOT NULL
+                current_seq INTEGER NOT NULL DEFAULT -1, final_commit_hash TEXT,
+                final_last_error TEXT, updated_at TEXT NOT NULL
             )""")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
             if "plan" not in columns:
@@ -43,6 +44,10 @@ class StateStore:
                 db.execute("ALTER TABLE tasks ADD COLUMN current_seq INTEGER NOT NULL DEFAULT -1")
             if "failures" not in columns:
                 db.execute("ALTER TABLE tasks ADD COLUMN failures INTEGER NOT NULL DEFAULT 0")
+            if "final_commit_hash" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN final_commit_hash TEXT")
+            if "final_last_error" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN final_last_error TEXT")
             db.execute("""CREATE TABLE IF NOT EXISTS plan_tasks (
                 issue_number INTEGER NOT NULL, seq INTEGER NOT NULL,
                 title TEXT NOT NULL, description TEXT NOT NULL,
@@ -195,6 +200,37 @@ class StateStore:
                 "SELECT last_error FROM plan_tasks WHERE issue_number=? AND seq=?", (issue_number, seq)
             ).fetchone()
         return (row["last_error"] if row else None) or ""
+
+    def final_context(self, issue_number: int) -> tuple[str | None, str]:
+        """Return the last verified final-fix commit and final-stage error."""
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT final_commit_hash,final_last_error FROM tasks WHERE issue_number=?",
+                (issue_number,),
+            ).fetchone()
+        if not row:
+            return None, ""
+        return row["final_commit_hash"] or None, row["final_last_error"] or ""
+
+    def update_final_context(
+        self,
+        issue_number: int,
+        *,
+        commit_hash: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        """Persist final-stage recovery data without changing the task status."""
+        fields: dict[str, object] = {"updated_at": datetime.now(UTC).isoformat()}
+        if commit_hash is not None:
+            fields["final_commit_hash"] = commit_hash
+        if last_error is not None:
+            fields["final_last_error"] = last_error
+        sql = ",".join(f"{key}=?" for key in fields)
+        with self.connect() as db:
+            db.execute(
+                f"UPDATE tasks SET {sql} WHERE issue_number=?",
+                (*fields.values(), issue_number),
+            )
 
     def rows(self) -> list[dict[str, object]]:
         with self.connect() as db:

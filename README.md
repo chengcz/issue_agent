@@ -91,6 +91,8 @@ orchestrator 统一 push 分支（finalize 前从不 push，因此 amend/reset �
   - 预算内：恢复 `agent-ready`，下一轮自动重跑。
   - 预算耗尽：摘掉 `agent-ready` 搁置，需人工 `reset`。
 - 重新领取后从第一个未完成任务断点续跑。
+- 最终 Review 已产生的修复 commit 和最新反馈也会持久化；最终阶段重试不会退回最后一个普通任务
+  commit 后重新返修。
 
 ### reset 命令
 

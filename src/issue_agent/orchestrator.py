@@ -326,7 +326,13 @@ class Orchestrator:
             else:
                 issue_log.event("plan_reused", tasks=[task.to_dict() for task in plan])
             start_seq = self._resume_seq(issue.number, plan)
-            await self._reset_to_anchor(workspace, issue.number, start_seq)
+            final_commit, _ = self.state.final_context(issue.number)
+            await self._reset_to_anchor(
+                workspace,
+                issue.number,
+                start_seq,
+                final_commit=final_commit if start_seq == len(plan) else None,
+            )
             self.state.update(issue.number, TaskStatus.PLANNED, current_seq=start_seq)
             baseline = await self._capture_baseline(workspace)
             self.workspaces.write_plan_file(workspace, plan)
@@ -441,13 +447,24 @@ class Orchestrator:
                 return seq
         return len(plan)
 
-    async def _reset_to_anchor(self, workspace, issue_number: int, start_seq: int) -> None:
+    async def _reset_to_anchor(
+        self,
+        workspace,
+        issue_number: int,
+        start_seq: int,
+        *,
+        final_commit: str | None = None,
+    ) -> None:
         """Drop half-finished commits and stray files past the last completed task.
 
         Resetting and cleaning gives a retry a clean starting point: leftover
         untracked files from a failed attempt cannot leak into the next one and
         shift which checks fail.
         """
+        if final_commit:
+            await self.workspaces.reset(workspace, final_commit)
+            await self.workspaces.clean(workspace)
+            return
         if start_seq > 0:
             anchor = self.state.plan_task_commit(issue_number, start_seq - 1)
             if anchor:
@@ -639,7 +656,7 @@ class Orchestrator:
         baseline: dict[str, CheckBaseline],
     ) -> None:
         """Whole-branch review, fixes, and the final checks before push."""
-        last_error = ""
+        _, last_error = self.state.final_context(issue.number)
         attempt_limit = _REVIEW_ATTEMPTS if self.config.reviewer_agent else self.config.max_attempts
         for attempt in range(1, attempt_limit + 1):
             issue_log.event("final_review_attempt_started", attempt=attempt)
@@ -673,19 +690,33 @@ class Orchestrator:
                 await self._run_checks(workspace, issue_log, baseline, attempt=attempt, stage="final")
                 if await self.workspaces.changed(workspace):
                     await self.workspaces.commit(workspace, f"feat: final review fixes (#{issue.number})")
+                    self.state.update_final_context(
+                        issue.number,
+                        commit_hash=await self.workspaces.head_commit(workspace),
+                    )
                     issue_log.event("final_fix_committed", attempt=attempt)
+                self.state.update_final_context(issue.number, last_error="")
                 issue_log.event("final_review_completed", attempt=attempt)
                 return
             except CommandError as exc:
                 last_error = str(exc)
+                self.state.update_final_context(issue.number, last_error=last_error)
                 issue_log.event("final_review_failed", attempt=attempt, error=last_error)
                 if isinstance(exc, (InvalidReviewVerdict, ReadOnlyViolation, ReviewRejected)):
                     raise
             self.state.update(issue.number, TaskStatus.CODING, current_seq=-1)
             issue_log.event("final_fix_started", attempt=attempt)
             await self.agents[agent_name].execute(workspace, make_final_fix_prompt(issue, last_error))
-            await self._run_checks(workspace, issue_log, baseline, attempt=attempt, stage="final")
+            try:
+                await self._run_checks(workspace, issue_log, baseline, attempt=attempt, stage="final")
+            except CommandError as exc:
+                self.state.update_final_context(issue.number, last_error=str(exc))
+                raise
             if await self.workspaces.changed(workspace):
                 await self.workspaces.commit(workspace, f"feat: final review fixes (#{issue.number})")
+                self.state.update_final_context(
+                    issue.number,
+                    commit_hash=await self.workspaces.head_commit(workspace),
+                )
                 issue_log.event("final_fix_committed", attempt=attempt)
         raise CommandError(last_error or "maximum attempts exceeded")
