@@ -457,6 +457,37 @@ def test_second_final_review_rejection_stops_without_auto_retry(tmp_path):
     assert app.github.labels.await_args_list[-1].kwargs["add"] == ("agent-failed",)
 
 
+def test_final_review_retry_resumes_from_final_fix_commit(tmp_path):
+    app = make_orchestrator(tmp_path, attempts=3)
+    app.agents["reviewer"].execute.side_effect = [
+        result(APPROVE),
+        result("Need docs.\nVERDICT: REQUEST_CHANGES\n"),
+        result("Still missing docs.\nVERDICT: REQUEST_CHANGES\n"),
+        result(APPROVE),
+    ]
+    app.workspaces.changed.side_effect = [True, True, False]
+    app.workspaces.head_commit.side_effect = ["task111", "final222"]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    asyncio.run(app.process(issue, "worker"))
+
+    expected_error = (
+        "final review requested changes after the allowed fix cycle:\n"
+        "Still missing docs.\nVERDICT: REQUEST_CHANGES\n"
+    )
+    assert app.state.final_context(4) == ("final222", expected_error)
+    app.workspaces.reset.reset_mock()
+    assert app.state.claim(issue, "worker", max_attempts=3) is True
+    asyncio.run(app.process(issue, "worker"))
+
+    app.workspaces.reset.assert_awaited_once_with(tmp_path, "final222")
+    assert app.agents["worker"].execute.await_count == 2
+    app.workspaces.push.assert_awaited_once()
+    assert app.state.final_context(4) == ("final222", "")
+
+
 def test_invalid_final_review_verdict_requeues_without_coding_fix(tmp_path):
     app = make_orchestrator(tmp_path, attempts=3)
     app.agents["reviewer"].execute.side_effect = [

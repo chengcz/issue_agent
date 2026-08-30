@@ -489,6 +489,16 @@ def test_plan_task_last_error_roundtrip(tmp_path):
     assert state.plan_task_last_error(1, 0) == "boom"
 
 
+def test_final_context_roundtrip(tmp_path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(1, "Task", "Body"), "codex")
+    assert state.final_context(1) == (None, "")
+    state.update_final_context(1, commit_hash="abc1234", last_error="final review failed")
+    assert state.final_context(1) == ("abc1234", "final review failed")
+    state.update_final_context(1, last_error="")
+    assert state.final_context(1) == ("abc1234", "")
+
+
 def test_run_task_seeds_first_prompt_with_persisted_error(tmp_path, monkeypatch):
     config_file = tmp_path / "issue-agent.toml"
     config_file.write_text(
