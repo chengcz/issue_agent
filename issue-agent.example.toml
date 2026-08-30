@@ -6,6 +6,7 @@ log_dir = "/opt/agent-dev/logs"
 poll_seconds = 60
 max_workers = 3
 max_attempts = 3
+max_task_attempts = 2
 default_agent = "codex"
 reviewer_agent = "claude"
 planner_agent = "claude"

@@ -27,6 +27,7 @@ class Config:
     poll_seconds: int = 60
     max_workers: int = 3
     max_attempts: int = 3
+    max_task_attempts: int = 2
     checks: tuple[str, ...] = ("pytest -q",)
     default_agent: str = "codex"
     reviewer_agent: str = ""
@@ -79,6 +80,7 @@ def load_config(path: str | Path) -> Config:
         poll_seconds=int(runtime.get("poll_seconds", 60)),
         max_workers=int(runtime.get("max_workers", 3)),
         max_attempts=int(runtime.get("max_attempts", 3)),
+        max_task_attempts=int(runtime.get("max_task_attempts", 2)),
         checks=tuple(raw.get("checks", {}).get("commands", ["pytest -q"])),
         default_agent=runtime.get("default_agent", "codex"),
         reviewer_agent=runtime.get("reviewer_agent", ""),

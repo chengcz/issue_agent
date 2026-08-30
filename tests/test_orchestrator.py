@@ -22,6 +22,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
     app = Orchestrator.__new__(Orchestrator)
     app.config = SimpleNamespace(
         max_attempts=attempts,
+        max_task_attempts=attempts,
         checks=(),
         reviewer_agent=reviewer,
         planner_agent="planner",
@@ -522,6 +523,24 @@ def test_command_errors_from_coding_are_retried(tmp_path):
     assert app.agents["worker"].execute.await_count == 2
     assert "first failure" in app.agents["worker"].execute.await_args_list[1].args[1]
     app.workspaces.push.assert_awaited_once()
+
+
+def test_task_attempt_budget_is_independent_from_issue_retry_budget(tmp_path):
+    app = make_orchestrator(tmp_path, attempts=3)
+    app.config.max_task_attempts = 1
+    app.config.reviewer_agent = ""
+    app.agents["worker"].execute.side_effect = CommandError("agent unavailable")
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    asyncio.run(app.process(issue, "worker"))
+
+    assert app.agents["worker"].execute.await_count == 1
+    row = app.state.rows()[0]
+    assert row["failures"] == 1
+    assert row["status"] == str(TaskStatus.FAILED)
+    assert "agent-ready" in app.github.labels.await_args_list[-1].kwargs["add"]
 
 
 def test_unexpected_errors_remain_blocked(tmp_path):
