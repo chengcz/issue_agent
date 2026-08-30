@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from .models import Issue
-from .process import run
+from .process import CommandError, run
 
 
 class GitHub:
@@ -60,8 +60,25 @@ class GitHub:
     async def create_pr(self, number: int, branch: str, base: str, title: str, checks: tuple[str, ...]) -> str:
         if self.dry_run:
             return f"dry-run://pr/{number}"
+        existing = await self.find_pr(branch)
+        if existing:
+            return existing
         body = "\n".join((f"Closes #{number}", "", "Automated checks:", *(f"- `{c}`" for c in checks), "", "Human review required."))
-        return (await self._gh("pr", "create", "--base", base, "--head", branch, "--title", title, "--body", body)).strip()
+        try:
+            return (await self._gh("pr", "create", "--base", base, "--head", branch, "--title", title, "--body", body)).strip()
+        except CommandError:
+            existing = await self.find_pr(branch)
+            if existing:
+                return existing
+            raise
+
+    async def find_pr(self, branch: str) -> str:
+        """Return an existing open PR URL for a branch, if any."""
+        output = await self._gh(
+            "pr", "list", "--state", "open", "--head", branch, "--limit", "1", "--json", "url"
+        )
+        items = json.loads(output)
+        return str(items[0]["url"]) if items else ""
 
     async def comment(self, number: int, body: str) -> None:
         if not self.dry_run:

@@ -206,8 +206,17 @@ class Orchestrator:
             if self.config.auto_plan_unlabeled
             else []
         )
+        persisted = {int(row["issue_number"]): row for row in self.state.rows()}
         for issue in runnable:
             if issue.number in self.running:
+                continue
+            row = persisted.get(issue.number)
+            if row and row["status"] == str(TaskStatus.HUMAN_REVIEW):
+                await self.github.labels(
+                    issue.number,
+                    add=("human-review",),
+                    remove=("agent-running", "agent-failed", self.config.ready_label),
+                )
                 continue
             try:
                 agent_name = self.select_agent(issue)
