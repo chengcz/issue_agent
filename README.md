@@ -606,7 +606,9 @@ issue-agent --config /etc/issue-agent/repo-a.toml status --json
 
 ### 6. 多 Worker 与容量
 
-`runtime.max_workers` 限制单仓库总并发，`agents.<name>.max_workers` 限制特定 Agent 并发，实际并发取二者允许的较小值。一台机器上所有实例的 Worker 总数还应受 CPU、内存、磁盘 I/O 和 API 限额约束。
+`runtime.max_workers` 限制单仓库同时处理的 Issue 数，`agents.<name>.max_workers` 只限制该 Agent
+CLI 的同时调用数；checks、Git 和 GitHub 操作不会继续占用 Agent 配额。一台机器上所有实例的
+Worker 总数还应受 CPU、内存、磁盘 I/O 和 API 限额约束。
 Planner 和 Reviewer 使用与其 Agent 名称对应的同一配额；当实现 Agent 与 Reviewer 不同时，不会绕过
 Reviewer 的 `max_workers`。
 
