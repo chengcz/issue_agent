@@ -7,7 +7,6 @@ pytest-cache-files-*/
 .ruff_cache/
 .cao/
 .autocode/
-docs/
 /bioagent.toml
 /bioagent/repo/
 /bioagent/worktrees/
