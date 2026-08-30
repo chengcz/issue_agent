@@ -11,7 +11,8 @@
 
 1. 开启 `auto_plan_unlabeled` 后，轮询没有任何 Label 的新 GitHub Issue。
 2. **Plan-only**：planner agent 只读探索代码库，把 Issue 拆成 1..N 个顺序任务，将 Plan 持久化到
-   SQLite 和 `.agent/plan.md`，并评论到 GitHub Issue。此阶段不修改业务代码、不 commit、不 push、不创建 PR。
+   SQLite 和 `.agent/plan.md`，并评论到 GitHub Issue。orchestrator 会校验 planner 没有产生仓库改动，
+   发现改动时立即恢复工作区并按失败处理。此阶段不 commit、不 push、不创建 PR。
 3. 人工审核 Plan、补充需求，然后手动添加 `agent-ready`。
 4. 根据 `agent:<name>` 标签选择实现 Agent；未指定则使用默认 Agent。
 5. 从本地已创建的 Issue worktree 和持久化 Plan 继续执行；直接带 `agent-ready` 发布的 Issue 则在执行前生成 Plan。
@@ -62,6 +63,7 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
 5. 配置了 reviewer 时，对最近一个 commit 做只读 Review：
    - `VERDICT: REQUEST_CHANGES` → 把反馈回喂给实现 Agent 修复并 amend 同一 commit 再 Review；
      第二次仍不通过立即停止（不再自动返修），等人工检查 review 日志后重试。
+   - Reviewer 产生仓库改动 → 立即恢复到 Review 前的 commit，并按普通失败处理。
    - 无合法 verdict → 按普通失败处理；预算内恢复 `agent-ready` 后重试，不要求实现 Agent
      根据无效 Review 输出修改代码。
 6. 通过后该 plan 任务标记 `done`，记录 commit hash。

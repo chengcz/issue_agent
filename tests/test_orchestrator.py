@@ -42,6 +42,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
     )
     app.workspaces = SimpleNamespace(
         create=AsyncMock(return_value=(tmp_path, "agent/4-task")),
+        status=AsyncMock(return_value=""),
         changed=AsyncMock(return_value=True),
         commit=AsyncMock(),
         amend=AsyncMock(),
@@ -254,6 +255,20 @@ def test_unlabeled_issue_plan_waits_for_ready_before_coding(tmp_path):
     app.github.create_pr.assert_awaited_once()
 
 
+def test_plan_only_restores_workspace_when_planner_writes_files(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.workspaces.status.side_effect = ["", " M src/app.py"]
+    issue = Issue(4, "Vague task", "Improve this module")
+    assert app.state.claim_for_planning(issue, "planner") is True
+
+    asyncio.run(app.plan_only(issue))
+
+    assert app.state.rows()[0]["status"] == str(TaskStatus.FAILED)
+    app.workspaces.reset.assert_any_await(tmp_path, "HEAD")
+    assert app.workspaces.clean.await_count >= 2
+    assert "modified the workspace" in app.github.comment.await_args.args[1]
+
+
 def test_run_once_routes_unlabeled_issue_to_plan_only(tmp_path):
     app = make_orchestrator(tmp_path)
     issue = Issue(12, "Needs planning", "A vague request")
@@ -402,6 +417,23 @@ def test_invalid_task_review_verdict_requeues_within_failure_budget(tmp_path):
     labels = app.github.labels.await_args_list[-1].kwargs
     assert "agent-ready" in labels["add"]
     assert "agent-failed" in labels["add"]
+    assert app.state.plan_task_statuses(4) == [TaskStatus.PENDING]
+
+
+def test_task_reviewer_write_is_reverted_and_requeued(tmp_path):
+    app = make_orchestrator(tmp_path, attempts=3)
+    app.workspaces.status.side_effect = ["", " M src/app.py"]
+    app.workspaces.changed.side_effect = [True]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    asyncio.run(app.process(issue, "worker"))
+
+    app.workspaces.reset.assert_any_await(tmp_path, "HEAD")
+    assert app.workspaces.clean.await_count >= 2
+    labels = app.github.labels.await_args_list[-1].kwargs
+    assert "agent-ready" in labels["add"]
     assert app.state.plan_task_statuses(4) == [TaskStatus.PENDING]
 
 

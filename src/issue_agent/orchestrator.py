@@ -34,6 +34,10 @@ class InvalidReviewVerdict(CommandError):
     """A reviewer response cannot be acted on safely and should be retried later."""
 
 
+class ReadOnlyViolation(CommandError):
+    """A planner or reviewer changed the repository during a read-only run."""
+
+
 def review_verdict(stdout: str) -> str | None:
     """Return a review verdict only when it is the final non-empty output line."""
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
@@ -396,12 +400,36 @@ class Orchestrator:
         if not self.config.planner_agent:
             plan = [PlanTask(title=issue.title, description=issue.body)]
         else:
-            result = await self.agents[self.config.planner_agent].execute(
-                workspace, make_plan_prompt(issue, self.config.max_tasks), review=True
+            await self._reset_to_anchor(workspace, issue.number, 0)
+            result = await self._execute_read_only(
+                self.config.planner_agent,
+                workspace,
+                make_plan_prompt(issue, self.config.max_tasks),
+                role="planner",
             )
             plan = parse_plan(result.stdout, self.config.max_tasks)
         self.state.save_plan(issue.number, plan)
         return plan
+
+    async def _execute_read_only(self, agent_name, workspace, prompt: str, *, role: str):
+        """Run a planner/reviewer and restore any repository changes it makes."""
+        if await self.workspaces.status(workspace):
+            raise CommandError(f"cannot start read-only {role}: workspace is not clean")
+        try:
+            result = await self.agents[agent_name].execute(workspace, prompt, review=True)
+        except Exception as exc:
+            if await self.workspaces.status(workspace):
+                await self.workspaces.reset(workspace, "HEAD")
+                await self.workspaces.clean(workspace)
+                raise ReadOnlyViolation(
+                    f"read-only {role} modified the workspace before failing"
+                ) from exc
+            raise
+        if await self.workspaces.status(workspace):
+            await self.workspaces.reset(workspace, "HEAD")
+            await self.workspaces.clean(workspace)
+            raise ReadOnlyViolation(f"read-only {role} modified the workspace")
+        return result
 
     def _resume_seq(self, issue_number: int, plan: list[PlanTask]) -> int:
         """First plan index that is not DONE; len(plan) when all tasks are done (final phase)."""
@@ -549,8 +577,11 @@ class Orchestrator:
 
                 if self.config.reviewer_agent:
                     self.state.update(issue.number, TaskStatus.REVIEWING)
-                    review = await self.agents[self.config.reviewer_agent].execute(
-                        workspace, make_task_review_prompt(issue, task), review=True
+                    review = await self._execute_read_only(
+                        self.config.reviewer_agent,
+                        workspace,
+                        make_task_review_prompt(issue, task),
+                        role="task reviewer",
                     )
                     verdict = review_verdict(review.stdout)
                     issue_log.review(
@@ -584,7 +615,7 @@ class Orchestrator:
             except CommandError as exc:
                 last_error = str(exc)
                 issue_log.event("task_attempt_failed", sequence=seq, attempt=attempt, error=last_error)
-                if isinstance(exc, (InvalidReviewVerdict, ReviewRejected)):
+                if isinstance(exc, (InvalidReviewVerdict, ReadOnlyViolation, ReviewRejected)):
                     self.state.update_plan_task(
                         issue.number, seq, status=TaskStatus.PENDING, last_error=last_error
                     )
@@ -617,8 +648,11 @@ class Orchestrator:
             )
             try:
                 if self.config.reviewer_agent:
-                    review = await self.agents[self.config.reviewer_agent].execute(
-                        workspace, make_final_review_prompt(issue, plan, self.config.base_branch), review=True
+                    review = await self._execute_read_only(
+                        self.config.reviewer_agent,
+                        workspace,
+                        make_final_review_prompt(issue, plan, self.config.base_branch),
+                        role="final reviewer",
                     )
                     verdict = review_verdict(review.stdout)
                     issue_log.review("final", review.stdout, attempt=attempt, verdict=verdict or "invalid")
@@ -645,7 +679,7 @@ class Orchestrator:
             except CommandError as exc:
                 last_error = str(exc)
                 issue_log.event("final_review_failed", attempt=attempt, error=last_error)
-                if isinstance(exc, (InvalidReviewVerdict, ReviewRejected)):
+                if isinstance(exc, (InvalidReviewVerdict, ReadOnlyViolation, ReviewRejected)):
                     raise
             self.state.update(issue.number, TaskStatus.CODING, current_seq=-1)
             issue_log.event("final_fix_started", attempt=attempt)
