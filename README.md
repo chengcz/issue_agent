@@ -598,6 +598,8 @@ issue-agent --config /etc/issue-agent/repo-a.toml status --json
 ### 6. 多 Worker 与容量
 
 `runtime.max_workers` 限制单仓库总并发，`agents.<name>.max_workers` 限制特定 Agent 并发，实际并发取二者允许的较小值。一台机器上所有实例的 Worker 总数还应受 CPU、内存、磁盘 I/O 和 API 限额约束。
+Planner 和 Reviewer 使用与其 Agent 名称对应的同一配额；当实现 Agent 与 Reviewer 不同时，不会绕过
+Reviewer 的 `max_workers`。
 
 建议从每仓库 1 个 Worker 开始，观察完整编译和测试的峰值资源后再增加。一般可按每个 Worker 至少 2 个 CPU 核心、2–4 GB 内存估算；大型项目应以实测为准。确保磁盘容量可以容纳主 checkout、并行 worktrees、构建产物和依赖缓存。
 
