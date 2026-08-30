@@ -565,7 +565,9 @@ class Orchestrator:
         # A whole-issue retry resets the worktree to the anchor, so seed the
         # first attempt with the last recorded task failure.
         last_error = self.state.plan_task_last_error(issue.number, seq)
-        attempt_limit = _REVIEW_ATTEMPTS if self.config.reviewer_agent else self.config.max_attempts
+        attempt_limit = (
+            _REVIEW_ATTEMPTS if self.config.reviewer_agent else self.config.max_task_attempts
+        )
         for attempt in range(1, attempt_limit + 1):
             issue_log.event("task_attempt_started", sequence=seq, attempt=attempt)
             self.state.update(
@@ -657,7 +659,9 @@ class Orchestrator:
     ) -> None:
         """Whole-branch review, fixes, and the final checks before push."""
         _, last_error = self.state.final_context(issue.number)
-        attempt_limit = _REVIEW_ATTEMPTS if self.config.reviewer_agent else self.config.max_attempts
+        attempt_limit = (
+            _REVIEW_ATTEMPTS if self.config.reviewer_agent else self.config.max_task_attempts
+        )
         for attempt in range(1, attempt_limit + 1):
             issue_log.event("final_review_attempt_started", attempt=attempt)
             self.state.update(

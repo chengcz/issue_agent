@@ -440,6 +440,7 @@ state_db = "state.db"
 log_dir = "logs"
 default_agent = "codex"
 max_attempts = 2
+max_task_attempts = 1
 dry_run = true
 [github]
 repo = "a/b"
@@ -450,6 +451,8 @@ command = "fake -"
 """
     )
     app = Orchestrator(load_config(config_file))
+    assert app.config.max_attempts == 2
+    assert app.config.max_task_attempts == 1
     issue = Issue(1, "Task", "Body")
     app.state.claim(issue, "codex")
     app.state.save_plan(1, [PlanTask("Implement", "Description")])
