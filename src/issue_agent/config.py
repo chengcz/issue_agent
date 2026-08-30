@@ -31,6 +31,7 @@ class Config:
     max_task_attempts: int = 2
     checks: tuple[str, ...] = ("pytest -q",)
     check_timeout_seconds: int = 1800
+    baseline_cache_ttl_seconds: int = 300
     default_agent: str = "codex"
     reviewer_agent: str = ""
     planner_agent: str = ""
@@ -61,6 +62,8 @@ def validate_config(config: Config) -> None:
             raise ValueError(f"{name} must be greater than zero")
     if config.fetch_ttl_seconds < 0:
         raise ValueError("runtime.fetch_ttl_seconds must not be negative")
+    if config.baseline_cache_ttl_seconds < 0:
+        raise ValueError("checks.baseline_cache_ttl_seconds must not be negative")
     for name, agent in config.agents.items():
         if not agent.command:
             raise ValueError(f"agents.{name}.command must not be empty")
@@ -119,6 +122,7 @@ def load_config(path: str | Path) -> Config:
         max_task_attempts=int(runtime.get("max_task_attempts", 2)),
         checks=tuple(raw.get("checks", {}).get("commands", ["pytest -q"])),
         check_timeout_seconds=int(raw.get("checks", {}).get("timeout_seconds", 1800)),
+        baseline_cache_ttl_seconds=int(raw.get("checks", {}).get("baseline_cache_ttl_seconds", 300)),
         default_agent=runtime.get("default_agent", "codex"),
         reviewer_agent=runtime.get("reviewer_agent", ""),
         planner_agent=runtime.get("planner_agent", ""),

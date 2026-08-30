@@ -258,6 +258,7 @@ timeout_seconds = 17
     assert app.config.auto_plan_unlabeled is True
     assert app.config.auto_plan_limit == 7
     assert app.config.check_timeout_seconds == 17
+    assert app.config.baseline_cache_ttl_seconds == 300
 
 
 def test_config_rejects_unknown_reviewer_and_zero_limits(tmp_path: Path):
