@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 
 from .agents import (
     CliAgent,
@@ -51,6 +52,15 @@ def failed_tests(output: str) -> set[str]:
     tell a pre-existing failure from a regression the agent introduced.
     """
     return set(_RE_FAILED_TEST.findall(output))
+
+
+@dataclass(frozen=True)
+class CheckBaseline:
+    """One command's failure state captured before implementation starts."""
+
+    returncode: int
+    failed_tests: frozenset[str]
+    output: str
 
 
 _STRUCTURAL = ':,]}'
@@ -416,7 +426,7 @@ class Orchestrator:
         await self.workspaces.reset(workspace, f"origin/{self.config.base_branch}")
         await self.workspaces.clean(workspace)
 
-    async def _capture_baseline(self, workspace) -> set[str]:
+    async def _capture_baseline(self, workspace) -> dict[str, CheckBaseline]:
         """Record which checks already fail on the anchor commit, before the agent works.
 
         The worktree sits at the anchor (origin/base or the last completed task
@@ -424,18 +434,23 @@ class Orchestrator:
         pre-existing on the base and are not the agent's responsibility; later
         checks only fail on failures *new* relative to this baseline.
         """
-        baseline: set[str] = set()
+        baseline: dict[str, CheckBaseline] = {}
         for check in self.config.checks:
             result = await shell(check, cwd=workspace, check=False)
             if result.returncode != 0:
-                baseline |= failed_tests(f"{result.stdout}\n{result.stderr}")
+                output = f"{result.stdout}\n{result.stderr}".strip()
+                baseline[check] = CheckBaseline(
+                    returncode=result.returncode,
+                    failed_tests=frozenset(failed_tests(output)),
+                    output=output,
+                )
         return baseline
 
     async def _run_checks(
         self,
         workspace,
         issue_log,
-        baseline: set[str],
+        baseline: dict[str, CheckBaseline],
         *,
         seq: int | None = None,
         attempt: int | None = None,
@@ -443,10 +458,10 @@ class Orchestrator:
     ) -> None:
         """Run the configured checks, tolerating failures already present on the base branch.
 
-        A check whose failures are all in ``baseline`` passes (the agent is not
-        responsible for pre-existing breakage); a check that introduces any new
-        failure raises ``CommandError`` naming exactly those failures, so the
-        retry prompt tells the agent precisely what to fix.
+        Pytest failures are compared by node ID within the same command. Other
+        failing commands are tolerated only while their return code and output
+        remain unchanged. A regression raises ``CommandError`` so the retry
+        prompt tells the agent precisely what to fix.
         """
         prefix = "final_" if stage == "final" else ""
         for check in self.config.checks:
@@ -454,15 +469,25 @@ class Orchestrator:
             if result.returncode == 0:
                 issue_log.event(f"{prefix}check_passed", sequence=seq, attempt=attempt, command=check)
                 continue
-            current = failed_tests(f"{result.stdout}\n{result.stderr}")
-            new = current - baseline
-            if current and not new:
+            output = f"{result.stdout}\n{result.stderr}".strip()
+            current = failed_tests(output)
+            previous = baseline.get(check)
+            previous_tests = set(previous.failed_tests) if previous else set()
+            new = current - previous_tests
+            unchanged_generic_failure = (
+                not current
+                and previous is not None
+                and not previous.failed_tests
+                and result.returncode == previous.returncode
+                and output == previous.output
+            )
+            if (current and not new) or unchanged_generic_failure:
                 issue_log.event(
                     f"{prefix}check_passed_pre_existing",
                     sequence=seq,
                     attempt=attempt,
                     command=check,
-                    pre_existing=sorted(current),
+                    pre_existing=sorted(current) if current else ["unchanged command failure"],
                 )
                 continue
             tail = (result.stderr or result.stdout)[-4000:]
@@ -482,7 +507,7 @@ class Orchestrator:
         seq: int,
         agent_name: str,
         issue_log: IssueLog,
-        baseline: set[str],
+        baseline: dict[str, CheckBaseline],
     ) -> None:
         task = plan[seq]
         issue_log.event("task_started", sequence=seq, task=task.to_dict(), agent=agent_name)
@@ -568,7 +593,7 @@ class Orchestrator:
         plan: list[PlanTask],
         agent_name: str,
         issue_log: IssueLog,
-        baseline: set[str],
+        baseline: dict[str, CheckBaseline],
     ) -> None:
         """Whole-branch review, fixes, and the final checks before push."""
         last_error = ""
