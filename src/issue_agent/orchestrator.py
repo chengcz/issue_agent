@@ -320,7 +320,11 @@ class Orchestrator:
 
             plan = self.state.load_plan(issue.number)
             if plan is None:
-                plan = await self._plan(workspace, issue)
+                plan = await self._plan(
+                    workspace,
+                    issue,
+                    acquire_agent_limit=self.config.planner_agent != agent_name,
+                )
                 await self.github.comment(issue.number, "## Agent Plan\n\n" + format_plan(plan))
                 issue_log.event("plan_generated", tasks=[task.to_dict() for task in plan])
             else:
@@ -402,7 +406,13 @@ class Orchestrator:
             remove=("agent-running", self.config.ready_label),
         )
 
-    async def _plan(self, workspace, issue: Issue) -> list[PlanTask]:
+    async def _plan(
+        self,
+        workspace,
+        issue: Issue,
+        *,
+        acquire_agent_limit: bool = False,
+    ) -> list[PlanTask]:
         if not self.config.planner_agent:
             plan = [PlanTask(title=issue.title, description=issue.body)]
         else:
@@ -412,13 +422,30 @@ class Orchestrator:
                 workspace,
                 make_plan_prompt(issue, self.config.max_tasks),
                 role="planner",
+                acquire_agent_limit=acquire_agent_limit,
             )
             plan = parse_plan(result.stdout, self.config.max_tasks)
         self.state.save_plan(issue.number, plan)
         return plan
 
-    async def _execute_read_only(self, agent_name, workspace, prompt: str, *, role: str):
+    async def _execute_read_only(
+        self,
+        agent_name,
+        workspace,
+        prompt: str,
+        *,
+        role: str,
+        acquire_agent_limit: bool = False,
+    ):
         """Run a planner/reviewer and restore any repository changes it makes."""
+        if acquire_agent_limit:
+            async with self.agent_limits[agent_name]:
+                return await self._execute_read_only(
+                    agent_name,
+                    workspace,
+                    prompt,
+                    role=role,
+                )
         if await self.workspaces.status(workspace):
             raise CommandError(f"cannot start read-only {role}: workspace is not clean")
         try:
@@ -601,6 +628,7 @@ class Orchestrator:
                         workspace,
                         make_task_review_prompt(issue, task),
                         role="task reviewer",
+                        acquire_agent_limit=self.config.reviewer_agent != agent_name,
                     )
                     verdict = review_verdict(review.stdout)
                     issue_log.review(
@@ -674,6 +702,7 @@ class Orchestrator:
                         workspace,
                         make_final_review_prompt(issue, plan, self.config.base_branch),
                         role="final reviewer",
+                        acquire_agent_limit=self.config.reviewer_agent != agent_name,
                     )
                     verdict = review_verdict(review.stdout)
                     issue_log.review("final", review.stdout, attempt=attempt, verdict=verdict or "invalid")

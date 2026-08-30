@@ -65,6 +65,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         ),
         "reviewer": SimpleNamespace(execute=AsyncMock(return_value=result(APPROVE))),
     }
+    app.agent_limits = {name: asyncio.Semaphore(1) for name in app.agents}
     return app
 
 
@@ -77,6 +78,35 @@ def test_review_verdict_must_be_the_final_line():
     assert review_verdict("Looks good.\nVERDICT: APPROVE\n") == "VERDICT: APPROVE"
     assert review_verdict("VERDICT: APPROVE\nBut this is not done") is None
     assert review_verdict("No verdict") is None
+
+
+def test_read_only_agent_honors_its_own_concurrency_limit(tmp_path):
+    app = make_orchestrator(tmp_path)
+    active = 0
+    max_active = 0
+
+    async def execute(workspace, prompt, *, review=False):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return result(APPROVE)
+
+    app.agents["reviewer"].execute = execute
+
+    async def run_reviews():
+        await asyncio.gather(
+            app._execute_read_only(
+                "reviewer", tmp_path, "one", role="reviewer", acquire_agent_limit=True
+            ),
+            app._execute_read_only(
+                "reviewer", tmp_path, "two", role="reviewer", acquire_agent_limit=True
+            ),
+        )
+
+    asyncio.run(run_reviews())
+    assert max_active == 1
 
 
 def test_plan_prompt_demands_detail_but_single_line():
