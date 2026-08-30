@@ -382,6 +382,18 @@ def test_resume_reuses_plan_and_resets_to_last_done_commit(tmp_path):
     app.workspaces.push.assert_awaited_once()
 
 
+def test_resume_fails_when_completed_task_has_no_commit_anchor(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.state.claim(Issue(4, "Task", "Body"), "worker")
+    app.state.save_plan(4, [PlanTask("One", "D"), PlanTask("Two", "D")])
+    app.state.update_plan_task(4, 0, status=TaskStatus.DONE)
+
+    with pytest.raises(CommandError, match="missing commit anchor"):
+        asyncio.run(app._reset_to_anchor(tmp_path, 4, 1))
+
+    app.workspaces.reset.assert_not_awaited()
+
+
 def test_final_review_changes_produce_a_fix_commit(tmp_path):
     app = make_orchestrator(tmp_path)
     app.agents["reviewer"].execute.side_effect = [
