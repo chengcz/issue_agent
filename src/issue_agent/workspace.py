@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from .models import Issue, PlanTask
-from .process import run
+from .process import CommandError, run
 
 
 def slugify(title: str) -> str:
@@ -47,7 +47,12 @@ class WorkspaceManager:
         branch = f"agent/{issue.number}-{slugify(issue.title)}"
         path = self.root / str(issue.number)
         await self.fetch_base()
-        if not path.exists():
+        if path.exists():
+            current = await run(("git", "branch", "--show-current"), cwd=path)
+            branch = current.stdout.strip()
+            if not branch:
+                raise CommandError(f"existing worktree is not on a branch: {path}")
+        else:
             branch_exists = await run(
                 ("git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"),
                 cwd=self.repo,
