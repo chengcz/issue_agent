@@ -39,20 +39,38 @@ async def run(
         stderr=asyncio.subprocess.PIPE,
         **process_options,
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(stdin.encode() if stdin is not None else None), timeout=timeout
-        )
-    except TimeoutError:
+
+    async def terminate_process_tree() -> None:
         if os.name == "nt":
-            process.kill()
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/PID",
+                str(process.pid),
+                "/T",
+                "/F",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await killer.communicate()
+            if process.returncode is None:
+                process.kill()
         else:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
         await process.wait()
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(stdin.encode() if stdin is not None else None), timeout=timeout
+        )
+    except TimeoutError:
+        await terminate_process_tree()
         raise CommandError(f"command timed out after {timeout}s: {command[0]}") from None
+    except asyncio.CancelledError:
+        await terminate_process_tree()
+        raise
     result = Result(process.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace"))
     if check and result.returncode:
         tail = (result.stderr or result.stdout)[-4000:]

@@ -223,6 +223,17 @@ def test_shell_timeout_terminates_the_command(tmp_path: Path):
         asyncio.run(shell("sleep 10", cwd=tmp_path, timeout=0.01))
 
 
+def test_shell_cancellation_terminates_the_command(tmp_path: Path):
+    async def cancel_command():
+        task = asyncio.create_task(shell("sleep 10", cwd=tmp_path, timeout=30))
+        await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_command())
+
+
 def test_config_and_label_routing(tmp_path: Path):
     config_file = tmp_path / "issue-agent.toml"
     config_file.write_text('''
