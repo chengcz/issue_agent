@@ -51,6 +51,8 @@ async def run(
     return result
 
 
-async def shell(command: str, *, cwd: Path, timeout: int = 3600) -> Result:
+async def shell(
+    command: str, *, cwd: Path, timeout: int = 3600, check: bool = True
+) -> Result:
     shell_command = ("cmd.exe", "/d", "/s", "/c", command) if os.name == "nt" else ("/bin/sh", "-lc", command)
-    return await run(shell_command, cwd=cwd, timeout=timeout)
+    return await run(shell_command, cwd=cwd, timeout=timeout, check=check)

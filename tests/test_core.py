@@ -167,6 +167,11 @@ def test_shell_uses_platform_shell(tmp_path: Path):
     assert "available" in result.stdout
 
 
+def test_shell_can_return_nonzero_result_for_baseline_checks(tmp_path: Path):
+    result = asyncio.run(shell("exit 7", cwd=tmp_path, check=False))
+    assert result.returncode == 7
+
+
 def test_config_and_label_routing(tmp_path: Path):
     config_file = tmp_path / "issue-agent.toml"
     config_file.write_text('''
