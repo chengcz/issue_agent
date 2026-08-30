@@ -302,6 +302,7 @@ def test_github_unlabeled_issues_filters_any_labeled_issue(tmp_path: Path):
 
     assert [issue.number for issue in issues] == [1]
     assert "--label" not in github._gh.await_args.args
+    assert github._gh.await_args.args[github._gh.await_args.args.index("--search") + 1] == "no:label"
 
 
 def test_create_pr_reuses_existing_branch_pr(tmp_path: Path):
