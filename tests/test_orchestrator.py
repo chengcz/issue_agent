@@ -47,6 +47,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         amend=AsyncMock(),
         push=AsyncMock(),
         reset=AsyncMock(),
+        clean=AsyncMock(),
         head_commit=AsyncMock(return_value="abc1234"),
         write_plan_file=Mock(),
         write_task_file=Mock(),
@@ -321,9 +322,10 @@ def test_final_checks_failure_triggers_a_fix_commit(tmp_path, monkeypatch):
     ]
     calls = {"n": 0}
 
-    async def fake_shell(check: str, **kwargs: object) -> Result:
+    async def fake_shell(command: str, **kwargs: object) -> Result:
+        # call order: baseline capture, task checks, final attempt-1 checks, final attempt-2 checks
         calls["n"] += 1
-        if calls["n"] == 2:  # final checks of attempt 1 fail
+        if calls["n"] == 3:  # final checks of attempt 1 fail
             raise CommandError("pytest failed: 1 failed")
         return result()
 

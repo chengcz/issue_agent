@@ -1,13 +1,18 @@
 import asyncio
+import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+import pytest
 
 from issue_agent.cli import format_status, parser
 from issue_agent.config import load_config
 from issue_agent.github import GitHub
+from issue_agent.issue_log import IssueLog
 from issue_agent.models import Issue, PlanTask, TaskStatus
-from issue_agent.orchestrator import Orchestrator
-from issue_agent.process import shell
+from issue_agent.orchestrator import Orchestrator, failed_tests
+from issue_agent.process import CommandError, Result, shell
 from issue_agent.state import StateStore
 from issue_agent.workspace import slugify
 
@@ -223,3 +228,157 @@ def test_cli_uses_public_issue_agent_name():
     command = parser()
     assert command.prog == "issue-agent"
     assert command.parse_args(["status"]).config == "issue-agent.toml"
+
+
+# --- baseline-aware checks -------------------------------------------------
+
+
+def test_failed_tests_extracts_pytest_summary():
+    output = (
+        "backend/schemas/lit.py:311: PydanticDeprecatedSince20: ...\n"
+        "FAILED backend/tests/test_teams.py::test_list_create_and_member_crud - AttributeError: 'Depends'\n"
+        "FAILED backend/tests/test_iam.py::test_non_admin_cannot_assign_admin_role - AssertionError\n"
+        "1 failed, 201 passed, 37 warnings in 3.71s\n"
+    )
+    assert failed_tests(output) == {
+        "backend/tests/test_teams.py::test_list_create_and_member_crud",
+        "backend/tests/test_iam.py::test_non_admin_cannot_assign_admin_role",
+    }
+    assert failed_tests("200 passed, 37 warnings in 3.71s\n") == set()
+    assert failed_tests("") == set()
+
+
+def _app(tmp_path: Path, checks: list[str]) -> Orchestrator:
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text(
+        f"""
+[runtime]
+repo = "."
+state_db = "state.db"
+log_dir = "logs"
+dry_run = true
+[github]
+repo = "a/b"
+[checks]
+commands = {json.dumps(checks)}
+"""
+    )
+    return Orchestrator(load_config(config_file))
+
+
+class _Log:
+    def __init__(self):
+        self.events = []
+
+    def event(self, name, **fields):
+        self.events.append((name, fields))
+
+
+def test_run_checks_tolerates_pre_existing_failures(tmp_path, monkeypatch):
+    app = _app(tmp_path, ["pytest"])
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        return Result(1, "FAILED backend/tests/test_teams.py::test_a - x\n", "")
+
+    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    log = _Log()
+    asyncio.run(
+        app._run_checks(tmp_path, log, {"backend/tests/test_teams.py::test_a"})
+    )
+    assert log.events[0][0] == "check_passed_pre_existing"
+    assert log.events[0][1]["pre_existing"] == ["backend/tests/test_teams.py::test_a"]
+
+
+def test_run_checks_flags_new_failures_and_blames_only_them(tmp_path, monkeypatch):
+    app = _app(tmp_path, ["pytest"])
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        return Result(
+            1,
+            "FAILED backend/tests/test_teams.py::test_a - x\n"
+            "FAILED backend/tests/test_new.py::test_b - y\n",
+            "",
+        )
+
+    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    with pytest.raises(CommandError) as exc:
+        asyncio.run(app._run_checks(tmp_path, _Log(), {"backend/tests/test_teams.py::test_a"}))
+    assert "1 new failure(s)" in str(exc.value)
+    # the summary block only names the new failure, never the pre-existing one
+    summary = str(exc.value).split("\n\n")[0]
+    assert "test_new.py::test_b" in summary
+    assert "test_teams.py" not in summary
+
+
+def test_run_checks_still_fails_without_failed_lines(tmp_path, monkeypatch):
+    app = _app(tmp_path, ["compileall"])
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        return Result(2, "SyntaxError: bad input\n", "")
+
+    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    with pytest.raises(CommandError):
+        asyncio.run(app._run_checks(tmp_path, _Log(), set()))
+
+
+def test_capture_baseline_collects_pre_existing_failures(tmp_path, monkeypatch):
+    app = _app(tmp_path, ["compileall", "pytest"])
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        if "compileall" in command:
+            return Result(0, "", "")
+        return Result(1, "FAILED backend/tests/test_teams.py::test_a - x\n", "")
+
+    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    baseline = asyncio.run(app._capture_baseline(tmp_path))
+    assert baseline == {"backend/tests/test_teams.py::test_a"}
+
+
+def test_run_task_cleans_state_after_failure(tmp_path, monkeypatch):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text(
+        """
+[runtime]
+repo = "."
+state_db = "state.db"
+log_dir = "logs"
+default_agent = "codex"
+max_attempts = 2
+dry_run = true
+[github]
+repo = "a/b"
+[checks]
+commands = ["pytest"]
+[agents.codex]
+command = "fake -"
+"""
+    )
+    app = Orchestrator(load_config(config_file))
+    issue = Issue(1, "Task", "Body")
+    app.state.claim(issue, "codex")
+    app.state.save_plan(1, [PlanTask("Implement", "Description")])
+    app.state.update(1, TaskStatus.PLANNED, current_seq=0)
+
+    async def fake_execute(workspace, prompt, *, review=False):
+        return Result(0, "done", "")
+
+    app.agents["codex"] = SimpleNamespace(execute=fake_execute)
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        return Result(1, "FAILED backend/tests/test_new.py::test_b - y\n", "")
+
+    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    issue_log = IssueLog(tmp_path / "logs", 1)
+
+    with pytest.raises(CommandError):
+        asyncio.run(
+            app._run_task(
+                tmp_path, issue, [PlanTask("Implement", "Description")], 0, "codex", issue_log, set()
+            )
+        )
+
+    # the task is no longer stuck on CODING: plan row is retryable, cursor reset
+    assert app.state.plan_task_statuses(1) == [TaskStatus.PENDING]
+    row = app.state.rows()[0]
+    assert row["current_seq"] == -1
+    assert "test_new.py::test_b" in str(row["last_error"])

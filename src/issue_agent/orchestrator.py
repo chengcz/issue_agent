@@ -40,6 +40,19 @@ def review_verdict(stdout: str) -> str | None:
     return None
 
 
+_RE_FAILED_TEST = re.compile(r"^FAILED (\S+)", re.MULTILINE)
+
+
+def failed_tests(output: str) -> set[str]:
+    """Extract the failing test IDs pytest prints in its short summary.
+
+    The ``-q`` short summary emits one ``FAILED <path>::<node_id>`` line per
+    failure; those IDs are what we compare against the base-branch baseline to
+    tell a pre-existing failure from a regression the agent introduced.
+    """
+    return set(_RE_FAILED_TEST.findall(output))
+
+
 _STRUCTURAL = ':,]}'
 
 
@@ -294,16 +307,16 @@ class Orchestrator:
                 issue_log.event("plan_generated", tasks=[task.to_dict() for task in plan])
             else:
                 issue_log.event("plan_reused", tasks=[task.to_dict() for task in plan])
-            self.workspaces.write_plan_file(workspace, plan)
-
             start_seq = self._resume_seq(issue.number, plan)
             await self._reset_to_anchor(workspace, issue.number, start_seq)
             self.state.update(issue.number, TaskStatus.PLANNED, current_seq=start_seq)
+            baseline = await self._capture_baseline(workspace)
+            self.workspaces.write_plan_file(workspace, plan)
 
             for seq in range(start_seq, len(plan)):
-                await self._run_task(workspace, issue, plan, seq, agent_name, issue_log)
+                await self._run_task(workspace, issue, plan, seq, agent_name, issue_log, baseline)
 
-            await self._finalize(workspace, issue, plan, agent_name, issue_log)
+            await self._finalize(workspace, issue, plan, agent_name, issue_log, baseline)
             self.state.update(issue.number, TaskStatus.PUSHING, current_seq=-1)
             issue_log.event("push_started", branch=branch)
             await self.workspaces.push(workspace, branch, dry_run=self.config.dry_run)
@@ -387,14 +400,79 @@ class Orchestrator:
         return len(plan)
 
     async def _reset_to_anchor(self, workspace, issue_number: int, start_seq: int) -> None:
-        """Drop any half-finished commits past the last completed task, so a task can be retried cleanly."""
+        """Drop half-finished commits and stray files past the last completed task.
+
+        Resetting and cleaning gives a retry a clean starting point: leftover
+        untracked files from a failed attempt cannot leak into the next one and
+        shift which checks fail.
+        """
         if start_seq > 0:
             anchor = self.state.plan_task_commit(issue_number, start_seq - 1)
             if anchor:
                 await self.workspaces.reset(workspace, anchor)
+                await self.workspaces.clean(workspace)
                 return
             return
         await self.workspaces.reset(workspace, f"origin/{self.config.base_branch}")
+        await self.workspaces.clean(workspace)
+
+    async def _capture_baseline(self, workspace) -> set[str]:
+        """Record which checks already fail on the anchor commit, before the agent works.
+
+        The worktree sits at the anchor (origin/base or the last completed task
+        commit) right after ``_reset_to_anchor``. Failing tests there are
+        pre-existing on the base and are not the agent's responsibility; later
+        checks only fail on failures *new* relative to this baseline.
+        """
+        baseline: set[str] = set()
+        for check in self.config.checks:
+            result = await shell(check, cwd=workspace, check=False)
+            if result.returncode != 0:
+                baseline |= failed_tests(f"{result.stdout}\n{result.stderr}")
+        return baseline
+
+    async def _run_checks(
+        self,
+        workspace,
+        issue_log,
+        baseline: set[str],
+        *,
+        seq: int | None = None,
+        attempt: int | None = None,
+        stage: str = "task",
+    ) -> None:
+        """Run the configured checks, tolerating failures already present on the base branch.
+
+        A check whose failures are all in ``baseline`` passes (the agent is not
+        responsible for pre-existing breakage); a check that introduces any new
+        failure raises ``CommandError`` naming exactly those failures, so the
+        retry prompt tells the agent precisely what to fix.
+        """
+        prefix = "final_" if stage == "final" else ""
+        for check in self.config.checks:
+            result = await shell(check, cwd=workspace, check=False)
+            if result.returncode == 0:
+                issue_log.event(f"{prefix}check_passed", sequence=seq, attempt=attempt, command=check)
+                continue
+            current = failed_tests(f"{result.stdout}\n{result.stderr}")
+            new = current - baseline
+            if current and not new:
+                issue_log.event(
+                    f"{prefix}check_passed_pre_existing",
+                    sequence=seq,
+                    attempt=attempt,
+                    command=check,
+                    pre_existing=sorted(current),
+                )
+                continue
+            tail = (result.stderr or result.stdout)[-4000:]
+            if new:
+                raise CommandError(
+                    f"check failed with {len(new)} new failure(s) not present on the base branch:\n"
+                    + "\n".join(sorted(new))
+                    + f"\n\n{tail}"
+                )
+            raise CommandError(f"command failed ({result.returncode}): {check}\n{tail}")
 
     async def _run_task(
         self,
@@ -404,6 +482,7 @@ class Orchestrator:
         seq: int,
         agent_name: str,
         issue_log: IssueLog,
+        baseline: set[str],
     ) -> None:
         task = plan[seq]
         issue_log.event("task_started", sequence=seq, task=task.to_dict(), agent=agent_name)
@@ -425,9 +504,7 @@ class Orchestrator:
                 )
                 issue_log.event("agent_implementation_finished", sequence=seq, attempt=attempt)
                 self.state.update(issue.number, TaskStatus.TESTING)
-                for check in self.config.checks:
-                    await shell(check, cwd=workspace)
-                    issue_log.event("check_passed", sequence=seq, attempt=attempt, command=check)
+                await self._run_checks(workspace, issue_log, baseline, seq=seq, attempt=attempt)
 
                 if not await self.workspaces.changed(workspace):
                     raise CommandError("agent completed without changing files")
@@ -478,6 +555,10 @@ class Orchestrator:
                 issue_log.event("task_attempt_failed", sequence=seq, attempt=attempt, error=last_error)
                 if isinstance(exc, ReviewRejected):
                     raise
+        # Leave the DB in a retryable state: the task is no longer being worked,
+        # so its plan row and the whole-issue cursor must not stay stuck on CODING.
+        self.state.update_plan_task(issue.number, seq, status=TaskStatus.PENDING, last_error=last_error)
+        self.state.update(issue.number, TaskStatus.FAILED, current_seq=-1, last_error=last_error)
         raise CommandError(last_error or "maximum attempts exceeded")
 
     async def _finalize(
@@ -487,6 +568,7 @@ class Orchestrator:
         plan: list[PlanTask],
         agent_name: str,
         issue_log: IssueLog,
+        baseline: set[str],
     ) -> None:
         """Whole-branch review, fixes, and the final checks before push."""
         last_error = ""
@@ -517,9 +599,7 @@ class Orchestrator:
                             f"{review.stdout[-4000:]}"
                         )
                 self.state.update(issue.number, TaskStatus.TESTING, current_seq=-1)
-                for check in self.config.checks:
-                    await shell(check, cwd=workspace)
-                    issue_log.event("final_check_passed", attempt=attempt, command=check)
+                await self._run_checks(workspace, issue_log, baseline, attempt=attempt, stage="final")
                 if await self.workspaces.changed(workspace):
                     await self.workspaces.commit(workspace, f"feat: final review fixes (#{issue.number})")
                     issue_log.event("final_fix_committed", attempt=attempt)
@@ -533,8 +613,7 @@ class Orchestrator:
             self.state.update(issue.number, TaskStatus.CODING, current_seq=-1)
             issue_log.event("final_fix_started", attempt=attempt)
             await self.agents[agent_name].execute(workspace, make_final_fix_prompt(issue, last_error))
-            for check in self.config.checks:
-                await shell(check, cwd=workspace)
+            await self._run_checks(workspace, issue_log, baseline, attempt=attempt, stage="final")
             if await self.workspaces.changed(workspace):
                 await self.workspaces.commit(workspace, f"feat: final review fixes (#{issue.number})")
                 issue_log.event("final_fix_committed", attempt=attempt)

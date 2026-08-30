@@ -49,12 +49,14 @@ class WorkspaceManager:
         return path, branch
 
     def write_plan_file(self, path: Path, plan: list[PlanTask]) -> None:
+        (path / ".agent").mkdir(parents=True, exist_ok=True)
         content = "# Plan\n\n" + "\n".join(
             f"{i + 1}. **{task.title}**\n   {task.description}" for i, task in enumerate(plan)
         ) + "\n"
         (path / ".agent" / "plan.md").write_text(content, encoding="utf-8")
 
     def write_task_file(self, path: Path, issue: Issue, task: PlanTask) -> None:
+        (path / ".agent").mkdir(parents=True, exist_ok=True)
         content = (
             f"# GitHub Issue #{issue.number}\n\n## {issue.title}\n\n{issue.body}\n\n"
             f"## 当前任务\n\n### {task.title}\n\n{task.description}\n\n## Labels\n\n"
@@ -81,6 +83,14 @@ class WorkspaceManager:
 
     async def reset(self, path: Path, target: str) -> None:
         await run(("git", "reset", "--hard", target), cwd=path)
+
+    async def clean(self, path: Path) -> None:
+        """Remove untracked non-ignored files so a retry starts from a clean tree.
+
+        ``-fd`` deletes untracked files and directories but leaves gitignored
+        ones (e.g. .venv, build artifacts) alone.
+        """
+        await run(("git", "clean", "-fd"), cwd=path)
 
     async def head_commit(self, path: Path) -> str:
         result = await run(("git", "rev-parse", "--short", "HEAD"), cwd=path)
