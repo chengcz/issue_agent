@@ -14,7 +14,7 @@ from issue_agent.models import Issue, PlanTask, TaskStatus
 from issue_agent.orchestrator import CheckBaseline, Orchestrator, failed_tests
 from issue_agent.process import CommandError, Result, shell
 from issue_agent.state import StateStore
-from issue_agent.workspace import slugify
+from issue_agent.workspace import WorkspaceManager, slugify
 
 
 def test_slugify_is_branch_safe():
@@ -35,6 +35,31 @@ def test_workspace_status_uses_complete_porcelain_output(tmp_path, monkeypatch):
     assert calls == [
         (("git", "status", "--porcelain", "--untracked-files=all"), tmp_path)
     ]
+
+
+def test_workspace_fetch_is_shared_within_ttl(tmp_path, monkeypatch):
+    calls = 0
+
+    async def fake_run(command, *, cwd, timeout=3600, stdin=None, check=True):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return Result(0, "", "")
+
+    monkeypatch.setattr("issue_agent.workspace.run", fake_run)
+    manager = WorkspaceManager(
+        tmp_path,
+        tmp_path / "worktrees",
+        "main",
+        fetch_ttl_seconds=30,
+    )
+
+    async def fetch_concurrently():
+        await asyncio.gather(manager.fetch_base(), manager.fetch_base())
+        await manager.fetch_base()
+
+    asyncio.run(fetch_concurrently())
+    assert calls == 1
 
 
 def test_state_claim_is_idempotent(tmp_path: Path):

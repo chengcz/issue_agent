@@ -4,6 +4,7 @@ worktrees = "/opt/agent-dev/worktrees"
 state_db = "/opt/agent-dev/state/orchestrator.sqlite3"
 log_dir = "/opt/agent-dev/logs"
 poll_seconds = 60
+fetch_ttl_seconds = 30
 max_workers = 3
 max_attempts = 3
 max_task_attempts = 2

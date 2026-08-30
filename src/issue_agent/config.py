@@ -25,6 +25,7 @@ class Config:
     base_branch: str = "main"
     ready_label: str = "agent-ready"
     poll_seconds: int = 60
+    fetch_ttl_seconds: int = 30
     max_workers: int = 3
     max_attempts: int = 3
     max_task_attempts: int = 2
@@ -78,6 +79,7 @@ def load_config(path: str | Path) -> Config:
         base_branch=github.get("base_branch", "main"),
         ready_label=github.get("ready_label", "agent-ready"),
         poll_seconds=int(runtime.get("poll_seconds", 60)),
+        fetch_ttl_seconds=int(runtime.get("fetch_ttl_seconds", 30)),
         max_workers=int(runtime.get("max_workers", 3)),
         max_attempts=int(runtime.get("max_attempts", 3)),
         max_task_attempts=int(runtime.get("max_task_attempts", 2)),

@@ -191,6 +191,8 @@ done
 - `runtime.max_attempts`：整个 Issue 的失败重排队预算，默认 3。
 - `runtime.max_task_attempts`：未配置 Reviewer 时，单个 task/最终检查在一次 Issue 执行中的内部
   尝试次数，默认 2；与整个 Issue 的预算独立。
+- `runtime.fetch_ttl_seconds`：同一仓库 base branch fetch 的短期复用窗口，默认 30 秒；并发 Issue
+  共用一次 fetch，避免重复网络请求和 Git 锁竞争。
 - `runtime.auto_plan_unlabeled`：是否自动为完全没有 Label 的新 Issue 生成 Plan。
 - `runtime.auto_plan_limit`：每轮最多扫描多少个无 Label Issue。
 - `runtime.log_dir`：每个 Issue 的执行和 Review JSONL 日志目录。

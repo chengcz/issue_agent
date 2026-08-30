@@ -172,7 +172,12 @@ class Orchestrator:
         self.config = config
         self.state = StateStore(config.state_db)
         self.github = GitHub(config.github_repo, config.repo, dry_run=config.dry_run)
-        self.workspaces = WorkspaceManager(config.repo, config.worktrees, config.base_branch)
+        self.workspaces = WorkspaceManager(
+            config.repo,
+            config.worktrees,
+            config.base_branch,
+            fetch_ttl_seconds=config.fetch_ttl_seconds,
+        )
         self.agents = {name: CliAgent(name, item) for name, item in config.agents.items()}
         self.global_limit = asyncio.Semaphore(config.max_workers)
         self.agent_limits = {
