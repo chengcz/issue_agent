@@ -9,7 +9,7 @@
 
 ## 工作流
 
-1. 开启 `auto_plan_unlabeled` 后，轮询没有任何 Label 的新 GitHub Issue。
+1. 开启 `auto_plan_unlabeled` 后，轮询尚未进入 Agent 工作流（没有 `agent-*` 标签）的新 GitHub Issue；普通业务标签如 `bug`、`enhancement` 不会阻止规划。
 2. **Plan-only**：planner agent 只读探索代码库，把 Issue 拆成 1..N 个顺序任务，将 Plan 持久化到
    SQLite 和 `.agent/plan.md`，并评论到 GitHub Issue。orchestrator 会校验 planner 没有产生仓库改动，
    发现改动时立即恢复工作区并按失败处理。此阶段不 commit、不 push、不创建 PR。
@@ -39,7 +39,7 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
 ### 调度与领取
 
 - `run_once` 拉取带 `agent-ready` 标签的 open Issue（额外包含中断时残留 `agent-running` 的任务）；
-  开启 `auto_plan_unlabeled` 时还会拉取无标签 Issue 进入 plan-only。
+  开启 `auto_plan_unlabeled` 时还会拉取没有 `agent-*` 工作流标签的 Issue 进入 plan-only。
 - 按 `agent:<name>` 标签选实现 Agent，未指定用 `default_agent`。
 - 领取幂等：`pending`/`planned` 总可领；`failed`/`blocked` 只在失败预算内可领；
   `failures >= max_attempts` 后搁置，需人工 `reset`。
@@ -145,7 +145,7 @@ cp issue-agent.example.toml issue-agent.toml
 
 ### 初始化 GitHub Labels
 
-无 Label Issue 可以自动进入 Plan-only；编码阶段仍然完全由 `agent-ready` 控制。首次使用前在目标仓库
+没有 `agent-*` 工作流标签的 Issue 可以自动进入 Plan-only；编码阶段仍然完全由 `agent-ready` 控制。首次使用前在目标仓库
 一次性创建执行阶段所需标签（重复执行会自动更新已存在的标签，幂等）：
 
 ```bash
@@ -178,7 +178,7 @@ for entry in "${labels[@]}"; do
 done
 ```
 
-各标签的用途见后文「标签规则」：无 Label 是可选的自动规划入口；`agent-ready` 是编码执行入口；
+各标签的用途见后文「标签规则」：没有 `agent-*` 标签是自动规划入口；`agent-ready` 是编码执行入口；
 `agent:<name>` 选择实现 Agent；
 `reviewer:<name>` 按 Issue 选择 Reviewer（当前 `reviewer_agent` 仍是全局配置，需要按 Issue 选择时扩展调度器）；
 `resource:database-schema` 对数据库 schema 任务全局串行；`agent-running`、`agent-failed`、`human-review`
@@ -199,8 +199,8 @@ CLI 启动时会验证 Agent 名称、并发数、重试次数和 timeout；无�
   尝试次数，默认 2；与整个 Issue 的预算独立。
 - `runtime.fetch_ttl_seconds`：同一仓库 base branch fetch 的短期复用窗口，默认 30 秒；并发 Issue
   共用一次 fetch，避免重复网络请求和 Git 锁竞争。
-- `runtime.auto_plan_unlabeled`：是否自动为完全没有 Label 的新 Issue 生成 Plan。
-- `runtime.auto_plan_limit`：每轮最多扫描多少个无 Label Issue。
+- `runtime.auto_plan_unlabeled`：是否自动为没有 `agent-*` 工作流标签的新 Issue 生成 Plan；名称为兼容旧配置保留，默认 `false`。
+- `runtime.auto_plan_limit`：每轮最多扫描多少个候选 Issue。
 - `runtime.log_dir`：每个 Issue 的执行和 Review JSONL 日志目录。
 - `checks.commands`：目标项目真实的验收命令。
 - `checks.timeout_seconds`：每条检查命令的超时，默认 1800 秒；超时会终止整个命令进程组，避免残留
@@ -436,15 +436,14 @@ Issue 内容和 Agent 输出，应按目标仓库的访问控制保护 `log_dir`
 
 1. 打开 `chengcz/bioagent` 仓库的 **Issues** 页面，点击 **New issue**。
 2. 填写标题和本模板中的所有必填章节，然后点击 **Create** 或 **Submit new issue**。
-3. 保持 Issue 完全没有 Label。下一轮轮询会发布 Plan 评论，但不会修改代码或创建 PR。
+3. 不要添加 `agent-ready`、`agent-running` 或 `agent-failed` 等 `agent-*` 工作流标签。可保留 `bug`、`enhancement` 等业务标签；下一轮轮询会发布 Plan 评论，但不会修改代码或创建 PR。
 4. 人工审核 Plan；需要时编辑 Issue 补充需求。
 5. 准备执行时，在 Issue 右侧找到 **Labels**，选择且只选择一个实现 Agent：
    - `agent:codex`：由 Codex 实现；未选择 Agent 标签时也默认使用 Codex。
    - `agent:claude`：由 Claude Code 实现。
 6. 最后添加 `agent-ready`。标签保存后，前台编排器会在下一次轮询时使用已审核的 Plan 开始编码。
 
-如果创建 Issue 时已经添加了 `bug`、`enhancement` 等普通 Label，它不属于“完全无 Label Issue”，不会
-自动进入 Plan-only。此时可直接添加 `agent-ready`，执行阶段会先生成 Plan 再继续编码。
+创建 Issue 时已添加 `bug`、`enhancement` 等普通 Label 仍会自动进入 Plan-only；只有 `agent-*` 工作流标签才会阻止该阶段。
 
 如果列表中没有 `agent-ready`：
 
