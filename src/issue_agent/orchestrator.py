@@ -203,7 +203,7 @@ class Orchestrator:
     async def run_once(self) -> None:
         runnable = await self.github.runnable_issues(self.config.ready_label)
         planning = (
-            await self.github.unlabeled_issues(self.config.auto_plan_limit)
+            await self.github.unassigned_issues(self.config.auto_plan_limit)
             if self.config.auto_plan_unlabeled
             else []
         )
