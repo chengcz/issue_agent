@@ -21,6 +21,17 @@ from issue_agent.state import StateStore
 APPROVE = "Looks good.\nVERDICT: APPROVE\n"
 
 
+class _Log:
+    def __init__(self):
+        self.events = []
+
+    def event(self, name, **fields):
+        self.events.append((name, fields))
+
+    def review(self, phase, output, **fields):
+        self.events.append(("review", {"phase": phase, "output": output, **fields}))
+
+
 def result(stdout: str = "") -> Result:
     return Result(returncode=0, stdout=stdout, stderr="")
 
@@ -958,3 +969,88 @@ def test_full_review_mode_uses_llm_reviewer(tmp_path, monkeypatch):
     task_review_prompts = [p for p in reviewer_prompts if "most recent commit" in p]
     assert len(task_review_prompts) == 1
     app.workspaces.push.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# agent_call usage logging tests
+# ---------------------------------------------------------------------------
+
+def test_execute_agent_logs_usage_and_duration(tmp_path):
+    """_execute_agent records an agent_call event with duration and token usage."""
+    app = make_orchestrator(tmp_path)
+    log = _Log()
+    app.agents["worker"].execute = AsyncMock(
+        return_value=Result(
+            returncode=0,
+            stdout="done",
+            stderr="",
+            duration_ms=4200,
+            usage={"input_tokens": 100, "output_tokens": 50, "cost_usd": 0.01},
+        )
+    )
+
+    asyncio.run(app._execute_agent("worker", tmp_path, "prompt", issue_log=log))
+
+    agent_calls = [e for e in log.events if e[0] == "agent_call"]
+    assert len(agent_calls) == 1
+    _, fields = agent_calls[0]
+    assert fields["agent"] == "worker"
+    assert fields["role"] == "worker"
+    assert fields["duration_ms"] == 4200
+    assert fields["input_tokens"] == 100
+    assert fields["output_tokens"] == 50
+    assert fields["cost_usd"] == 0.01
+
+
+def test_execute_read_only_logs_usage_with_role(tmp_path):
+    """_execute_read_only records agent_call with the caller-supplied role."""
+    app = make_orchestrator(tmp_path)
+    log = _Log()
+    app.agents["reviewer"].execute = AsyncMock(
+        return_value=Result(
+            returncode=0,
+            stdout=APPROVE,
+            stderr="",
+            duration_ms=3100,
+            usage={"input_tokens": 80, "output_tokens": 20, "cache_read_input_tokens": 500},
+        )
+    )
+
+    asyncio.run(
+        app._execute_read_only("reviewer", tmp_path, "p", role="task reviewer", issue_log=log)
+    )
+
+    agent_calls = [e for e in log.events if e[0] == "agent_call"]
+    assert len(agent_calls) == 1
+    _, fields = agent_calls[0]
+    assert fields["role"] == "task reviewer"
+    assert fields["duration_ms"] == 3100
+    assert fields["cache_read_input_tokens"] == 500
+
+
+def test_execute_agent_without_issue_log_does_not_fail(tmp_path):
+    """Backward compat: omitting issue_log skips logging without raising."""
+    app = make_orchestrator(tmp_path)
+    app.agents["worker"].execute = AsyncMock(
+        return_value=Result(returncode=0, stdout="ok", stderr="", duration_ms=10)
+    )
+
+    res = asyncio.run(app._execute_agent("worker", tmp_path, "prompt"))
+    assert res.stdout == "ok"
+
+
+def test_execute_agent_logs_duration_when_usage_absent(tmp_path):
+    """Plain-text CLI (no JSON envelope): duration still logged, tokens omitted."""
+    app = make_orchestrator(tmp_path)
+    log = _Log()
+    app.agents["worker"].execute = AsyncMock(
+        return_value=Result(returncode=0, stdout="ok", stderr="", duration_ms=999, usage=None)
+    )
+
+    asyncio.run(app._execute_agent("worker", tmp_path, "prompt", issue_log=log))
+
+    agent_calls = [e for e in log.events if e[0] == "agent_call"]
+    assert len(agent_calls) == 1
+    _, fields = agent_calls[0]
+    assert fields["duration_ms"] == 999
+    assert "input_tokens" not in fields

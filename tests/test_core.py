@@ -244,6 +244,114 @@ def test_shell_cancellation_terminates_the_command(tmp_path: Path):
     asyncio.run(cancel_command())
 
 
+def test_result_has_duration_and_usage_fields():
+    """Result dataclass exposes optional duration_ms and usage for token tracking."""
+    r = Result(returncode=0, stdout="ok", stderr="")
+    assert r.duration_ms is None
+    assert r.usage is None
+
+    r2 = Result(returncode=0, stdout="ok", stderr="", duration_ms=123, usage={"input_tokens": 10})
+    assert r2.duration_ms == 123
+    assert r2.usage == {"input_tokens": 10}
+
+
+def test_run_measures_duration(tmp_path: Path):
+    """process.run() always populates duration_ms with wall-clock milliseconds."""
+    result = asyncio.run(shell("sleep 0.05", cwd=tmp_path))
+    assert result.duration_ms is not None
+    assert result.duration_ms >= 40  # allow small timing slack
+
+
+def test_run_duration_present_on_failure(tmp_path: Path):
+    """duration_ms is populated even when the command fails (check=False)."""
+    result = asyncio.run(shell("exit 3", cwd=tmp_path, check=False))
+    assert result.returncode == 3
+    assert result.duration_ms is not None
+    assert result.duration_ms >= 0
+
+
+# ---------------------------------------------------------------------------
+# JSON envelope unwrap tests (CliAgent.execute)
+# ---------------------------------------------------------------------------
+
+CLAUDE_JSON_ENVELOPE = json.dumps({
+    "type": "result",
+    "subtype": "success",
+    "cost_usd": 0.0123,
+    "is_error": False,
+    "duration_ms": 5000,
+    "duration_api_ms": 4500,
+    "num_turns": 3,
+    "result": "VERDICT: APPROVE\nAll checks passed.",
+    "session_id": "sess_abc123",
+    "total_cost_usd": 0.0123,
+    "usage": {
+        "input_tokens": 1500,
+        "cache_creation_input_tokens": 200,
+        "cache_read_input_tokens": 800,
+        "output_tokens": 350,
+    },
+})
+
+
+def test_unwrap_claude_json_extracts_result_and_usage():
+    """Claude CLI JSON envelope: stdout becomes result text, usage/duration extracted."""
+    from issue_agent.agents import _unwrap_agent_output
+
+    raw = Result(returncode=0, stdout=CLAUDE_JSON_ENVELOPE, stderr="", duration_ms=5100)
+    unwrapped = _unwrap_agent_output(raw)
+    assert unwrapped.stdout == "VERDICT: APPROVE\nAll checks passed."
+    assert unwrapped.usage is not None
+    assert unwrapped.usage["input_tokens"] == 1500
+    assert unwrapped.usage["output_tokens"] == 350
+    assert unwrapped.usage["cache_read_input_tokens"] == 800
+    assert unwrapped.usage["cost_usd"] == 0.0123
+    # duration from envelope preferred over wall-clock when present
+    assert unwrapped.duration_ms == 5000
+
+
+def test_unwrap_plain_text_passthrough():
+    """Non-JSON stdout is returned unchanged with usage=None."""
+    from issue_agent.agents import _unwrap_agent_output
+
+    raw = Result(returncode=0, stdout="VERDICT: APPROVE\n", stderr="", duration_ms=1200)
+    unwrapped = _unwrap_agent_output(raw)
+    assert unwrapped.stdout == "VERDICT: APPROVE\n"
+    assert unwrapped.usage is None
+    assert unwrapped.duration_ms == 1200
+
+
+def test_unwrap_ignores_json_without_result_envelope():
+    """JSON that is not a Claude result envelope (e.g. planner fenced output) is not unwrapped."""
+    from issue_agent.agents import _unwrap_agent_output
+
+    planner_output = '```json\n[{"title": "A", "description": "B"}]\n```'
+    raw = Result(returncode=0, stdout=planner_output, stderr="", duration_ms=900)
+    unwrapped = _unwrap_agent_output(raw)
+    assert unwrapped.stdout == planner_output
+    assert unwrapped.usage is None
+
+
+def test_unwrap_handles_malformed_json_gracefully():
+    """Truncated or invalid JSON falls back to plain text, never raises."""
+    from issue_agent.agents import _unwrap_agent_output
+
+    raw = Result(returncode=0, stdout='{"type": "result", "result": "trunc', stderr="", duration_ms=100)
+    unwrapped = _unwrap_agent_output(raw)
+    assert unwrapped.stdout == '{"type": "result", "result": "trunc'
+    assert unwrapped.usage is None
+
+
+def test_unwrap_preserves_stderr_and_returncode():
+    """Unwrap only transforms stdout; stderr and returncode pass through."""
+    from issue_agent.agents import _unwrap_agent_output
+
+    raw = Result(returncode=1, stdout=CLAUDE_JSON_ENVELOPE, stderr="warning: x", duration_ms=300)
+    unwrapped = _unwrap_agent_output(raw)
+    assert unwrapped.returncode == 1
+    assert unwrapped.stderr == "warning: x"
+
+
 def test_config_and_label_routing(tmp_path: Path):
     config_file = tmp_path / "issue-agent.toml"
     config_file.write_text('''

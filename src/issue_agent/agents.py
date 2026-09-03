@@ -1,11 +1,51 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from .config import AgentConfig
 from .models import Issue, PlanTask
 from .process import Result, run
+
+
+def _unwrap_agent_output(result: Result) -> Result:
+    """Detect Claude/Codex JSON result envelope and extract usage metadata.
+
+    When stdout is a JSON object with ``"type": "result"`` and a ``"result"``
+    key, the envelope is unwrapped: ``stdout`` becomes the inner result text and
+    token/cost/duration metadata moves to ``usage``. Plain-text output (or any
+    JSON that is not a result envelope) passes through unchanged so downstream
+    parsers like :func:`review_verdict` and :func:`parse_plan` keep working.
+    """
+    text = result.stdout.strip()
+    if not text.startswith("{"):
+        return result
+    try:
+        envelope = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return result
+    if not isinstance(envelope, dict):
+        return result
+    if envelope.get("type") != "result" or "result" not in envelope:
+        return result
+
+    usage: dict[str, Any] = {}
+    raw_usage = envelope.get("usage")
+    if isinstance(raw_usage, dict):
+        usage.update(raw_usage)
+    for key in ("cost_usd", "total_cost_usd", "duration_api_ms", "num_turns", "session_id"):
+        if key in envelope:
+            usage[key] = envelope[key]
+
+    duration = envelope.get("duration_ms")
+    return replace(
+        result,
+        stdout=str(envelope["result"]),
+        usage=usage or None,
+        duration_ms=int(duration) if isinstance(duration, (int, float)) else result.duration_ms,
+    )
 
 
 @dataclass(frozen=True)
@@ -17,12 +57,13 @@ class CliAgent:
         command = self.config.review_command if review and self.config.review_command else self.config.command
         rendered = [part.replace("{prompt}", prompt) for part in command]
         has_placeholder = any("{prompt}" in part for part in command)
-        return await run(
+        result = await run(
             rendered,
             cwd=workspace,
             timeout=self.config.timeout_seconds,
             stdin=None if has_placeholder else prompt,
         )
+        return _unwrap_agent_output(result)
 
 
 def _with_guidance(prompt: str, guidance: str) -> str:
