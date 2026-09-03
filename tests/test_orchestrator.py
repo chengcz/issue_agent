@@ -389,12 +389,12 @@ def test_plan_only_restores_workspace_when_planner_writes_files(tmp_path):
     assert "modified the workspace" in app.github.comment.await_args.args[1]
 
 
-def test_run_once_routes_unlabeled_issue_to_plan_only(tmp_path):
+def test_run_once_routes_issue_without_agent_workflow_label_to_plan_only(tmp_path):
     app = make_orchestrator(tmp_path)
-    issue = Issue(12, "Needs planning", "A vague request")
+    issue = Issue(12, "Needs planning", "A vague request", ("bug", "agent:claude"))
     app.running = {}
     app.github.runnable_issues = AsyncMock(return_value=[])
-    app.github.unlabeled_issues = AsyncMock(return_value=[issue])
+    app.github.unassigned_issues = AsyncMock(return_value=[issue])
     app._guarded_plan_only = AsyncMock()
 
     async def run_scheduler() -> None:
@@ -403,7 +403,7 @@ def test_run_once_routes_unlabeled_issue_to_plan_only(tmp_path):
 
     asyncio.run(run_scheduler())
 
-    app.github.unlabeled_issues.assert_awaited_once_with(20)
+    app.github.unassigned_issues.assert_awaited_once_with(20)
     app._guarded_plan_only.assert_awaited_once_with(issue, "planner")
     assert app.state.rows()[0]["status"] == str(TaskStatus.CLAIMED)
 
@@ -413,7 +413,7 @@ def test_run_once_reconciles_labels_for_persisted_human_review(tmp_path):
     issue = Issue(4, "Task", "Body", ("agent-running",))
     app.running = {}
     app.github.runnable_issues = AsyncMock(return_value=[issue])
-    app.github.unlabeled_issues = AsyncMock(return_value=[])
+    app.github.unassigned_issues = AsyncMock(return_value=[])
     app.state.claim(issue, "worker")
     app.state.update(4, TaskStatus.HUMAN_REVIEW, pr_url="https://example.test/pr/4")
 

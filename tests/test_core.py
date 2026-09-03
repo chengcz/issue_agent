@@ -333,20 +333,20 @@ repo = "a/b"
         load_config(config_file)
 
 
-def test_github_unlabeled_issues_filters_any_labeled_issue(tmp_path: Path):
+def test_github_unassigned_issues_keeps_product_labels(tmp_path: Path):
     github = GitHub("owner/repo", tmp_path)
     github._gh = AsyncMock(
         return_value='''[
             {"number": 1, "title": "Plan me", "body": "", "labels": [], "url": "u1"},
-            {"number": 2, "title": "Skip me", "body": "", "labels": [{"name": "bug"}], "url": "u2"}
+            {"number": 2, "title": "Plan me too", "body": "", "labels": [{"name": "bug"}], "url": "u2"},
+            {"number": 3, "title": "Already queued", "body": "", "labels": [{"name": "agent-ready"}], "url": "u3"}
         ]'''
     )
 
-    issues = asyncio.run(github.unlabeled_issues())
+    issues = asyncio.run(github.unassigned_issues())
 
-    assert [issue.number for issue in issues] == [1]
-    assert "--label" not in github._gh.await_args.args
-    assert github._gh.await_args.args[github._gh.await_args.args.index("--search") + 1] == "no:label"
+    assert [issue.number for issue in issues] == [1, 2]
+    assert "--search" not in github._gh.await_args.args
 
 
 def test_create_pr_reuses_existing_branch_pr(tmp_path: Path):
