@@ -4,8 +4,10 @@ import asyncio
 import logging
 import os
 import signal
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -19,6 +21,8 @@ class Result:
     returncode: int
     stdout: str
     stderr: str
+    duration_ms: int | None = None
+    usage: dict[str, Any] | None = field(default=None, compare=False)
 
 
 async def run(
@@ -30,6 +34,7 @@ async def run(
     check: bool = True,
 ) -> Result:
     log.info("run cwd=%s command=%s", cwd, command[0])
+    started = time.monotonic()
     process_options = {"start_new_session": True} if os.name != "nt" else {}
     process = await asyncio.create_subprocess_exec(
         *command,
@@ -71,7 +76,12 @@ async def run(
     except asyncio.CancelledError:
         await terminate_process_tree()
         raise
-    result = Result(process.returncode or 0, stdout.decode(errors="replace"), stderr.decode(errors="replace"))
+    result = Result(
+        process.returncode or 0,
+        stdout.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+        duration_ms=int((time.monotonic() - started) * 1000),
+    )
     if check and result.returncode:
         tail = (result.stderr or result.stdout)[-4000:]
         raise CommandError(f"command failed ({result.returncode}): {command[0]}\n{tail}")
