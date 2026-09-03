@@ -5,7 +5,6 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
 
 from .agents import (
     CliAgent,
@@ -15,11 +14,13 @@ from .agents import (
     make_task_prompt,
     make_task_review_prompt,
 )
+from .checks import CheckBaseline, capture_baseline, run_checks
+from .codegraph import guidance_block
 from .config import Config
 from .github import GitHub
 from .issue_log import IssueLog
 from .models import Issue, PlanTask, TaskStatus
-from .process import CommandError, shell
+from .process import CommandError
 from .state import StateStore
 from .workspace import WorkspaceManager
 
@@ -48,28 +49,6 @@ def review_verdict(stdout: str) -> str | None:
     if verdict in {"VERDICT: APPROVE", "VERDICT: REQUEST_CHANGES"}:
         return verdict
     return None
-
-
-_RE_FAILED_TEST = re.compile(r"^FAILED (\S+)", re.MULTILINE)
-
-
-def failed_tests(output: str) -> set[str]:
-    """Extract the failing test IDs pytest prints in its short summary.
-
-    The ``-q`` short summary emits one ``FAILED <path>::<node_id>`` line per
-    failure; those IDs are what we compare against the base-branch baseline to
-    tell a pre-existing failure from a regression the agent introduced.
-    """
-    return set(_RE_FAILED_TEST.findall(output))
-
-
-@dataclass(frozen=True)
-class CheckBaseline:
-    """One command's failure state captured before implementation starts."""
-
-    returncode: int
-    failed_tests: frozenset[str]
-    output: str
 
 
 _STRUCTURAL = ':,]}'
@@ -189,6 +168,15 @@ class Orchestrator:
         self._baseline_cache: dict[
             tuple[str, tuple[str, ...]], tuple[float, dict[str, CheckBaseline]]
         ] = {}
+        if guidance_block(config.repo, config.codegraph):
+            log.info(
+                "codegraph index detected at %s; run 'codegraph install' to give agents MCP access",
+                config.repo,
+            )
+
+    def _codegraph_guidance(self) -> str:
+        """Prompt guidance for agents; empty (prompts unchanged) without a ready index."""
+        return guidance_block(self.config.repo, self.config.codegraph)
 
     def recover(self) -> int:
         return self.state.recover_interrupted()
@@ -438,7 +426,7 @@ class Orchestrator:
             result = await self._execute_read_only(
                 self.config.planner_agent,
                 workspace,
-                make_plan_prompt(issue, self.config.max_tasks),
+                make_plan_prompt(issue, self.config.max_tasks, guidance=self._codegraph_guidance()),
                 role="planner",
                 acquire_agent_limit=acquire_agent_limit,
             )
@@ -542,21 +530,12 @@ class Orchestrator:
             cached = cache.get(cache_key)
             if cached is not None and time.monotonic() - cached[0] < self.config.baseline_cache_ttl_seconds:
                 return cached[1]
-        baseline: dict[str, CheckBaseline] = {}
-        for check in self.config.checks:
-            result = await shell(
-                check,
-                cwd=workspace,
-                timeout=self.config.check_timeout_seconds,
-                check=False,
-            )
-            if result.returncode != 0:
-                output = f"{result.stdout}\n{result.stderr}".strip()
-                baseline[check] = CheckBaseline(
-                    returncode=result.returncode,
-                    failed_tests=frozenset(failed_tests(output)),
-                    output=output,
-                )
+        baseline = await capture_baseline(
+            workspace,
+            self.config.checks,
+            timeout=self.config.check_timeout_seconds,
+            parallel=self.config.checks_parallel,
+        )
         if cache_key is not None:
             cache[cache_key] = (time.monotonic(), baseline)
         return baseline
@@ -571,53 +550,18 @@ class Orchestrator:
         attempt: int | None = None,
         stage: str = "task",
     ) -> None:
-        """Run the configured checks, tolerating failures already present on the base branch.
-
-        Pytest failures are compared by node ID within the same command. Other
-        failing commands are tolerated only while their return code and output
-        remain unchanged. A regression raises ``CommandError`` so the retry
-        prompt tells the agent precisely what to fix.
-        """
-        prefix = "final_" if stage == "final" else ""
-        for check in self.config.checks:
-            result = await shell(
-                check,
-                cwd=workspace,
-                timeout=self.config.check_timeout_seconds,
-                check=False,
-            )
-            if result.returncode == 0:
-                issue_log.event(f"{prefix}check_passed", sequence=seq, attempt=attempt, command=check)
-                continue
-            output = f"{result.stdout}\n{result.stderr}".strip()
-            current = failed_tests(output)
-            previous = baseline.get(check)
-            previous_tests = set(previous.failed_tests) if previous else set()
-            new = current - previous_tests
-            unchanged_generic_failure = (
-                not current
-                and previous is not None
-                and not previous.failed_tests
-                and result.returncode == previous.returncode
-                and output == previous.output
-            )
-            if (current and not new) or unchanged_generic_failure:
-                issue_log.event(
-                    f"{prefix}check_passed_pre_existing",
-                    sequence=seq,
-                    attempt=attempt,
-                    command=check,
-                    pre_existing=sorted(current) if current else ["unchanged command failure"],
-                )
-                continue
-            tail = (result.stderr or result.stdout)[-4000:]
-            if new:
-                raise CommandError(
-                    f"check failed with {len(new)} new failure(s) not present on the base branch:\n"
-                    + "\n".join(sorted(new))
-                    + f"\n\n{tail}"
-                )
-            raise CommandError(f"command failed ({result.returncode}): {check}\n{tail}")
+        """Run the configured checks; see :mod:`issue_agent.checks` for tolerance semantics."""
+        await run_checks(
+            workspace,
+            issue_log,
+            baseline,
+            checks=self.config.checks,
+            timeout=self.config.check_timeout_seconds,
+            parallel=self.config.checks_parallel,
+            seq=seq,
+            attempt=attempt,
+            stage=stage,
+        )
 
     async def _run_task(
         self,
@@ -648,10 +592,18 @@ class Orchestrator:
                 issue.number, seq, status=TaskStatus.CODING, attempts=attempt, last_error=last_error
             )
             try:
+                if last_error:
+                    self.workspaces.write_feedback_file(workspace, last_error)
                 await self._execute_agent(
                     agent_name,
                     workspace,
-                    make_task_prompt(issue, task, plan, retry_error=last_error),
+                    make_task_prompt(
+                        issue,
+                        task,
+                        plan,
+                        retry_error=last_error,
+                        guidance=self._codegraph_guidance(),
+                    ),
                 )
                 issue_log.event("agent_implementation_finished", sequence=seq, attempt=attempt)
                 self.state.update(issue.number, TaskStatus.TESTING)
@@ -672,7 +624,7 @@ class Orchestrator:
                     review = await self._execute_read_only(
                         self.config.reviewer_agent,
                         workspace,
-                        make_task_review_prompt(issue, task),
+                        make_task_review_prompt(issue, task, guidance=self._codegraph_guidance()),
                         role="task reviewer",
                         acquire_agent_limit=True,
                     )
@@ -747,7 +699,12 @@ class Orchestrator:
                     review = await self._execute_read_only(
                         self.config.reviewer_agent,
                         workspace,
-                        make_final_review_prompt(issue, plan, self.config.base_branch),
+                        make_final_review_prompt(
+                            issue,
+                            plan,
+                            self.config.base_branch,
+                            guidance=self._codegraph_guidance(),
+                        ),
                         role="final reviewer",
                         acquire_agent_limit=True,
                     )
@@ -794,6 +751,7 @@ class Orchestrator:
             self.state.update(issue.number, TaskStatus.CODING, current_seq=-1)
             issue_log.event("final_fix_started", attempt=attempt)
             try:
+                self.workspaces.write_feedback_file(workspace, last_error)
                 await self._execute_agent(
                     agent_name, workspace, make_final_fix_prompt(issue, last_error)
                 )
