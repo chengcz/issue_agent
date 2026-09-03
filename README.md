@@ -17,10 +17,12 @@
 4. 根据 `agent:<name>` 标签选择实现 Agent；未指定则使用默认 Agent。
 5. 从本地已创建的 Issue worktree 和持久化 Plan 继续执行；直接带 `agent-ready` 发布的 Issue 则在执行前生成 Plan。
 6. **逐任务执行**：每个任务写入 `.agent/task.md`。实现 Agent 完成后 orchestrator 独立执行检查，然后
-   commit（`feat: <task.title> (#N)`）；reviewer 对最近一个 commit 做只读 Review，要求修改时反馈给实现
-   Agent，修复后 amend 同一 commit 再 Review。第二次 Review 未通过时立即停止，不自动进行更多返修；
-   人工检查 review 日志后可重新添加 `agent-ready` 再次尝试。
-7. **最终阶段**：全部任务通过后，reviewer 对整条分支 diff 做整体 Review；要求修改时由实现 Agent 修复并
+   commit（`feat: <task.title> (#N)`）；默认对最近一个 commit 做**确定性形式审查**（secrets 扫描、
+   禁改文件、空 diff，零 LLM 调用），不通过时反馈给实现 Agent，修复后 amend 同一 commit 再审。
+   第二次仍不通过时立即停止，不自动进行更多返修；人工检查 review 日志后可重新添加 `agent-ready`
+   再次尝试。可用 `[review] task_mode` 切换为 LLM 深度审查（`full`）或关闭（`off`）。
+7. **最终阶段**：全部任务通过后，reviewer 对整条分支 diff 做整体功能性 Review（这是唯一的 LLM
+   功能审查，覆盖跨任务一致性、正确性、安全、兼容性、迁移与测试）；要求修改时由实现 Agent 修复并
    产生独立 commit（`feat: final review fixes (#N)`）；通过后再执行一次完整 checks。
 8. orchestrator 统一 push、创建 PR，并停在 `human-review`。
 
@@ -62,13 +64,21 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
 2. 实现 Agent 在 worktree 中执行（prompt 走 stdin）。
 3. orchestrator 独立执行 `checks.commands` 验收。
 4. 校验确实修改了文件，然后 commit：`feat: <task.title> (#N)`。
-5. 配置了 reviewer 时，对最近一个 commit 做只读 Review：
-   - `VERDICT: REQUEST_CHANGES` → 把反馈回喂给实现 Agent 修复并 amend 同一 commit 再 Review；
-     第二次仍不通过立即停止（不再自动返修），等人工检查 review 日志后重试。
-   - Reviewer 产生仓库改动 → 立即恢复到 Review 前的 commit，并按普通失败处理。
-   - 无合法 verdict → 按普通失败处理；预算内恢复 `agent-ready` 后重试，不要求实现 Agent
-     根据无效 Review 输出修改代码。
+5. 按 `[review] task_mode` 对最近一个 commit 做审查（默认 `formal`）：
+   - `formal`（默认）：**确定性形式审查**，零 LLM 调用、秒级完成——扫描 diff 中的 secrets
+     （AWS/GitHub/OpenAI/Stripe key、私钥块、硬编码密码等）、禁改文件（`.env`、`*.pem`、
+     `credentials` 等）与空 commit。不依赖 `reviewer_agent` 配置。
+   - `full`：LLM reviewer 只读深度 Review（需要配置 `reviewer_agent`；未配置时跳过）。
+     `VERDICT: REQUEST_CHANGES` → 反馈回喂实现 Agent；Reviewer 产生仓库改动 → 立即恢复并按
+     失败处理；无合法 verdict → 按普通失败处理。
+   - `off`：跳过任务级审查（功能审查仍由最终阶段的整分支 Review 兜底）。
+   - 任一模式下不通过 → 实现 Agent 修复并 amend 同一 commit 再审；第二次仍不通过立即停止
+     （不再自动返修），等人工检查 review 日志后重试。
 6. 通过后该 plan 任务标记 `done`，记录 commit hash。
+
+> 设计取舍：per-task 的功能性深度审查收敛到最终阶段（整分支 Review），任务级只保留确定性
+> 形式审查 + checks（测试）兜底，每个任务省去一次 LLM review 调用。若任务 1 存在设计缺陷，
+> 后续任务会在其上叠加，最终 Review 拒绝时返工成本最高——因此 plan 的 Acceptance 标准要具体可检。
 
 > 检查是**基线感知**的：agent 开始前，orchestrator 先在锚点提交（`origin/main` 或上一个已完成任务的 commit）逐条运行 `checks.commands`，按命令记录**预存失败**；pytest 失败按 node ID 比较，其他命令仅在退出码和输出均未变化时视为同一个预存失败。之后每次 check 只把"新失败"判为回归并报给 agent 精修。预存失败（例如目标仓库 main 上本就挂掉的测试）被容忍并通过，避免 agent 在不相关的预存错误上反复空耗重试预算——这也是检查报错不再逐轮"漂移"的原因。每个任务失败后其 plan 状态会回退到 `pending`、cursor 复位，可干净断点续跑。
 
@@ -207,6 +217,9 @@ CLI 启动时会验证 Agent 名称、并发数、重试次数和 timeout；无�
   测试进程持续占用资源；任务取消时也会执行同样的进程树清理。
 - `checks.baseline_cache_ttl_seconds`：同一 anchor/checks 基线缓存有效期，默认 300 秒；设为 `0` 可
   禁用缓存，适用于强依赖外部环境的集成检查。
+- `review.task_mode`：任务级审查模式，默认 `formal`（确定性形式审查：secrets/禁改文件/空 diff，
+  零 LLM 调用）；`full` 恢复每任务 LLM 深度 Review（需配置 `reviewer_agent`）；`off` 跳过任务级
+  审查。最终阶段的整分支 LLM Review 不受此项影响。
 - 启用已经安装且完成认证的 Agent。
 
 先运行一次：
@@ -217,6 +230,13 @@ issue-agent --config issue-agent.toml status
 issue-agent --config issue-agent.toml status --active
 issue-agent --config issue-agent.toml status --json
 ```
+
+`status` 输出列：`ISSUE`、`STATUS`、`CURRENT TASK`、`AGENT`、`TOKENS`（输入+输出 token 合计，
+k/M 紧凑格式）、`COST`（累计美元开销）、`TIME`（累计 Agent 壁钟耗时）与 `UPDATED`。TOKENS/COST
+需要 Agent CLI 输出 JSON envelope（如 Claude CLI 加 `--output-format json`）才有数据，否则仅
+TIME 有值；无数据时显示 `-`。`--json` 输出含全部累积字段（`total_input_tokens`、
+`total_output_tokens`、`total_cache_read_tokens`、`total_cache_creation_tokens`、
+`total_cost_usd`、`total_duration_ms`）。
 
 确认无误后，可在当前终端持续轮询；按 `Ctrl+C` 停止：
 
@@ -242,6 +262,26 @@ command = "your-agent --prompt {prompt}"
 ```
 
 命令不含 `{prompt}` 时，prompt 通过 stdin 发送，避免 Issue 太长导致 shell 参数限制；包含占位符时会作为一个参数直接传入，不经过 shell 展开。
+
+### Token 与耗时追踪
+
+orchestrator 对每次 Agent CLI 调用自动记录壁钟耗时；若 CLI 输出为 JSON result envelope
+（Claude CLI 加 `--output-format json`），还会自动解析 token 用量（输入/输出/缓存读/缓存写）、
+cost 与 API 耗时。**stdout 会自动 unwrap 为纯文本**，下游解析（plan JSON、review verdict）
+不受影响；不加该 flag 时优雅降级为仅计时。
+
+```toml
+[agents.claude]
+command = "claude -p --output-format json"
+review_command = "claude -p --model sonnet --permission-mode plan --output-format json"
+```
+
+用量数据双通道落盘：
+
+- `logs/issue-<N>.jsonl` 的 `agent_call` 事件：每次调用的完整明细（agent、role、duration_ms、
+  input_tokens、output_tokens、cache_read_input_tokens、cache_creation_input_tokens、cost_usd）。
+- SQLite 状态库：按 Issue 累积总量（`total_input_tokens` 等 6 列），供 `status` 命令快速查询，
+  显示为 TOKENS（输入+输出合计，k/M 紧凑格式）、COST、TIME 三列。
 
 Issue 标签示例：
 
@@ -278,6 +318,21 @@ Issue 添加 `agent:claude_opus` 或 `agent:claude_sonnet` 后，编排器会选
 `reviewer:claude_sonnet`，并扩展调度器读取该标签；没有标签时回退到全局
 `reviewer_agent`。Review 命令应使用只读的 `--permission-mode plan`，避免 Reviewer 修改工作区。
 
+### 任务级审查模式
+
+```toml
+[review]
+task_mode = "formal"  # formal（默认）| full | off
+```
+
+- `formal`：确定性形式审查（secrets/禁改文件/空 diff），零 LLM 调用，不依赖 `reviewer_agent`。
+- `full`：每个任务 commit 后由 `reviewer_agent` 做 LLM 深度 Review（旧默认行为）。
+- `off`：跳过任务级审查。
+
+无论哪种模式，最终阶段的整分支 LLM Review（需配置 `reviewer_agent`）始终执行，是唯一的
+功能性深度审查。`full` 模式未配置 `reviewer_agent` 时任务级审查跳过；`formal` 模式审查
+不通过同样占用 2 轮返修预算，第二次仍不通过则搁置等人工处理。
+
 ## 目标项目约定
 
 目标项目应包含 `AGENTS.md`，Claude 项目可增加一个很短的 `CLAUDE.md`，只引用 `AGENTS.md`，避免规则分叉。建议把目标项目的检查统一为 `scripts/check.sh`，然后配置：
@@ -307,8 +362,9 @@ commands = ["./scripts/check.sh"]
    .venv/bin/issue-agent --config bioagent.toml --verbose serve
    ```
 
-6. planner 先把 Issue 拆成多个任务，实现 Agent 逐个完成：每个任务独立检查、commit 与 Review；
-   全部任务通过后做整体 Review 和最终检查，编排器再统一推送并创建 PR，同时把 Issue 标记为
+6. planner 先把 Issue 拆成多个任务，实现 Agent 逐个完成：每个任务独立检查、commit 与形式审查
+   （默认确定性审查，见 `[review] task_mode`）；全部任务通过后做整分支 LLM Review 和最终检查，
+   编排器再统一推送并创建 PR，同时把 Issue 标记为
    `human-review`。必须由人审查和合并；编排器不会自动合并或部署。
 
 命令行发布示例：
@@ -361,24 +417,28 @@ gh issue edit ISSUE_NUMBER \
 
 ## Agent 与 Review
 
-默认实现 Agent 是 Codex。Issue 使用 `agent:claude` 时由 Claude Code 实现。当前配置使用 Codex
-做只读 Review；因此 Claude 实现的任务会得到跨 Agent 复审。Review 未明确给出批准结论时，任务会被标记为失败并等待人工处理。
+默认实现 Agent 是 Codex。Issue 使用 `agent:claude` 时由 Claude Code 实现。任务级审查默认是
+确定性形式审查（`[review] task_mode = "formal"`，见上文）；LLM 深度 Review 收敛到最终阶段，
+当前配置由 Codex 做只读 Review，因此 Claude 实现的任务在整分支 Review 时仍会得到跨 Agent 复审。
+Review 未明确给出批准结论时，任务会被标记为失败并等待人工处理。
 
 `runtime.planner_agent` 指定负责拆解 Issue 的规划 Agent（通常复用 reviewer 的只读命令，没有则用实现命令）；
 `runtime.max_tasks` 限制单个 plan 的任务数上限，防止 planner 失控。planner 输出解析失败或超过上限时，
-任务被标记为失败并可重领后重新规划。每个任务独立 commit 与 Review，任务之间的修复 amend 同一个 commit；
-最终阶段针对整条分支 Review，修复产生独立 commit。
+任务被标记为失败并可重领后重新规划。每个任务独立 commit 与形式审查（默认确定性审查），任务之间的修复
+amend 同一个 commit；最终阶段针对整条分支做 LLM Review，修复产生独立 commit。
 
 ### Issue 执行与 Review 日志
 
 `runtime.log_dir` 下会按 Issue 写入两份 JSONL 文件：
 
 ```text
-issue-42.jsonl          # 规划、编码尝试、检查、commit、返修、push、PR 与失败状态
-issue-42.reviews.jsonl  # 每次 task review 和 final review 的完整输出及 verdict
+issue-42.jsonl          # 规划、编码尝试、检查、commit、返修、push、PR、agent_call 用量与失败状态
+issue-42.reviews.jsonl  # 每次 task review（含形式审查）和 final review 的完整输出及 verdict
 ```
 
-执行日志会记录当前 plan 子任务、尝试次数、检查命令、错误和最终 PR 地址；review 日志会保留
+执行日志会记录当前 plan 子任务、尝试次数、检查命令、错误和最终 PR 地址；每次 Agent CLI 调用
+还会写入 `agent_call` 事件（agent、role、duration_ms，以及 CLI 输出 JSON envelope 时的
+input/output/cache token 与 cost 明细）。review 日志会保留
 `REQUEST_CHANGES` 的具体反馈，方便分析是否因 Issue 描述、计划、实现或测试不足而返修。日志可能包含
 Issue 内容和 Agent 输出，应按目标仓库的访问控制保护 `log_dir`，不要写入公开目录。
 

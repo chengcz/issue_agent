@@ -41,15 +41,22 @@ flowchart TD
     Checks -->|通过或仅预存失败| Changed{存在代码改动?}
     Changed -->|否| TaskRetry
     Changed -->|是| Commit[首次 commit；返修时 amend]
-    Commit --> Reviewer{配置 Reviewer?}
-    Reviewer -->|否| TaskDone[任务标记 done 并记录 commit]
-    Reviewer -->|是| TaskReview[只读 Review 最近一个 commit]
+    Commit --> ReviewMode{review.task_mode}
+    ReviewMode -->|off| TaskDone[任务标记 done 并记录 commit]
+    ReviewMode -->|formal 默认| FormalReview[确定性形式审查<br/>secrets / 禁改文件 / 空 diff]
+    ReviewMode -->|full| FullGate{配置 Reviewer?}
+    FullGate -->|否| TaskDone
+    FullGate -->|是| TaskReview[只读 LLM Review 最近一个 commit]
+    FormalReview --> FormalGuard{形式审查通过?}
+    FormalGuard -->|否，首次| Coding
+    FormalGuard -->|否，第二次| ManualReview[停止自动返修，等待人工处理]
+    FormalGuard -->|是| TaskDone
     TaskReview --> ReviewGuard{Review 结果}
     ReviewGuard -->|工作区被修改| RestoreReview[恢复到 Review 前 HEAD]
     RestoreReview --> Failed
     ReviewGuard -->|无合法 verdict| Failed
     ReviewGuard -->|REQUEST_CHANGES，首次| Coding
-    ReviewGuard -->|REQUEST_CHANGES，第二次| ManualReview[停止自动返修，等待人工处理]
+    ReviewGuard -->|REQUEST_CHANGES，第二次| ManualReview
     ReviewGuard -->|APPROVE| TaskDone
     TaskDone --> MoreTasks{还有未完成任务?}
     MoreTasks -->|是| TaskLoop
@@ -94,7 +101,12 @@ flowchart TD
 
 - Planner 开始前工作区会回到 `origin/<base_branch>`；Planner 或 Reviewer 如果产生 tracked 或
   non-ignored untracked 改动，orchestrator 会恢复到安全 commit 并将本轮标记失败。
+- 任务级审查按 `review.task_mode` 分档：`formal`（默认）为确定性检查（diff 中 secrets 模式、
+  禁改文件、空 commit），零 LLM 调用且不依赖 Reviewer 配置；`full` 为 LLM 只读深度 Review；
+  `off` 跳过。git 基础设施故障（如 worktree 损坏）以可重试错误处理，参与任务内返修循环。
 - checks 基线按命令隔离。pytest 使用失败 node ID 判断新增回归；其他命令仅在退出码和合并后的输出均与
   基线一致时容忍。
-- 明确的第二次 `REQUEST_CHANGES` 停止自动返修；无合法 verdict 和只读违规属于普通失败，在 Issue
-  失败预算内重新排队。
+- 明确的第二次不通过（LLM `REQUEST_CHANGES` 或形式审查拒绝）停止自动返修；无合法 verdict 和只读
+  违规属于普通失败，在 Issue 失败预算内重新排队。
+- 每次 Agent CLI 调用的耗时与 token 用量（CLI 输出 JSON envelope 时）双写：`agent_call` 事件进
+  JSONL 执行日志，按 Issue 累积总量进 SQLite，供 `status` 显示 TOKENS/COST/TIME 列。
