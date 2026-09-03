@@ -302,6 +302,35 @@ repo = "a/b"
     config = load_config(config_file)
     assert config.checks_parallel is True
     assert config.codegraph.enabled is True
+    assert config.review_task_mode == "formal"
+
+
+def test_config_parses_review_task_mode(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text('''
+[runtime]
+repo = "."
+[github]
+repo = "a/b"
+[review]
+task_mode = "full"
+''')
+    config = load_config(config_file)
+    assert config.review_task_mode == "full"
+
+
+def test_config_rejects_invalid_review_task_mode(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text('''
+[runtime]
+repo = "."
+[github]
+repo = "a/b"
+[review]
+task_mode = "invalid"
+''')
+    with pytest.raises(ValueError, match="review.task_mode"):
+        load_config(config_file)
 
 
 def test_config_rejects_unknown_reviewer_and_zero_limits(tmp_path: Path):

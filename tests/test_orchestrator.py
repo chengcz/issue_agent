@@ -45,6 +45,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         dry_run=True,
         repo=tmp_path,
         codegraph=CodegraphConfig(),
+        review_task_mode="full",
     )
     app.state = StateStore(tmp_path / "state.db")
     app.github = SimpleNamespace(
@@ -854,3 +855,106 @@ def test_recovery_marks_inflight_without_plan_failed(tmp_path):
 
     assert state.recover_interrupted() == 1
     assert state.rows()[0]["status"] == str(TaskStatus.FAILED)
+
+
+# ---------------------------------------------------------------------------
+# review_task_mode tests
+# ---------------------------------------------------------------------------
+
+def test_formal_review_mode_skips_llm_reviewer(tmp_path, monkeypatch):
+    """When review_task_mode=formal, the LLM reviewer agent is never called for tasks."""
+    from issue_agent.formal_review import FormalReviewResult
+
+    app = make_orchestrator(tmp_path)
+    app.config.review_task_mode = "formal"
+    monkeypatch.setattr(
+        "issue_agent.orchestrator.formal_review",
+        lambda ws: FormalReviewResult(approved=True, reason=""),
+    )
+    app.workspaces.changed.side_effect = [True, False]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+
+    # LLM reviewer not called for task review (only final review)
+    reviewer_prompts = [call.args[1] for call in app.agents["reviewer"].execute.await_args_list]
+    task_review_prompts = [p for p in reviewer_prompts if "most recent commit" in p]
+    assert len(task_review_prompts) == 0, \
+        f"LLM task reviewer should not be called in formal mode, got: {task_review_prompts}"
+    app.workspaces.push.assert_awaited_once()
+
+
+def test_formal_review_mode_rejects_secret_in_diff(tmp_path, monkeypatch):
+    """Formal review detects secrets and triggers a retry."""
+    from issue_agent.formal_review import FormalReviewResult
+
+    app = make_orchestrator(tmp_path)
+    app.config.review_task_mode = "formal"
+    call_count = {"n": 0}
+
+    def fake_formal_review(workspace):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return FormalReviewResult(approved=False, reason="Potential AWS access key detected")
+        return FormalReviewResult(approved=True, reason="")
+
+    monkeypatch.setattr("issue_agent.orchestrator.formal_review", fake_formal_review)
+    app.workspaces.changed.side_effect = [True, True, False]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+
+    assert call_count["n"] == 2  # first rejected, second approved
+    assert app.agents["worker"].execute.await_count == 2
+    app.workspaces.push.assert_awaited_once()
+
+
+def test_review_off_mode_skips_all_task_review(tmp_path, monkeypatch):
+    """When review_task_mode=off, no task review happens at all."""
+    from issue_agent.formal_review import FormalReviewResult
+
+    app = make_orchestrator(tmp_path)
+    app.config.review_task_mode = "off"
+    monkeypatch.setattr(
+        "issue_agent.orchestrator.formal_review",
+        lambda ws: FormalReviewResult(approved=True, reason=""),
+    )
+    app.workspaces.changed.side_effect = [True, False]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+
+    # reviewer only called for final review, not task review
+    reviewer_prompts = [call.args[1] for call in app.agents["reviewer"].execute.await_args_list]
+    task_review_prompts = [p for p in reviewer_prompts if "most recent commit" in p]
+    assert len(task_review_prompts) == 0
+    app.workspaces.push.assert_awaited_once()
+
+
+def test_full_review_mode_uses_llm_reviewer(tmp_path, monkeypatch):
+    """When review_task_mode=full, the existing LLM reviewer is used for tasks."""
+    from issue_agent.formal_review import FormalReviewResult
+
+    app = make_orchestrator(tmp_path)
+    app.config.review_task_mode = "full"
+    monkeypatch.setattr(
+        "issue_agent.orchestrator.formal_review",
+        lambda ws: FormalReviewResult(approved=True, reason=""),
+    )
+    app.workspaces.changed.side_effect = [True, False]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+
+    reviewer_prompts = [call.args[1] for call in app.agents["reviewer"].execute.await_args_list]
+    task_review_prompts = [p for p in reviewer_prompts if "most recent commit" in p]
+    assert len(task_review_prompts) == 1
+    app.workspaces.push.assert_awaited_once()

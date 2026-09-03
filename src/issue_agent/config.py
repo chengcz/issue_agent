@@ -35,6 +35,7 @@ class Config:
     check_timeout_seconds: int = 1800
     baseline_cache_ttl_seconds: int = 300
     checks_parallel: bool = True
+    review_task_mode: str = "formal"  # "full" | "formal" | "off"
     codegraph: CodegraphConfig = field(default_factory=CodegraphConfig)
     default_agent: str = "codex"
     reviewer_agent: str = ""
@@ -83,6 +84,10 @@ def validate_config(config: Config) -> None:
     ):
         if name and name not in config.agents:
             raise ValueError(f"unknown or disabled {role}: {name}")
+    if config.review_task_mode not in {"full", "formal", "off"}:
+        raise ValueError(
+            f"review.task_mode must be one of full/formal/off, got {config.review_task_mode!r}"
+        )
 
 
 def load_config(path: str | Path) -> Config:
@@ -128,6 +133,7 @@ def load_config(path: str | Path) -> Config:
         check_timeout_seconds=int(raw.get("checks", {}).get("timeout_seconds", 1800)),
         baseline_cache_ttl_seconds=int(raw.get("checks", {}).get("baseline_cache_ttl_seconds", 300)),
         checks_parallel=bool(raw.get("checks", {}).get("parallel", True)),
+        review_task_mode=str(raw.get("review", {}).get("task_mode", "formal")),
         codegraph=CodegraphConfig(
             enabled=bool(raw.get("codegraph", {}).get("enabled", True))
         ),
