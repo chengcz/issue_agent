@@ -6,6 +6,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .codegraph import CodegraphConfig
+
 
 @dataclass(frozen=True)
 class AgentConfig:
@@ -32,6 +34,8 @@ class Config:
     checks: tuple[str, ...] = ("pytest -q",)
     check_timeout_seconds: int = 1800
     baseline_cache_ttl_seconds: int = 300
+    checks_parallel: bool = True
+    codegraph: CodegraphConfig = field(default_factory=CodegraphConfig)
     default_agent: str = "codex"
     reviewer_agent: str = ""
     planner_agent: str = ""
@@ -123,6 +127,10 @@ def load_config(path: str | Path) -> Config:
         checks=tuple(raw.get("checks", {}).get("commands", ["pytest -q"])),
         check_timeout_seconds=int(raw.get("checks", {}).get("timeout_seconds", 1800)),
         baseline_cache_ttl_seconds=int(raw.get("checks", {}).get("baseline_cache_ttl_seconds", 300)),
+        checks_parallel=bool(raw.get("checks", {}).get("parallel", True)),
+        codegraph=CodegraphConfig(
+            enabled=bool(raw.get("codegraph", {}).get("enabled", True))
+        ),
         default_agent=runtime.get("default_agent", "codex"),
         reviewer_agent=runtime.get("reviewer_agent", ""),
         planner_agent=runtime.get("planner_agent", ""),

@@ -5,7 +5,14 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from issue_agent.agents import make_plan_prompt
+from issue_agent.agents import (
+    make_final_fix_prompt,
+    make_final_review_prompt,
+    make_plan_prompt,
+    make_task_prompt,
+    make_task_review_prompt,
+)
+from issue_agent.codegraph import CodegraphConfig
 from issue_agent.models import Issue, PlanTask, TaskStatus
 from issue_agent.orchestrator import Orchestrator, parse_plan, review_verdict
 from issue_agent.process import CommandError, Result
@@ -25,6 +32,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         max_task_attempts=attempts,
         checks=(),
         check_timeout_seconds=1800,
+        checks_parallel=True,
         reviewer_agent=reviewer,
         planner_agent="planner",
         max_tasks=8,
@@ -35,6 +43,8 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         auto_plan_limit=20,
         log_dir=tmp_path / "logs",
         dry_run=True,
+        repo=tmp_path,
+        codegraph=CodegraphConfig(),
     )
     app.state = StateStore(tmp_path / "state.db")
     app.github = SimpleNamespace(
@@ -54,6 +64,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         head_commit=AsyncMock(return_value="abc1234"),
         write_plan_file=Mock(),
         write_task_file=Mock(),
+        write_feedback_file=Mock(),
     )
     app.agents = {
         "worker": SimpleNamespace(execute=AsyncMock(return_value=result())),
@@ -143,6 +154,58 @@ def test_plan_prompt_demands_detail_but_single_line():
     assert "files or modules" in prompt
     assert "no raw line breaks" in prompt
     assert "long single line" in prompt
+
+
+def test_plan_prompt_appends_guidance_without_touching_base():
+    base = make_plan_prompt(Issue(9, "T", "B"), 8)
+    assert "codegraph" not in base
+    guided = make_plan_prompt(Issue(9, "T", "B"), 8, guidance="GUIDANCE-BLOCK")
+    assert guided.startswith(base)
+    assert guided.endswith("GUIDANCE-BLOCK")
+
+
+def test_task_prompt_inlines_titles_only_and_points_to_plan_file():
+    plan = [PlanTask("One", "first long description"), PlanTask("Two", "second long description")]
+    prompt = make_task_prompt(Issue(9, "T", "B"), plan[1], plan)
+    assert "1. One" in prompt
+    assert "2. Two" in prompt
+    assert ".agent/plan.md" in prompt
+    assert "first long description" not in prompt
+    assert "second long description" not in prompt
+
+
+def test_task_prompt_retry_uses_feedback_pointer_and_short_excerpt():
+    plan = [PlanTask("One", "D")]
+    prompt = make_task_prompt(Issue(9, "T", "B"), plan[0], plan, retry_error="E" * 5000)
+    assert ".agent/feedback.md" in prompt
+    assert "E" * 800 in prompt
+    assert "E" * 801 not in prompt
+
+
+def test_task_review_prompt_appends_guidance_without_touching_base():
+    base = make_task_review_prompt(Issue(9, "T", "B"), PlanTask("One", "D"))
+    assert "codegraph" not in base
+    guided = make_task_review_prompt(Issue(9, "T", "B"), PlanTask("One", "D"), guidance="G")
+    assert guided.startswith(base)
+    assert guided.endswith("G")
+
+
+def test_final_review_prompt_uses_plan_pointer_and_guidance():
+    plan = [PlanTask("One", "first long description")]
+    base = make_final_review_prompt(Issue(9, "T", "B"), plan, "main")
+    assert ".agent/plan.md" in base
+    assert "1. One" in base
+    assert "first long description" not in base
+    guided = make_final_review_prompt(Issue(9, "T", "B"), plan, "main", guidance="G")
+    assert guided.startswith(base)
+    assert guided.endswith("G")
+
+
+def test_final_fix_prompt_uses_feedback_pointer_and_short_excerpt():
+    prompt = make_final_fix_prompt(Issue(9, "T", "B"), "F" * 5000)
+    assert ".agent/feedback.md" in prompt
+    assert "F" * 800 in prompt
+    assert "F" * 801 not in prompt
 
 
 def test_parse_plan_accepts_fenced_json_with_prose():
@@ -432,7 +495,7 @@ def test_final_checks_failure_triggers_a_fix_commit(tmp_path, monkeypatch):
             raise CommandError("pytest failed: 1 failed")
         return result()
 
-    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
     app.workspaces.changed.side_effect = [True, True, False]
     issue = Issue(4, "Task", "Body")
     app.state.claim(issue, "worker")
@@ -628,6 +691,70 @@ def test_command_errors_from_coding_are_retried(tmp_path):
     assert app.agents["worker"].execute.await_count == 2
     assert "first failure" in app.agents["worker"].execute.await_args_list[1].args[1]
     app.workspaces.push.assert_awaited_once()
+
+
+def test_prompts_include_codegraph_guidance_when_index_ready(tmp_path):
+    app = make_orchestrator(tmp_path)
+    (tmp_path / ".codegraph").mkdir()
+    app.workspaces.changed.side_effect = [True, True, False]
+
+    run_process(app, Issue(4, "Task", "Body"))
+
+    planner_prompt = app.agents["planner"].execute.await_args_list[0].args[1]
+    assert "codegraph" in planner_prompt
+    worker_prompts = [call.args[1] for call in app.agents["worker"].execute.await_args_list]
+    assert all("codegraph" in prompt for prompt in worker_prompts)
+    reviewer_prompts = [call.args[1] for call in app.agents["reviewer"].execute.await_args_list]
+    assert all("codegraph" in prompt for prompt in reviewer_prompts)
+
+
+def test_prompts_omit_codegraph_block_without_index(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.workspaces.changed.side_effect = [True, True, False]
+
+    run_process(app, Issue(4, "Task", "Body"))
+
+    prompts = [app.agents["planner"].execute.await_args_list[0].args[1]]
+    prompts += [call.args[1] for call in app.agents["worker"].execute.await_args_list]
+    prompts += [call.args[1] for call in app.agents["reviewer"].execute.await_args_list]
+    assert all("codegraph" not in prompt for prompt in prompts)
+
+
+def test_task_retry_writes_feedback_file_and_prompt_points_to_it(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.agents["worker"].execute.side_effect = [CommandError("first failure"), result()]
+    app.workspaces.changed.side_effect = [True, False]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+
+    app.workspaces.write_feedback_file.assert_called_once_with(tmp_path, "first failure")
+    retry_prompt = app.agents["worker"].execute.await_args_list[1].args[1]
+    assert ".agent/feedback.md" in retry_prompt
+    assert "first failure" in retry_prompt
+
+
+def test_final_fix_writes_feedback_file_and_prompt_points_to_it(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.agents["reviewer"].execute.side_effect = [
+        result(APPROVE),  # task one
+        result("Missing docs.\nVERDICT: REQUEST_CHANGES\n"),  # final review
+        result("Docs added.\nVERDICT: APPROVE\n"),  # final re-review
+    ]
+    app.workspaces.changed.side_effect = [True, True, False]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+
+    feedback_texts = [call.args[1] for call in app.workspaces.write_feedback_file.call_args_list]
+    assert any("Missing docs" in text for text in feedback_texts)
+    fix_prompt = app.agents["worker"].execute.await_args_list[1].args[1]
+    assert ".agent/feedback.md" in fix_prompt
+    assert "Missing docs" in fix_prompt
 
 
 def test_task_attempt_budget_is_independent_from_issue_retry_budget(tmp_path):

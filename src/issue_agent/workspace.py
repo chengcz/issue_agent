@@ -84,6 +84,11 @@ class WorkspaceManager:
         ) + "\n"
         (path / ".agent" / "plan.md").write_text(content, encoding="utf-8")
 
+    def write_feedback_file(self, path: Path, feedback: str) -> None:
+        """Persist the full failure report a retry prompt only excerpts."""
+        (path / ".agent").mkdir(parents=True, exist_ok=True)
+        (path / ".agent" / "feedback.md").write_text(feedback + "\n", encoding="utf-8")
+
     def write_task_file(self, path: Path, issue: Issue, task: PlanTask) -> None:
         (path / ".agent").mkdir(parents=True, exist_ok=True)
         content = (

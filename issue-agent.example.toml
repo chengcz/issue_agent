@@ -25,6 +25,15 @@ ready_label = "agent-ready"
 commands = ["ruff check .", "pytest -q"]
 timeout_seconds = 1800
 baseline_cache_ttl_seconds = 300
+# Run multiple check commands concurrently; set false if they contend in the worktree.
+parallel = true
+
+# CodeGraph (form B): when the target repo's main checkout has a .codegraph/ index,
+# planner/worker/reviewer prompts gain a guidance block pointing agents at the
+# codegraph MCP tools (or read-only CLI). The index is user-maintained:
+# codegraph init / codegraph watch / codegraph install. Disable to keep prompts unchanged.
+[codegraph]
+enabled = true
 
 # If {prompt} is absent, the prompt is sent through stdin (safer for long Issues).
 [agents.codex]

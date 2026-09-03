@@ -6,12 +6,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from issue_agent.checks import CheckBaseline, failed_tests
 from issue_agent.cli import format_status, parser
 from issue_agent.config import load_config
 from issue_agent.github import GitHub
 from issue_agent.issue_log import IssueLog
 from issue_agent.models import Issue, PlanTask, TaskStatus
-from issue_agent.orchestrator import CheckBaseline, Orchestrator, failed_tests
+from issue_agent.orchestrator import Orchestrator
 from issue_agent.process import CommandError, Result, shell
 from issue_agent.state import StateStore
 from issue_agent.workspace import WorkspaceManager, slugify
@@ -19,6 +20,15 @@ from issue_agent.workspace import WorkspaceManager, slugify
 
 def test_slugify_is_branch_safe():
     assert slugify("Add Regimen / API!") == "add-regimen-api"
+
+
+def test_write_feedback_file_creates_agent_dir(tmp_path):
+    workspace = tmp_path / "wt"
+    workspace.mkdir()
+    manager = WorkspaceManager(tmp_path, tmp_path / "worktrees", "main")
+    manager.write_feedback_file(workspace, "review requested changes:\nMissing docs")
+    feedback = (workspace / ".agent" / "feedback.md").read_text(encoding="utf-8")
+    assert feedback == "review requested changes:\nMissing docs\n"
 
 
 def test_workspace_status_uses_complete_porcelain_output(tmp_path, monkeypatch):
@@ -261,6 +271,39 @@ timeout_seconds = 17
     assert app.config.baseline_cache_ttl_seconds == 300
 
 
+def test_config_parses_codegraph_and_parallel_checks(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text('''
+[runtime]
+repo = "."
+state_db = "state.db"
+dry_run = true
+[github]
+repo = "a/b"
+[checks]
+commands = ["pytest -q"]
+parallel = false
+[codegraph]
+enabled = false
+''')
+    config = load_config(config_file)
+    assert config.checks_parallel is False
+    assert config.codegraph.enabled is False
+
+
+def test_config_defaults_to_codegraph_enabled_and_parallel_checks(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text('''
+[runtime]
+repo = "."
+[github]
+repo = "a/b"
+''')
+    config = load_config(config_file)
+    assert config.checks_parallel is True
+    assert config.codegraph.enabled is True
+
+
 def test_config_rejects_unknown_reviewer_and_zero_limits(tmp_path: Path):
     config_file = tmp_path / "issue-agent.toml"
     config_file.write_text(
@@ -411,7 +454,7 @@ def test_run_checks_tolerates_pre_existing_failures(tmp_path, monkeypatch):
     async def fake_shell(command, *, cwd, timeout=3600, check=True):
         return Result(1, "FAILED backend/tests/test_teams.py::test_a - x\n", "")
 
-    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
     log = _Log()
     asyncio.run(
         app._run_checks(
@@ -441,7 +484,7 @@ def test_run_checks_flags_new_failures_and_blames_only_them(tmp_path, monkeypatc
             "",
         )
 
-    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
     with pytest.raises(CommandError) as exc:
         asyncio.run(
             app._run_checks(
@@ -469,7 +512,7 @@ def test_run_checks_still_fails_without_failed_lines(tmp_path, monkeypatch):
     async def fake_shell(command, *, cwd, timeout=3600, check=True):
         return Result(2, "SyntaxError: bad input\n", "")
 
-    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
     with pytest.raises(CommandError):
         asyncio.run(app._run_checks(tmp_path, _Log(), {}))
 
@@ -480,7 +523,7 @@ def test_run_checks_tolerates_unchanged_non_pytest_failure(tmp_path, monkeypatch
     async def fake_shell(command, *, cwd, timeout=3600, check=True):
         return Result(1, "SyntaxError: existing bad input\n", "")
 
-    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
     baseline = asyncio.run(app._capture_baseline(tmp_path))
     log = _Log()
     asyncio.run(app._run_checks(tmp_path, log, baseline))
@@ -499,7 +542,7 @@ def test_run_checks_flags_changed_non_pytest_failure(tmp_path, monkeypatch):
     async def fake_shell(command, *, cwd, timeout=3600, check=True):
         return next(results)
 
-    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
     baseline = asyncio.run(app._capture_baseline(tmp_path))
     with pytest.raises(CommandError, match="new bad input"):
         asyncio.run(app._run_checks(tmp_path, _Log(), baseline))
@@ -516,7 +559,7 @@ def test_run_checks_keeps_baselines_isolated_by_command(tmp_path, monkeypatch):
             return Result(0, "", "")
         return Result(1, "FAILED tests/test_api.py::test_a - new\n", "")
 
-    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
     with pytest.raises(CommandError, match="1 new failure"):
         asyncio.run(app._run_checks(tmp_path, _Log(), baseline))
 
@@ -529,7 +572,7 @@ def test_capture_baseline_collects_pre_existing_failures(tmp_path, monkeypatch):
             return Result(0, "", "")
         return Result(1, "FAILED backend/tests/test_teams.py::test_a - x\n", "")
 
-    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
     baseline = asyncio.run(app._capture_baseline(tmp_path))
     assert baseline == {
         "pytest": CheckBaseline(
@@ -554,7 +597,7 @@ def test_capture_baseline_is_reused_for_same_anchor(tmp_path, monkeypatch):
         return Result(1, "FAILED tests/test_api.py::test_a - existing\n", "")
 
     monkeypatch.setattr(app.workspaces, "head_commit", fake_head_commit)
-    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
 
     first = asyncio.run(app._capture_baseline(tmp_path))
     second = asyncio.run(app._capture_baseline(tmp_path))
@@ -599,7 +642,7 @@ command = "fake -"
     async def fake_shell(command, *, cwd, timeout=3600, check=True):
         return Result(1, "FAILED backend/tests/test_new.py::test_b - y\n", "")
 
-    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
     issue_log = IssueLog(tmp_path / "logs", 1)
 
     with pytest.raises(CommandError):
@@ -680,7 +723,7 @@ command = "fake -"
     async def fake_head_commit(path):
         return "abc1234"
 
-    monkeypatch.setattr("issue_agent.orchestrator.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
     monkeypatch.setattr(app.workspaces, "changed", fake_changed)
     monkeypatch.setattr(app.workspaces, "commit", fake_commit)
     monkeypatch.setattr(app.workspaces, "head_commit", fake_head_commit)

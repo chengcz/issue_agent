@@ -25,8 +25,18 @@ class CliAgent:
         )
 
 
-def make_plan_prompt(issue: Issue, max_tasks: int) -> str:
-    return f"""You are the planner for GitHub Issue #{issue.number}.
+def _with_guidance(prompt: str, guidance: str) -> str:
+    """Append the codegraph guidance block; empty guidance keeps the prompt byte-identical."""
+    return f"{prompt}\n\n{guidance}" if guidance else prompt
+
+
+def _excerpt(error: str) -> str:
+    """Head excerpt of a failure report; the full text lives in .agent/feedback.md."""
+    return error[:800]
+
+
+def make_plan_prompt(issue: Issue, max_tasks: int, guidance: str = "") -> str:
+    prompt = f"""You are the planner for GitHub Issue #{issue.number}.
 Read AGENTS.md when present. Explore the codebase read-only. Do NOT modify files or commit.
 Split the issue into a sequence of {max_tasks} or fewer concrete implementation tasks. Each task must:
 - be independently committable and reviewable (one logical change per task)
@@ -44,22 +54,33 @@ is fine; only raw line breaks break the format:
 ```json
 [{{"title": "short task title", "description": "which files, which functions, how it connects, and the Acceptance: check"}}]
 ```"""
+    return _with_guidance(prompt, guidance)
 
 
-def make_task_prompt(issue: Issue, task: PlanTask, plan: list[PlanTask], *, retry_error: str = "") -> str:
-    plan_text = "\n".join(f"{i + 1}. {t.title}: {t.description}" for i, t in enumerate(plan))
-    retry = f"\nPrevious attempt failed. Fix this error:\n{retry_error[-4000:]}\n" if retry_error else ""
-    return f"""You are the coding worker for GitHub Issue #{issue.number}, implementing one task of the plan.
-Read AGENTS.md when present and .agent/task.md. Implement ONLY the current task; earlier tasks are already
-committed — do not redo or revert them. Stay inside this worktree. Do not commit, push, create a PR, merge,
-deploy, or edit secrets. Add or update tests and documentation as required. Review your diff before finishing.
-Full plan:
-{plan_text}
+def make_task_prompt(
+    issue: Issue, task: PlanTask, plan: list[PlanTask], *, retry_error: str = "", guidance: str = ""
+) -> str:
+    overview = "\n".join(f"{i + 1}. {t.title}" for i, t in enumerate(plan))
+    retry = (
+        "\nPrevious attempt failed. Full report: .agent/feedback.md "
+        "(raw check output: .agent/check-output.txt). Excerpt:\n"
+        f"{_excerpt(retry_error)}\n"
+        if retry_error
+        else ""
+    )
+    prompt = f"""You are the coding worker for GitHub Issue #{issue.number}, implementing one task of the plan.
+Read AGENTS.md when present, .agent/task.md (issue + current task), and .agent/plan.md (full plan with
+per-task descriptions). Implement ONLY the current task; earlier tasks are already committed — do not
+redo or revert them. Stay inside this worktree. Do not commit, push, create a PR, merge, deploy, or edit
+secrets. Add or update tests and documentation as required. Review your diff before finishing.
+Plan overview (full descriptions in .agent/plan.md):
+{overview}
 {retry}"""
+    return _with_guidance(prompt, guidance)
 
 
-def make_task_review_prompt(issue: Issue, task: PlanTask) -> str:
-    return f"""Review the most recent commit for GitHub Issue #{issue.number}, which implements the task:
+def make_task_review_prompt(issue: Issue, task: PlanTask, guidance: str = "") -> str:
+    prompt = f"""Review the most recent commit for GitHub Issue #{issue.number}, which implements the task:
 {task.title}
 Read AGENTS.md and .agent/task.md. Do not modify files. Inspect the last commit (e.g. `git diff HEAD^ HEAD`)
 and review only this task's changes.
@@ -68,24 +89,30 @@ Give concrete reasons before the verdict. End with exactly one of these lines:
 VERDICT: APPROVE
 VERDICT: REQUEST_CHANGES
 """
+    return _with_guidance(prompt, guidance)
 
 
-def make_final_review_prompt(issue: Issue, plan: list[PlanTask], base_branch: str) -> str:
-    plan_text = "\n".join(f"{i + 1}. {t.title}: {t.description}" for i, t in enumerate(plan))
-    return f"""Review the complete implementation for GitHub Issue #{issue.number} (all tasks on this branch).
-Read AGENTS.md. Do not modify files. Review the full branch diff against the base
-(e.g. `git diff origin/{base_branch} HEAD`) as one coherent change, and check it satisfies the plan:
-{plan_text}
+def make_final_review_prompt(
+    issue: Issue, plan: list[PlanTask], base_branch: str, guidance: str = ""
+) -> str:
+    overview = "\n".join(f"{i + 1}. {t.title}" for i, t in enumerate(plan))
+    prompt = f"""Review the complete implementation for GitHub Issue #{issue.number} (all tasks on this branch).
+Read AGENTS.md and .agent/plan.md (full plan with per-task descriptions). Do not modify files. Review the
+full branch diff against the base (e.g. `git diff origin/{base_branch} HEAD`) as one coherent change, and
+check it satisfies the plan:
+Plan overview (full descriptions in .agent/plan.md):
+{overview}
 Check cross-task consistency, correctness, security, compatibility, migrations, tests, and unrelated changes.
 Give concrete reasons before the verdict. End with exactly one of these lines:
 VERDICT: APPROVE
 VERDICT: REQUEST_CHANGES
 """
+    return _with_guidance(prompt, guidance)
 
 
 def make_final_fix_prompt(issue: Issue, error: str) -> str:
     return f"""You are the coding worker for GitHub Issue #{issue.number}. The final review or checks requested
 changes. Fix the reported problems and leave no unrelated changes. Stay inside this worktree. Do not commit,
 push, create a PR, merge, deploy, or edit secrets.
-Reported problems:
-{error[-4000:]}"""
+Reported problems: full report in .agent/feedback.md (raw check output: .agent/check-output.txt). Excerpt:
+{_excerpt(error)}"""
