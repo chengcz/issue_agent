@@ -1054,3 +1054,76 @@ def test_execute_agent_logs_duration_when_usage_absent(tmp_path):
     _, fields = agent_calls[0]
     assert fields["duration_ms"] == 999
     assert "input_tokens" not in fields
+
+
+def test_execute_agent_accumulates_usage_in_state_db(tmp_path):
+    """Dual-write: agent_call usage also lands in the state DB totals."""
+    app = make_orchestrator(tmp_path)
+    log = _Log()
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.agents["worker"].execute = AsyncMock(
+        return_value=Result(
+            returncode=0,
+            stdout="done",
+            stderr="",
+            duration_ms=2000,
+            usage={"input_tokens": 100, "output_tokens": 40, "cost_usd": 0.008},
+        )
+    )
+
+    asyncio.run(app._execute_agent("worker", tmp_path, "prompt", issue_log=log, issue_number=4))
+
+    row = next(r for r in app.state.rows() if r["issue_number"] == 4)
+    assert row["total_input_tokens"] == 100
+    assert row["total_output_tokens"] == 40
+    assert row["total_cost_usd"] == 0.008
+    assert row["total_duration_ms"] == 2000
+    # JSONL log still written (dual-channel preserved)
+    assert any(e[0] == "agent_call" for e in log.events)
+
+
+def test_execute_read_only_accumulates_usage_in_state_db(tmp_path):
+    """Read-only agents (planner/reviewer) also accumulate into state DB."""
+    app = make_orchestrator(tmp_path)
+    log = _Log()
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.agents["reviewer"].execute = AsyncMock(
+        return_value=Result(
+            returncode=0,
+            stdout=APPROVE,
+            stderr="",
+            duration_ms=1500,
+            usage={"input_tokens": 60, "output_tokens": 15, "cache_read_input_tokens": 300},
+        )
+    )
+
+    asyncio.run(
+        app._execute_read_only(
+            "reviewer", tmp_path, "p", role="task reviewer", issue_log=log, issue_number=4
+        )
+    )
+
+    row = next(r for r in app.state.rows() if r["issue_number"] == 4)
+    assert row["total_input_tokens"] == 60
+    assert row["total_cache_read_tokens"] == 300
+    assert row["total_duration_ms"] == 1500
+
+
+def test_execute_agent_without_issue_number_skips_state_write(tmp_path):
+    """Backward compat: omitting issue_number logs to JSONL only, no state write."""
+    app = make_orchestrator(tmp_path)
+    log = _Log()
+    app.agents["worker"].execute = AsyncMock(
+        return_value=Result(
+            returncode=0, stdout="ok", stderr="", duration_ms=10,
+            usage={"input_tokens": 5},
+        )
+    )
+
+    asyncio.run(app._execute_agent("worker", tmp_path, "prompt", issue_log=log))
+
+    assert any(e[0] == "agent_call" for e in log.events)
+    # no state rows touched
+    assert app.state.rows() == []

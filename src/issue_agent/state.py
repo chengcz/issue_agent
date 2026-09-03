@@ -35,7 +35,14 @@ class StateStore:
                 agent TEXT, branch TEXT, worktree TEXT, attempts INTEGER NOT NULL DEFAULT 0,
                 failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, pr_url TEXT, plan TEXT,
                 current_seq INTEGER NOT NULL DEFAULT -1, final_commit_hash TEXT,
-                final_last_error TEXT, updated_at TEXT NOT NULL
+                final_last_error TEXT,
+                total_input_tokens INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd REAL NOT NULL DEFAULT 0,
+                total_duration_ms INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
             )""")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
             if "plan" not in columns:
@@ -48,6 +55,18 @@ class StateStore:
                 db.execute("ALTER TABLE tasks ADD COLUMN final_commit_hash TEXT")
             if "final_last_error" not in columns:
                 db.execute("ALTER TABLE tasks ADD COLUMN final_last_error TEXT")
+            if "total_input_tokens" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN total_input_tokens INTEGER NOT NULL DEFAULT 0")
+            if "total_output_tokens" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN total_output_tokens INTEGER NOT NULL DEFAULT 0")
+            if "total_cache_read_tokens" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN total_cache_read_tokens INTEGER NOT NULL DEFAULT 0")
+            if "total_cache_creation_tokens" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0")
+            if "total_cost_usd" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0")
+            if "total_duration_ms" not in columns:
+                db.execute("ALTER TABLE tasks ADD COLUMN total_duration_ms INTEGER NOT NULL DEFAULT 0")
             db.execute("""CREATE TABLE IF NOT EXISTS plan_tasks (
                 issue_number INTEGER NOT NULL, seq INTEGER NOT NULL,
                 title TEXT NOT NULL, description TEXT NOT NULL,
@@ -232,6 +251,46 @@ class StateStore:
                 (*fields.values(), issue_number),
             )
 
+    def accumulate_usage(
+        self, issue_number: int, usage: dict[str, object] | None, *, duration_ms: int | None
+    ) -> None:
+        """Add one agent call's token/cost/duration to the issue's cumulative totals.
+
+        Missing keys count as zero; unknown issues are silently ignored so a
+        stray call never breaks the execution loop.
+        """
+        usage = usage or {}
+
+        def _int(key: str) -> int:
+            value = usage.get(key)
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        def _float(key: str) -> float:
+            value = usage.get(key)
+            return float(value) if isinstance(value, (int, float)) else 0.0
+
+        cost = _float("total_cost_usd") or _float("cost_usd")
+        with self.connect() as db:
+            db.execute(
+                """UPDATE tasks SET
+                    total_input_tokens = total_input_tokens + ?,
+                    total_output_tokens = total_output_tokens + ?,
+                    total_cache_read_tokens = total_cache_read_tokens + ?,
+                    total_cache_creation_tokens = total_cache_creation_tokens + ?,
+                    total_cost_usd = total_cost_usd + ?,
+                    total_duration_ms = total_duration_ms + ?
+                WHERE issue_number=?""",
+                (
+                    _int("input_tokens"),
+                    _int("output_tokens"),
+                    _int("cache_read_input_tokens"),
+                    _int("cache_creation_input_tokens"),
+                    cost,
+                    int(duration_ms) if duration_ms else 0,
+                    issue_number,
+                ),
+            )
+
     def rows(self) -> list[dict[str, object]]:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM tasks ORDER BY updated_at DESC")]
@@ -241,6 +300,9 @@ class StateStore:
         sql = """SELECT tasks.issue_number, tasks.title, tasks.status, tasks.agent,
             tasks.branch, tasks.attempts, tasks.failures, tasks.current_seq,
             plan_tasks.title AS current_task, tasks.last_error, tasks.pr_url,
+            tasks.total_input_tokens, tasks.total_output_tokens,
+            tasks.total_cache_read_tokens, tasks.total_cache_creation_tokens,
+            tasks.total_cost_usd, tasks.total_duration_ms,
             tasks.updated_at
             FROM tasks
             LEFT JOIN plan_tasks ON plan_tasks.issue_number = tasks.issue_number
