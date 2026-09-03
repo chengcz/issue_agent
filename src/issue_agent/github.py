@@ -41,10 +41,19 @@ class GitHub:
     async def ready_issues(self, label: str, limit: int = 20) -> list[Issue]:
         return await self.open_issues(limit, label=label)
 
-    async def unlabeled_issues(self, limit: int = 20) -> list[Issue]:
-        """Return open Issues that have no labels at all."""
+    async def unassigned_issues(self, limit: int = 20) -> list[Issue]:
+        """Return open Issues that are not already in the agent workflow.
+
+        Product labels such as ``bug`` and ``enhancement`` must not prevent the
+        plan-only phase.  An Issue becomes ineligible only once an ``agent-*``
+        workflow label is present (for example ``agent-ready`` or
+        ``agent-running``).  ``agent:<name>`` remains a routing preference, so
+        it intentionally does not suppress planning.
+        """
         return [
-            issue for issue in await self.open_issues(limit, search="no:label") if not issue.labels
+            issue
+            for issue in await self.open_issues(limit)
+            if not any(label.startswith("agent-") for label in issue.labels)
         ]
 
     async def runnable_issues(self, ready_label: str, limit: int = 20) -> list[Issue]:

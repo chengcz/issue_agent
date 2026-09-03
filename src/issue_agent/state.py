@@ -94,7 +94,7 @@ class StateStore:
         return True
 
     def claim_for_planning(self, issue: Issue, agent: str, max_attempts: int = 3) -> bool:
-        """Claim an unlabeled Issue for planning exactly once unless planning was interrupted."""
+        """Claim an unassigned Issue for planning exactly once unless planning was interrupted."""
         now = datetime.now(UTC).isoformat()
         with self.connect() as db:
             row = db.execute(

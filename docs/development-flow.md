@@ -8,10 +8,10 @@
 ```mermaid
 flowchart TD
     Start[once / serve 启动] --> Recover[恢复被中断的 SQLite 状态]
-    Recover --> Poll[拉取 agent-ready、agent-running<br/>以及可选的无 Label Issue]
+    Recover --> Poll[拉取 agent-ready、agent-running<br/>以及可选的无 agent-* Issue]
 
     Poll --> Kind{Issue 类型}
-    Kind -->|无 Label| PlanClaim[幂等领取 Plan-only]
+    Kind -->|无 agent-* 标签| PlanClaim[幂等领取 Plan-only]
     PlanClaim --> PlanWorkspace[创建或复用 worktree<br/>重置到 origin/base]
     PlanWorkspace --> Planner[只读 Planner 生成 1..N 个任务]
     Planner --> PlanGuard{工作区被修改?}
