@@ -124,6 +124,14 @@ class TestGitErrorHandling:
         with pytest.raises(RuntimeError, match="git diff.*failed"):
             _git(tmp_path, "diff", "--name-only", "HEAD^", "HEAD")
 
+    def test_git_failure_raises_command_error_for_retry_participation(self, tmp_path):
+        """_git() raises CommandError specifically so the task retry loop can catch it."""
+        from issue_agent.formal_review import _git
+        from issue_agent.process import CommandError
+
+        with pytest.raises(CommandError, match="git diff.*failed"):
+            _git(tmp_path, "diff", "--name-only", "HEAD^", "HEAD")
+
     def test_formal_review_propagates_git_error(self, tmp_path):
         """formal_review() on a non-git directory raises RuntimeError, not silent empty."""
         with pytest.raises(RuntimeError, match="git.*failed"):

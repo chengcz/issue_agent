@@ -989,6 +989,8 @@ dry_run = true
 repo = "a/b"
 [checks]
 commands = ["pytest"]
+[review]
+task_mode = "off"
 [agents.codex]
 command = "fake -"
 """
