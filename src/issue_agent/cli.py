@@ -27,10 +27,13 @@ def parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="show current and persisted task state")
     status.add_argument("--active", action="store_true", help="show only running tasks")
     status.add_argument("--json", action="store_true", help="output machine-readable JSON")
+    report = sub.add_parser("report", help="show per-Issue and per-task time and token usage")
+    report.add_argument("--issue", type=int, help="limit the report to one GitHub Issue")
+    report.add_argument("--json", action="store_true", help="output machine-readable JSON")
     reset = sub.add_parser("reset", help="reset a task so it can be claimed and run again")
     reset.add_argument("issue", type=int, help="GitHub issue number to reset")
     reset.add_argument(
-        "--no-label", action="store_true", help="reset state only; do not re-add the agent-ready label"
+        "--no-label", action="store_true", help="reset state only; do not re-add the ready label"
     )
     return result
 
@@ -94,11 +97,56 @@ def format_status(rows: list[dict[str, object]]) -> str:
     return "\n".join((header, separator, *body))
 
 
+def format_report(rows: list[dict[str, object]]) -> str:
+    """Render cumulative wall/agent/check time and tokens for Issues and plan tasks."""
+    if not rows:
+        return "No matching tasks."
+    sections: list[str] = []
+    for row in rows:
+        summary = (
+            f"#{row['issue_number']} {row['title']} [{row['status']}]  "
+            f"wall={_format_duration({'total_duration_ms': row.get('total_wall_duration_ms')})}  "
+            f"queue={_format_duration({'total_duration_ms': row.get('total_queue_duration_ms')})}  "
+            f"agent={_format_duration(row)}  "
+            f"checks={_format_duration({'total_duration_ms': row.get('total_check_duration_ms')})}  "
+            f"tokens={_format_tokens(row)}  cost={_format_cost(row)}"
+        )
+        tasks = row.get("tasks") or []
+        if not tasks:
+            sections.append(summary)
+            continue
+        headings = ("TASK", "STATUS", "ATTEMPTS", "TOKENS", "AGENT", "CHECKS", "WALL", "TITLE")
+        values = [
+            (
+                str(int(task["seq"]) + 1),
+                str(task["status"]),
+                str(task["attempts"]),
+                _format_tokens(task),
+                _format_duration(task),
+                _format_duration({"total_duration_ms": task.get("total_check_duration_ms")}),
+                _format_duration({"total_duration_ms": task.get("total_wall_duration_ms")}),
+                str(task["title"]),
+            )
+            for task in tasks
+        ]
+        widths = [
+            max(len(headings[index]), *(len(value[index]) for value in values))
+            for index in range(len(headings))
+        ]
+        table = [
+            "  ".join(value.ljust(widths[index]) for index, value in enumerate(headings)),
+            "  ".join("-" * width for width in widths),
+            *("  ".join(value.ljust(widths[index]) for index, value in enumerate(item)) for item in values),
+        ]
+        sections.append(summary + "\n" + "\n".join(table))
+    return "\n\n".join(sections)
+
+
 async def reset_issue(config, issue_number: int, *, no_label: bool) -> int:
     """Reset one task row so it is claimable again, optionally requeueing it.
 
     Clears the whole-issue retry budget and returns the row to PENDING. Unless
-    ``no_label`` is set, also re-adds the ``agent-ready`` label (and removes the
+    ``no_label`` is set, also re-adds the configured ready label (and removes the
     orchestrator-maintained ``agent-failed``/``agent-running`` labels) so the
     issue is picked up on the next scheduler poll. Prints a summary; returns a
     process exit code.
@@ -122,11 +170,13 @@ async def reset_issue(config, issue_number: int, *, no_label: bool) -> int:
     if not no_label:
         github = GitHub(config.github_repo, config.repo, dry_run=config.dry_run)
         await github.labels(
-            issue_number, add=("agent-ready",), remove=("agent-failed", "agent-running")
+            issue_number,
+            add=(config.ready_label,),
+            remove=("agent-failed", "agent-running"),
         )
-        summary += "; re-added agent-ready, will be picked up on the next poll"
+        summary += f"; re-added {config.ready_label}, will be picked up on the next poll"
     else:
-        summary += "; add the agent-ready label to rerun"
+        summary += f"; add the {config.ready_label} label to rerun"
     print(summary)
     return 0
 
@@ -136,6 +186,10 @@ async def async_main(args: argparse.Namespace) -> int:
     if args.command == "status":
         rows = StateStore(config.state_db).status_rows(active_only=args.active)
         print(json.dumps(rows, ensure_ascii=False, indent=2) if args.json else format_status(rows))
+        return 0
+    if args.command == "report":
+        rows = StateStore(config.state_db).report_rows(args.issue)
+        print(json.dumps(rows, ensure_ascii=False, indent=2) if args.json else format_report(rows))
         return 0
     if args.command == "reset":
         return await reset_issue(config, args.issue, no_label=args.no_label)

@@ -371,7 +371,7 @@ def test_unlabeled_issue_plan_waits_for_ready_before_coding(tmp_path):
     assert row["status"] == str(TaskStatus.PLANNED)
     assert app.agents["planner"].execute.await_count == 1
     assert "agent-ready" in app.github.comment.await_args.args[1]
-    app.github.labels.assert_not_awaited()
+    app.github.labels.assert_awaited_once_with(4, add=("agent-planned",))
     app.workspaces.push.assert_not_awaited()
     app.github.create_pr.assert_not_awaited()
 
@@ -381,7 +381,7 @@ def test_unlabeled_issue_plan_waits_for_ready_before_coding(tmp_path):
 
     assert app.agents["planner"].execute.await_count == 1
     app.github.labels.assert_any_await(
-        4, add=("agent-running",), remove=("agent-ready",)
+        4, add=("agent-running",), remove=("agent-ready", "agent-planned")
     )
     app.workspaces.push.assert_awaited_once()
     app.github.create_pr.assert_awaited_once()
@@ -1272,3 +1272,139 @@ def test_process_accumulates_usage_from_all_agent_calls_in_state_db(tmp_path):
     assert row["total_output_tokens"] == 50 + 10 + 10
     assert abs(row["total_cost_usd"] - (0.01 + 0.003 + 0.003)) < 1e-9
     assert row["total_duration_ms"] == 1000 + 500 + 500
+    task = app.state.report_rows(4)[0]["tasks"][0]
+    # Task metrics include its worker and task reviewer, but not the final reviewer.
+    assert task["total_input_tokens"] == 100 + 30
+    assert task["total_output_tokens"] == 50 + 10
+    assert task["total_duration_ms"] == 1000 + 500
+
+
+def test_failed_agent_call_is_attributed_to_task_and_counted(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("Implement", "Details")])
+    app.agents["worker"].execute = AsyncMock(
+        side_effect=CommandError(
+            "agent failed",
+            result=Result(
+                1,
+                "",
+                "boom",
+                duration_ms=700,
+                usage={"input_tokens": 40, "output_tokens": 5},
+            ),
+        )
+    )
+    log = _Log()
+
+    with pytest.raises(CommandError, match="agent failed"):
+        asyncio.run(
+            app._execute_agent(
+                "worker",
+                tmp_path,
+                "prompt",
+                issue_log=log,
+                issue_number=4,
+                seq=0,
+                attempt=2,
+            )
+        )
+
+    task = app.state.report_rows(4)[0]["tasks"][0]
+    assert task["total_input_tokens"] == 40
+    assert task["total_output_tokens"] == 5
+    assert task["total_duration_ms"] == 700
+    event = next(fields for name, fields in log.events if name == "agent_call")
+    assert event["success"] is False
+    assert event["sequence"] == 0
+    assert event["attempt"] == 2
+
+
+def test_timed_out_agent_call_duration_is_counted_without_usage(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("Implement", "Details")])
+    app.agents["worker"].execute = AsyncMock(
+        side_effect=CommandError("timed out", duration_ms=900)
+    )
+
+    with pytest.raises(CommandError, match="timed out"):
+        asyncio.run(
+            app._execute_agent(
+                "worker", tmp_path, "prompt", issue_number=4, seq=0, attempt=1
+            )
+        )
+
+    task = app.state.report_rows(4)[0]["tasks"][0]
+    assert task["total_duration_ms"] == 900
+    assert task["total_input_tokens"] == 0
+
+
+def test_worker_session_is_reused_when_resume_command_is_configured(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    execute = AsyncMock(
+        side_effect=[
+            Result(0, "ok", "", usage={"session_id": "thread-4"}),
+            Result(0, "ok", ""),
+        ]
+    )
+    app.agents["worker"] = SimpleNamespace(
+        config=SimpleNamespace(
+            resume_command=("worker", "resume", "{session_id}"),
+            review_resume_command=None,
+        ),
+        execute=execute,
+    )
+
+    asyncio.run(app._execute_agent("worker", tmp_path, "first", issue_number=4))
+    asyncio.run(app._execute_agent("worker", tmp_path, "second", issue_number=4))
+
+    assert execute.await_args_list[1].kwargs["session_id"] == "thread-4"
+
+
+def test_failed_issue_requeues_with_configured_ready_label(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.config.ready_label = "automation-ready"
+    issue = Issue(4, "Task", "Body")
+
+    asyncio.run(app._park_or_requeue(issue, failures=1))
+
+    app.github.labels.assert_awaited_once_with(
+        4,
+        add=("agent-failed", "automation-ready"),
+        remove=("agent-running",),
+    )
+
+
+def test_tracked_worker_completion_wakes_scheduler(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.running = {}
+    app._wake = asyncio.Event()
+
+    async def run():
+        app._track(4, asyncio.sleep(0))
+        await asyncio.gather(*tuple(app.running.values()))
+        await asyncio.sleep(0)
+        return app._wake.is_set()
+
+    assert asyncio.run(run()) is True
+
+
+def test_notification_failure_after_pr_does_not_rerun_implementation(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.workspaces.changed.side_effect = [True, False]
+    app.github.labels.side_effect = [None, CommandError("label unavailable")]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    asyncio.run(app.process(issue, "worker"))
+
+    assert app.state.rows()[0]["status"] == str(TaskStatus.HUMAN_REVIEW)
+    assert app.agents["worker"].execute.await_count == 1
+    log = (tmp_path / "logs" / "issue-4.jsonl").read_text(encoding="utf-8")
+    assert "publication_notification_failed" in log

@@ -23,8 +23,12 @@ ready_label = "agent-ready"
 
 [checks]
 commands = ["ruff check .", "pytest -q"]
+# Fast checks after each plan task. Use [] to defer all configured checks to the final gate.
+task_commands = ["ruff check ."]
 timeout_seconds = 1800
+max_workers = 2
 baseline_cache_ttl_seconds = 300
+baseline_cache_max_entries = 32
 # Run multiple check commands concurrently; set false if they contend in the worktree.
 parallel = true
 
@@ -37,12 +41,16 @@ enabled = true
 
 # If {prompt} is absent, the prompt is sent through stdin (safer for long Issues).
 [agents.codex]
-command = "codex exec --sandbox workspace-write -"
+command = "codex exec --json --sandbox workspace-write -"
+resume_command = "codex exec resume --json {session_id} -"
 max_workers = 2
 timeout_seconds = 7200
 
 [agents.claude]
-command = "claude -p"
+command = "claude -p --output-format json"
+review_command = "claude -p --permission-mode plan --output-format json"
+resume_command = "claude -p --resume {session_id} --output-format json"
+review_resume_command = "claude -p --resume {session_id} --permission-mode plan --output-format json"
 max_workers = 1
 timeout_seconds = 7200
 

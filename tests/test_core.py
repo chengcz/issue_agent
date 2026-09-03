@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from issue_agent.checks import CheckBaseline, failed_tests
-from issue_agent.cli import format_status, parser
+from issue_agent.cli import format_report, format_status, parser
 from issue_agent.config import load_config
 from issue_agent.github import GitHub
 from issue_agent.issue_log import IssueLog
@@ -43,8 +43,32 @@ def test_workspace_status_uses_complete_porcelain_output(tmp_path, monkeypatch):
     status = asyncio.run(app.workspaces.status(tmp_path))
     assert status == "M src/app.py\n?? new/file.py"
     assert calls == [
-        (("git", "status", "--porcelain", "--untracked-files=all"), tmp_path)
+        (
+            (
+                "git", "status", "--porcelain", "--untracked-files=all", "--", ".",
+                ":(exclude).agent",
+            ),
+            tmp_path,
+        )
     ]
+
+
+def test_workspace_git_mutations_preserve_and_exclude_agent_files(tmp_path, monkeypatch):
+    calls = []
+
+    async def fake_run(command, *, cwd, timeout=3600, stdin=None, check=True):
+        calls.append(command)
+        return Result(0, "", "")
+
+    monkeypatch.setattr("issue_agent.workspace.run", fake_run)
+    manager = WorkspaceManager(tmp_path, tmp_path / "worktrees", "main")
+
+    asyncio.run(manager.commit(tmp_path, "message"))
+    asyncio.run(manager.amend(tmp_path))
+    asyncio.run(manager.clean(tmp_path))
+
+    assert ("git", "add", "--all", "--", ".", ":(exclude).agent") in calls
+    assert ("git", "clean", "-fd", "-e", ".agent/") in calls
 
 
 def test_workspace_fetch_is_shared_within_ttl(tmp_path, monkeypatch):
@@ -151,6 +175,23 @@ def test_state_recovery_makes_interrupted_task_claimable(tmp_path: Path):
     state.update(7, TaskStatus.TESTING)
     assert state.recover_interrupted() == 1
     assert state.claim(issue, "codex")
+
+
+def test_state_recovery_closes_open_metric_runs(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(42, "Task", "Body")
+    state.claim(issue, "codex")
+    state.save_plan(42, [PlanTask("Implement", "Details")])
+    state.start_run(42, "implementation")
+    state.start_plan_task(42, 0)
+    state.update(42, TaskStatus.CODING, current_seq=0)
+
+    assert state.recover_interrupted() == 1
+
+    report = state.report_rows(42)[0]
+    assert report["runs"][0]["status"] == "interrupted"
+    assert report["runs"][0]["finished_at"] is not None
+    assert report["tasks"][0]["finished_at"] is not None
 
 
 def test_state_reset_makes_parked_issue_claimable_again(tmp_path: Path):
@@ -398,6 +439,28 @@ def test_unwrap_claude_json_extracts_result_and_usage():
     assert unwrapped.duration_ms == 5000
 
 
+def test_unwrap_codex_jsonl_extracts_final_message_and_usage():
+    from issue_agent.agents import _unwrap_agent_output
+
+    output = (
+        '{"type":"thread.started","thread_id":"thread-7"}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}\n'
+        '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":80,'
+        '"output_tokens":20,"reasoning_output_tokens":5}}'
+    )
+    unwrapped = _unwrap_agent_output(Result(0, output, "", duration_ms=123))
+
+    assert unwrapped.stdout == "done"
+    assert unwrapped.duration_ms == 123
+    assert unwrapped.usage == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "cache_read_input_tokens": 80,
+        "reasoning_output_tokens": 5,
+        "session_id": "thread-7",
+    }
+
+
 def test_unwrap_plain_text_passthrough():
     """Non-JSON stdout is returned unchanged with usage=None."""
     from issue_agent.agents import _unwrap_agent_output
@@ -485,6 +548,49 @@ enabled = false
     config = load_config(config_file)
     assert config.checks_parallel is False
     assert config.codegraph.enabled is False
+
+
+def test_config_parses_task_checks_limits_and_resume_commands(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text('''
+[runtime]
+repo = "."
+max_workers = 4
+[github]
+repo = "a/b"
+[checks]
+commands = ["pytest -q"]
+task_commands = ["ruff check ."]
+max_workers = 2
+baseline_cache_max_entries = 5
+[agents.codex]
+command = "codex exec --json -"
+resume_command = "codex exec resume --json {session_id} -"
+''')
+    config = load_config(config_file)
+
+    assert config.task_checks == ("ruff check .",)
+    assert config.max_check_workers == 2
+    assert config.baseline_cache_max_entries == 5
+    assert config.agents["codex"].resume_command == (
+        "codex", "exec", "resume", "--json", "{session_id}", "-"
+    )
+
+
+def test_config_rejects_resume_command_without_session_placeholder(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text('''
+[runtime]
+repo = "."
+[github]
+repo = "a/b"
+[agents.codex]
+command = "codex exec -"
+resume_command = "codex exec resume --last -"
+''')
+
+    with pytest.raises(ValueError, match="must contain.*session_id"):
+        load_config(config_file)
 
 
 def test_config_defaults_to_codegraph_enabled_and_parallel_checks(tmp_path: Path):
@@ -619,6 +725,77 @@ def test_status_parser_and_human_format():
     assert "#7" in output
     assert "testing" in output
     assert "Check CLI" in output
+
+
+def test_report_parser_and_human_format():
+    args = parser().parse_args(["report", "--issue", "7", "--json"])
+    assert args.issue == 7
+    assert args.json is True
+    output = format_report(
+        [
+            {
+                "issue_number": 7,
+                "title": "Improve runner",
+                "status": "done",
+                "total_input_tokens": 100,
+                "total_output_tokens": 20,
+                "total_duration_ms": 1000,
+                "total_check_duration_ms": 2000,
+                "total_wall_duration_ms": 4000,
+                "total_cost_usd": 0.01,
+                "tasks": [
+                    {
+                        "seq": 0,
+                        "title": "Add metrics",
+                        "status": "done",
+                        "attempts": 1,
+                        "total_input_tokens": 100,
+                        "total_output_tokens": 20,
+                        "total_duration_ms": 1000,
+                        "total_check_duration_ms": 2000,
+                        "total_wall_duration_ms": 3500,
+                    }
+                ],
+            }
+        ]
+    )
+    assert "#7 Improve runner [done]" in output
+    assert "Add metrics" in output
+    assert "tokens=120" in output
+
+
+def test_state_records_issue_task_and_failed_call_metrics(tmp_path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(7, "Task", "Body")
+    state.claim(issue, "codex")
+    state.save_plan(7, [PlanTask("Implement", "Details")])
+    run_id = state.start_run(7, "implementation")
+    state.start_plan_task(7, 0)
+    state.record_agent_call(
+        7,
+        run_id=run_id,
+        seq=0,
+        attempt=1,
+        agent="codex",
+        role="worker",
+        success=False,
+        duration_ms=1500,
+        usage={"input_tokens": 90, "output_tokens": 10, "reasoning_output_tokens": 4},
+        error="failed",
+    )
+    state.record_check_duration(7, duration_ms=250, seq=0)
+    state.finish_plan_task(7, 0, wall_duration_ms=2000)
+    state.finish_run(run_id, 7, "failed", wall_duration_ms=2200)
+
+    row = state.report_rows(7)[0]
+    task = row["tasks"][0]
+    assert row["total_input_tokens"] == task["total_input_tokens"] == 90
+    assert row["total_reasoning_tokens"] == task["total_reasoning_tokens"] == 4
+    assert row["total_duration_ms"] == task["total_duration_ms"] == 1500
+    assert row["total_check_duration_ms"] == task["total_check_duration_ms"] == 250
+    assert row["total_wall_duration_ms"] == 2200
+    assert task["total_wall_duration_ms"] == 2000
+    assert row["runs"][0]["status"] == "failed"
 
 
 def test_format_status_shows_token_cost_time_columns():
@@ -935,6 +1112,7 @@ command = "fake -"
         return Result(0, "done", "")
 
     app.agents["codex"] = SimpleNamespace(execute=fake_execute)
+    app.workspaces.changed = AsyncMock(return_value=True)
 
     async def fake_shell(command, *, cwd, timeout=3600, check=True):
         return Result(1, "FAILED backend/tests/test_new.py::test_b - y\n", "")

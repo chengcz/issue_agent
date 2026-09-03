@@ -7,11 +7,11 @@ from typing import Any
 
 from .config import AgentConfig
 from .models import Issue, PlanTask
-from .process import Result, run
+from .process import CommandError, Result, run
 
 
 def _unwrap_agent_output(result: Result) -> Result:
-    """Detect Claude/Codex JSON result envelope and extract usage metadata.
+    """Detect Claude JSON envelopes or Codex JSONL and extract usage metadata.
 
     When stdout is a JSON object with ``"type": "result"`` and a ``"result"``
     key, the envelope is unwrapped: ``stdout`` becomes the inner result text and
@@ -22,6 +22,50 @@ def _unwrap_agent_output(result: Result) -> Result:
     text = result.stdout.strip()
     if not text.startswith("{"):
         return result
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) > 1:
+        try:
+            events = [json.loads(line) for line in lines]
+        except (json.JSONDecodeError, ValueError):
+            return result
+        if all(isinstance(event, dict) for event in events):
+            messages = [
+                event["item"].get("text", "")
+                for event in events
+                if event.get("type") == "item.completed"
+                and isinstance(event.get("item"), dict)
+                and event["item"].get("type") == "agent_message"
+            ]
+            completed = [
+                event.get("usage")
+                for event in events
+                if event.get("type") == "turn.completed" and isinstance(event.get("usage"), dict)
+            ]
+            started = next(
+                (event for event in events if event.get("type") == "thread.started"), {}
+            )
+            if messages or completed:
+                usage: dict[str, Any] = {}
+                for item in completed:
+                    usage["input_tokens"] = int(usage.get("input_tokens", 0)) + int(
+                        item.get("input_tokens", 0)
+                    )
+                    usage["output_tokens"] = int(usage.get("output_tokens", 0)) + int(
+                        item.get("output_tokens", 0)
+                    )
+                    usage["cache_read_input_tokens"] = int(
+                        usage.get("cache_read_input_tokens", 0)
+                    ) + int(item.get("cached_input_tokens", 0))
+                    usage["reasoning_output_tokens"] = int(
+                        usage.get("reasoning_output_tokens", 0)
+                    ) + int(item.get("reasoning_output_tokens", 0))
+                if started.get("thread_id"):
+                    usage["session_id"] = started["thread_id"]
+                return replace(
+                    result,
+                    stdout=str(messages[-1]) if messages else "",
+                    usage=usage or None,
+                )
     try:
         envelope = json.loads(text)
     except (json.JSONDecodeError, ValueError):
@@ -53,16 +97,35 @@ class CliAgent:
     name: str
     config: AgentConfig
 
-    async def execute(self, workspace: Path, prompt: str, *, review: bool = False) -> Result:
-        command = self.config.review_command if review and self.config.review_command else self.config.command
-        rendered = [part.replace("{prompt}", prompt) for part in command]
-        has_placeholder = any("{prompt}" in part for part in command)
-        result = await run(
-            rendered,
-            cwd=workspace,
-            timeout=self.config.timeout_seconds,
-            stdin=None if has_placeholder else prompt,
+    async def execute(
+        self,
+        workspace: Path,
+        prompt: str,
+        *,
+        review: bool = False,
+        session_id: str = "",
+    ) -> Result:
+        resume = self.config.review_resume_command if review else self.config.resume_command
+        command = resume if session_id and resume else (
+            self.config.review_command if review and self.config.review_command else self.config.command
         )
+        rendered = [
+            part.replace("{prompt}", prompt).replace("{session_id}", session_id)
+            for part in command
+        ]
+        has_placeholder = any("{prompt}" in part for part in command)
+        try:
+            result = await run(
+                rendered,
+                cwd=workspace,
+                timeout=self.config.timeout_seconds,
+                stdin=None if has_placeholder else prompt,
+            )
+        except Exception as exc:
+            if isinstance(exc, CommandError) and exc.result is not None:
+                unwrapped = _unwrap_agent_output(exc.result)
+                raise CommandError(str(exc), result=unwrapped) from exc
+            raise
         return _unwrap_agent_output(result)
 
 
