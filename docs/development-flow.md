@@ -17,7 +17,7 @@ flowchart TD
     Planner --> PlanGuard{工作区被修改?}
     PlanGuard -->|是| PlanRestore[恢复 HEAD 并记录失败]
     PlanGuard -->|否| SavePlan[Plan 写入 SQLite 和 .agent/plan.md]
-    SavePlan --> PlanComment[评论 Plan，等待人工审核]
+    SavePlan --> PlanComment[评论 Plan，添加 agent-planned<br/>等待人工审核]
     PlanComment --> WaitReady[人工添加 agent-ready]
 
     Kind -->|agent-ready / agent-running| Claim[按 agent 标签路由并幂等领取]
@@ -108,5 +108,8 @@ flowchart TD
   基线一致时容忍。
 - 明确的第二次不通过（LLM `REQUEST_CHANGES` 或形式审查拒绝）停止自动返修；无合法 verdict 和只读
   违规属于普通失败，在 Issue 失败预算内重新排队。
-- 每次 Agent CLI 调用的耗时与 token 用量（CLI 输出 JSON envelope 时）双写：`agent_call` 事件进
-  JSONL 执行日志，按 Issue 累积总量进 SQLite，供 `status` 显示 TOKENS/COST/TIME 列。
+- 每次 Agent CLI 调用的耗时与 token 用量（CLI 输出支持的结构化格式时）双写：`agent_call` 事件进
+  JSONL 执行日志，按 Issue/task 累积总量进 SQLite；Codex JSONL 和 Claude JSON envelope 均可解析，
+  失败/超时调用也保留耗时。`report` 分别显示 wall/agent/check time 与 token/cost。
+- 相同 anchor/checks 的并发 baseline 使用 single-flight 和有界 LRU；`checks.task_commands` 可将中间
+  task 限制为快速检查，最终 gate 始终执行完整 `checks.commands`。

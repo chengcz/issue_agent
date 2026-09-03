@@ -13,7 +13,18 @@ log = logging.getLogger(__name__)
 
 
 class CommandError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: Result | None = None,
+        duration_ms: int | None = None,
+    ):
+        super().__init__(message)
+        self.result = result
+        self.duration_ms = duration_ms if duration_ms is not None else (
+            result.duration_ms if result is not None else None
+        )
 
 
 @dataclass(frozen=True)
@@ -72,7 +83,10 @@ async def run(
         )
     except TimeoutError:
         await terminate_process_tree()
-        raise CommandError(f"command timed out after {timeout}s: {command[0]}") from None
+        raise CommandError(
+            f"command timed out after {timeout}s: {command[0]}",
+            duration_ms=int((time.monotonic() - started) * 1000),
+        ) from None
     except asyncio.CancelledError:
         await terminate_process_tree()
         raise
@@ -84,7 +98,10 @@ async def run(
     )
     if check and result.returncode:
         tail = (result.stderr or result.stdout)[-4000:]
-        raise CommandError(f"command failed ({result.returncode}): {command[0]}\n{tail}")
+        raise CommandError(
+            f"command failed ({result.returncode}): {command[0]}\n{tail}",
+            result=result,
+        )
     return result
 
 

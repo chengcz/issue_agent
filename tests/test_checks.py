@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -154,3 +155,69 @@ def test_failed_check_writes_full_output_file_and_points_to_it(tmp_path, monkeyp
     full = (tmp_path / ".agent" / "check-output.txt").read_text(encoding="utf-8")
     assert "FAILED tests/test_x.py::test_y" in full
     assert ".agent/check-output.txt" in str(exc.value)
+
+
+def test_concurrent_baseline_requests_share_one_execution(tmp_path, monkeypatch):
+    app = _app(tmp_path, ["pytest"])
+    app._baseline_cache = {}
+    app._baseline_inflight = {}
+    app.workspaces.head_commit = lambda workspace: asyncio.sleep(0, result="abc123")
+    calls = 0
+
+    async def fake_capture(workspace, checks, *, timeout, parallel):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.01)
+        return {}
+
+    monkeypatch.setattr("issue_agent.orchestrator.capture_baseline", fake_capture)
+
+    async def run_both():
+        return await asyncio.gather(
+            app._capture_baseline(tmp_path),
+            app._capture_baseline(tmp_path),
+        )
+
+    assert asyncio.run(run_both()) == [{}, {}]
+    assert calls == 1
+
+
+def test_baseline_cache_is_bounded(tmp_path, monkeypatch):
+    app = _app(tmp_path, ["pytest"])
+    app._baseline_cache = {}
+    app._baseline_inflight = {}
+    object.__setattr__(app.config, "baseline_cache_max_entries", 2)
+    app.workspaces.head_commit = AsyncMock(side_effect=("one", "two", "three"))
+
+    async def fake_capture(workspace, checks, *, timeout, parallel):
+        return {}
+
+    monkeypatch.setattr("issue_agent.orchestrator.capture_baseline", fake_capture)
+
+    async def populate():
+        await app._capture_baseline(tmp_path)
+        await app._capture_baseline(tmp_path)
+        await app._capture_baseline(tmp_path)
+
+    asyncio.run(populate())
+
+    assert len(app._baseline_cache) == 2
+    assert ("one", ("pytest",)) not in app._baseline_cache
+
+
+def test_empty_task_commands_skip_intermediate_checks_but_not_final(tmp_path, monkeypatch):
+    app = _app(tmp_path, ["pytest"])
+    app.config = type("ConfigView", (), {**vars(app.config), "task_checks": ()})()
+    calls = []
+
+    async def fake_run_checks(*args, **kwargs):
+        calls.append(kwargs["stage"])
+
+    monkeypatch.setattr("issue_agent.orchestrator.run_checks", fake_run_checks)
+    log = _Log()
+
+    asyncio.run(app._run_checks(tmp_path, log, {}, stage="task"))
+    asyncio.run(app._run_checks(tmp_path, log, {}, stage="final"))
+
+    assert calls == ["final"]
+    assert ("task_checks_skipped", {"sequence": None, "attempt": None}) in log.events

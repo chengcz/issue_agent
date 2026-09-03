@@ -40,8 +40,13 @@ class StateStore:
                 total_output_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                total_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cost_usd REAL NOT NULL DEFAULT 0,
                 total_duration_ms INTEGER NOT NULL DEFAULT 0,
+                total_check_duration_ms INTEGER NOT NULL DEFAULT 0,
+                total_queue_duration_ms INTEGER NOT NULL DEFAULT 0,
+                total_wall_duration_ms INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT, finished_at TEXT,
                 updated_at TEXT NOT NULL
             )""")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(tasks)")}
@@ -67,13 +72,87 @@ class StateStore:
                 db.execute("ALTER TABLE tasks ADD COLUMN total_cost_usd REAL NOT NULL DEFAULT 0")
             if "total_duration_ms" not in columns:
                 db.execute("ALTER TABLE tasks ADD COLUMN total_duration_ms INTEGER NOT NULL DEFAULT 0")
+            for name, definition in (
+                ("total_reasoning_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_check_duration_ms", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_queue_duration_ms", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_wall_duration_ms", "INTEGER NOT NULL DEFAULT 0"),
+                ("started_at", "TEXT"),
+                ("finished_at", "TEXT"),
+            ):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
             db.execute("""CREATE TABLE IF NOT EXISTS plan_tasks (
                 issue_number INTEGER NOT NULL, seq INTEGER NOT NULL,
                 title TEXT NOT NULL, description TEXT NOT NULL,
                 status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT, commit_hash TEXT, updated_at TEXT NOT NULL,
+                last_error TEXT, commit_hash TEXT,
+                total_input_tokens INTEGER NOT NULL DEFAULT 0,
+                total_output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                total_reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                total_cost_usd REAL NOT NULL DEFAULT 0,
+                total_duration_ms INTEGER NOT NULL DEFAULT 0,
+                total_check_duration_ms INTEGER NOT NULL DEFAULT 0,
+                total_wall_duration_ms INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT, finished_at TEXT, updated_at TEXT NOT NULL,
                 PRIMARY KEY (issue_number, seq)
             )""")
+            plan_columns = {row["name"] for row in db.execute("PRAGMA table_info(plan_tasks)")}
+            for name, definition in (
+                ("total_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_output_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_reasoning_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_cost_usd", "REAL NOT NULL DEFAULT 0"),
+                ("total_duration_ms", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_check_duration_ms", "INTEGER NOT NULL DEFAULT 0"),
+                ("total_wall_duration_ms", "INTEGER NOT NULL DEFAULT 0"),
+                ("started_at", "TEXT"),
+                ("finished_at", "TEXT"),
+            ):
+                if name not in plan_columns:
+                    db.execute(f"ALTER TABLE plan_tasks ADD COLUMN {name} {definition}")
+            db.execute("""CREATE TABLE IF NOT EXISTS issue_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_number INTEGER NOT NULL, kind TEXT NOT NULL,
+                status TEXT NOT NULL, queued_at TEXT, started_at TEXT NOT NULL,
+                finished_at TEXT, queue_duration_ms INTEGER NOT NULL DEFAULT 0,
+                wall_duration_ms INTEGER NOT NULL DEFAULT 0
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS agent_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_number INTEGER NOT NULL, run_id INTEGER,
+                seq INTEGER, attempt INTEGER, agent TEXT NOT NULL, role TEXT NOT NULL,
+                success INTEGER NOT NULL, duration_ms INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                cost_usd REAL NOT NULL DEFAULT 0,
+                session_id TEXT, error TEXT, created_at TEXT NOT NULL
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS agent_sessions (
+                issue_number INTEGER NOT NULL, agent TEXT NOT NULL, role TEXT NOT NULL,
+                session_id TEXT NOT NULL, updated_at TEXT NOT NULL,
+                PRIMARY KEY(issue_number,agent,role)
+            )""")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS issue_runs_by_issue ON issue_runs(issue_number,id)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS agent_calls_by_issue ON agent_calls(issue_number,id)"
+            )
+            run_columns = {row["name"] for row in db.execute("PRAGMA table_info(issue_runs)")}
+            for name, definition in (
+                ("queued_at", "TEXT"),
+                ("queue_duration_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in run_columns:
+                    db.execute(f"ALTER TABLE issue_runs ADD COLUMN {name} {definition}")
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path)
@@ -120,10 +199,15 @@ class StateStore:
                 "SELECT status, failures, plan FROM tasks WHERE issue_number=?", (issue.number,)
             ).fetchone()
             if row:
-                if row["plan"]:
-                    return False
                 status = row["status"]
-                if status == str(TaskStatus.PENDING):
+                if row["plan"]:
+                    if status not in (str(TaskStatus.FAILED), str(TaskStatus.BLOCKED)):
+                        return False
+                    if int(row["failures"]) >= max_attempts:
+                        return False
+                    # Reclaim so a failed GitHub comment/label transition can
+                    # republish the already-persisted plan without another LLM call.
+                elif status == str(TaskStatus.PENDING):
                     pass
                 elif status in (str(TaskStatus.FAILED), str(TaskStatus.BLOCKED)):
                     if int(row["failures"]) >= max_attempts:
@@ -277,6 +361,7 @@ class StateStore:
                     total_output_tokens = total_output_tokens + ?,
                     total_cache_read_tokens = total_cache_read_tokens + ?,
                     total_cache_creation_tokens = total_cache_creation_tokens + ?,
+                    total_reasoning_tokens = total_reasoning_tokens + ?,
                     total_cost_usd = total_cost_usd + ?,
                     total_duration_ms = total_duration_ms + ?
                 WHERE issue_number=?""",
@@ -285,10 +370,203 @@ class StateStore:
                     _int("output_tokens"),
                     _int("cache_read_input_tokens"),
                     _int("cache_creation_input_tokens"),
+                    _int("reasoning_output_tokens"),
                     cost,
                     int(duration_ms) if duration_ms else 0,
                     issue_number,
                 ),
+            )
+
+    @staticmethod
+    def _usage_values(usage: dict[str, object] | None) -> tuple[int, int, int, int, int, float]:
+        usage = usage or {}
+
+        def integer(key: str) -> int:
+            value = usage.get(key)
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        cost_value = usage.get("total_cost_usd") or usage.get("cost_usd") or 0
+        cost = float(cost_value) if isinstance(cost_value, (int, float)) else 0.0
+        return (
+            integer("input_tokens"),
+            integer("output_tokens"),
+            integer("cache_read_input_tokens"),
+            integer("cache_creation_input_tokens"),
+            integer("reasoning_output_tokens"),
+            cost,
+        )
+
+    def start_run(self, issue_number: int, kind: str) -> int:
+        now_dt = datetime.now(UTC)
+        now = now_dt.isoformat()
+        with self.connect() as db:
+            task = db.execute(
+                "SELECT updated_at FROM tasks WHERE issue_number=?", (issue_number,)
+            ).fetchone()
+            queued_at = task["updated_at"] if task else now
+            queued_dt = datetime.fromisoformat(queued_at)
+            queue_duration = max(0, int((now_dt - queued_dt).total_seconds() * 1000))
+            cursor = db.execute(
+                """INSERT INTO issue_runs(
+                    issue_number,kind,status,queued_at,started_at,queue_duration_ms
+                ) VALUES(?,?,?,?,?,?)""",
+                (issue_number, kind, "running", queued_at, now, queue_duration),
+            )
+            db.execute(
+                """UPDATE tasks SET started_at=COALESCE(started_at,?), finished_at=NULL,
+                    total_queue_duration_ms=total_queue_duration_ms+? WHERE issue_number=?""",
+                (now, queue_duration, issue_number),
+            )
+            return int(cursor.lastrowid)
+
+    def finish_run(
+        self, run_id: int, issue_number: int, status: str, *, wall_duration_ms: int
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as db:
+            db.execute(
+                "UPDATE issue_runs SET status=?,finished_at=?,wall_duration_ms=? WHERE id=?",
+                (status, now, wall_duration_ms, run_id),
+            )
+            db.execute(
+                "UPDATE tasks SET total_wall_duration_ms=total_wall_duration_ms+?,finished_at=? "
+                "WHERE issue_number=?",
+                (wall_duration_ms, now, issue_number),
+            )
+
+    def start_plan_task(self, issue_number: int, seq: int) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as db:
+            db.execute(
+                "UPDATE plan_tasks SET started_at=COALESCE(started_at,?),finished_at=NULL "
+                "WHERE issue_number=? AND seq=?",
+                (now, issue_number, seq),
+            )
+
+    def finish_plan_task(self, issue_number: int, seq: int, *, wall_duration_ms: int) -> None:
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as db:
+            db.execute(
+                "UPDATE plan_tasks SET total_wall_duration_ms=total_wall_duration_ms+?,finished_at=? "
+                "WHERE issue_number=? AND seq=?",
+                (wall_duration_ms, now, issue_number, seq),
+            )
+
+    def record_check_duration(
+        self, issue_number: int, *, duration_ms: int, seq: int | None = None
+    ) -> None:
+        with self.connect() as db:
+            db.execute(
+                "UPDATE tasks SET total_check_duration_ms=total_check_duration_ms+? "
+                "WHERE issue_number=?",
+                (duration_ms, issue_number),
+            )
+            if seq is not None:
+                db.execute(
+                    "UPDATE plan_tasks SET total_check_duration_ms=total_check_duration_ms+? "
+                    "WHERE issue_number=? AND seq=?",
+                    (duration_ms, issue_number, seq),
+                )
+
+    def record_agent_call(
+        self,
+        issue_number: int,
+        *,
+        run_id: int | None,
+        seq: int | None,
+        attempt: int | None,
+        agent: str,
+        role: str,
+        success: bool,
+        duration_ms: int | None,
+        usage: dict[str, object] | None,
+        error: str = "",
+    ) -> None:
+        values = self._usage_values(usage)
+        duration = int(duration_ms or 0)
+        session_id = str((usage or {}).get("session_id") or "") or None
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO agent_calls(
+                    issue_number,run_id,seq,attempt,agent,role,success,duration_ms,
+                    input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,
+                    reasoning_tokens,cost_usd,session_id,error,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    issue_number, run_id, seq, attempt, agent, role, int(success), duration,
+                    *values, session_id, error or None, now,
+                ),
+            )
+            aggregate = (*values[:5], values[5], duration, issue_number)
+            db.execute(
+                """UPDATE tasks SET
+                    total_input_tokens=total_input_tokens+?,
+                    total_output_tokens=total_output_tokens+?,
+                    total_cache_read_tokens=total_cache_read_tokens+?,
+                    total_cache_creation_tokens=total_cache_creation_tokens+?,
+                    total_reasoning_tokens=total_reasoning_tokens+?,
+                    total_cost_usd=total_cost_usd+?,
+                    total_duration_ms=total_duration_ms+?
+                WHERE issue_number=?""",
+                aggregate,
+            )
+            if seq is not None:
+                db.execute(
+                    """UPDATE plan_tasks SET
+                        total_input_tokens=total_input_tokens+?,
+                        total_output_tokens=total_output_tokens+?,
+                        total_cache_read_tokens=total_cache_read_tokens+?,
+                        total_cache_creation_tokens=total_cache_creation_tokens+?,
+                        total_reasoning_tokens=total_reasoning_tokens+?,
+                        total_cost_usd=total_cost_usd+?,
+                        total_duration_ms=total_duration_ms+?
+                    WHERE issue_number=? AND seq=?""",
+                    (*aggregate, seq),
+                )
+
+    def report_rows(self, issue_number: int | None = None) -> list[dict[str, object]]:
+        where = " WHERE issue_number=?" if issue_number is not None else ""
+        parameters = (issue_number,) if issue_number is not None else ()
+        with self.connect() as db:
+            issues = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT * FROM tasks" + where + " ORDER BY updated_at DESC", parameters
+                )
+            ]
+            for issue in issues:
+                issue["tasks"] = [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT * FROM plan_tasks WHERE issue_number=? ORDER BY seq",
+                        (issue["issue_number"],),
+                    )
+                ]
+                issue["runs"] = [
+                    dict(row)
+                    for row in db.execute(
+                        "SELECT * FROM issue_runs WHERE issue_number=? ORDER BY id",
+                        (issue["issue_number"],),
+                    )
+                ]
+        return issues
+
+    def load_session(self, issue_number: int, agent: str, role: str) -> str:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT session_id FROM agent_sessions WHERE issue_number=? AND agent=? AND role=?",
+                (issue_number, agent, role),
+            ).fetchone()
+        return str(row["session_id"]) if row else ""
+
+    def save_session(self, issue_number: int, agent: str, role: str, session_id: str) -> None:
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO agent_sessions(issue_number,agent,role,session_id,updated_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(issue_number,agent,role) DO UPDATE SET
+                session_id=excluded.session_id,updated_at=excluded.updated_at""",
+                (issue_number, agent, role, session_id, datetime.now(UTC).isoformat()),
             )
 
     def rows(self) -> list[dict[str, object]]:
@@ -302,7 +580,10 @@ class StateStore:
             plan_tasks.title AS current_task, tasks.last_error, tasks.pr_url,
             tasks.total_input_tokens, tasks.total_output_tokens,
             tasks.total_cache_read_tokens, tasks.total_cache_creation_tokens,
-            tasks.total_cost_usd, tasks.total_duration_ms,
+            tasks.total_reasoning_tokens, tasks.total_cost_usd, tasks.total_duration_ms,
+            tasks.total_check_duration_ms, tasks.total_wall_duration_ms,
+            tasks.total_queue_duration_ms,
+            tasks.started_at, tasks.finished_at,
             tasks.updated_at
             FROM tasks
             LEFT JOIN plan_tasks ON plan_tasks.issue_number = tasks.issue_number
@@ -318,10 +599,39 @@ class StateStore:
 
     def recover_interrupted(self) -> int:
         """Make work interrupted by a process restart claimable again."""
-        now = datetime.now(UTC).isoformat()
+        now_dt = datetime.now(UTC)
+        now = now_dt.isoformat()
         placeholders = ",".join("?" for _ in _ACTIVE)
         active = [str(status) for status in _ACTIVE]
         with self.connect() as db:
+            open_runs = db.execute(
+                "SELECT id,issue_number,started_at FROM issue_runs WHERE finished_at IS NULL"
+            ).fetchall()
+            for run in open_runs:
+                started = datetime.fromisoformat(run["started_at"])
+                duration = max(0, int((now_dt - started).total_seconds() * 1000))
+                db.execute(
+                    "UPDATE issue_runs SET status='interrupted',finished_at=?,wall_duration_ms=? "
+                    "WHERE id=?",
+                    (now, duration, run["id"]),
+                )
+                db.execute(
+                    "UPDATE tasks SET total_wall_duration_ms=total_wall_duration_ms+?,finished_at=? "
+                    "WHERE issue_number=?",
+                    (duration, now, run["issue_number"]),
+                )
+            open_tasks = db.execute(
+                "SELECT issue_number,seq,started_at FROM plan_tasks "
+                "WHERE started_at IS NOT NULL AND finished_at IS NULL"
+            ).fetchall()
+            for task in open_tasks:
+                started = datetime.fromisoformat(task["started_at"])
+                duration = max(0, int((now_dt - started).total_seconds() * 1000))
+                db.execute(
+                    "UPDATE plan_tasks SET total_wall_duration_ms=total_wall_duration_ms+?,"
+                    "finished_at=? WHERE issue_number=? AND seq=?",
+                    (duration, now, task["issue_number"], task["seq"]),
+                )
             planning = db.execute(
                 "UPDATE tasks SET status=?, last_error=?, updated_at=? WHERE status=?",
                 (str(TaskStatus.PENDING), "orchestrator restarted during planning", now, str(TaskStatus.PLANNING)),
@@ -367,4 +677,5 @@ class StateStore:
                 "WHERE issue_number=? AND status != ?",
                 (str(TaskStatus.PENDING), now, issue_number, str(TaskStatus.DONE)),
             )
+            db.execute("DELETE FROM agent_sessions WHERE issue_number=?", (issue_number,))
         return old_status

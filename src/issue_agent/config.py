@@ -15,6 +15,8 @@ class AgentConfig:
     max_workers: int = 1
     timeout_seconds: int = 3600
     review_command: tuple[str, ...] | None = None
+    resume_command: tuple[str, ...] | None = None
+    review_resume_command: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -32,8 +34,11 @@ class Config:
     max_attempts: int = 3
     max_task_attempts: int = 2
     checks: tuple[str, ...] = ("pytest -q",)
+    task_checks: tuple[str, ...] | None = None
     check_timeout_seconds: int = 1800
+    max_check_workers: int = 1
     baseline_cache_ttl_seconds: int = 300
+    baseline_cache_max_entries: int = 32
     checks_parallel: bool = True
     review_task_mode: str = "formal"  # "full" | "formal" | "off"
     codegraph: CodegraphConfig = field(default_factory=CodegraphConfig)
@@ -61,6 +66,8 @@ def validate_config(config: Config) -> None:
         "runtime.max_tasks": config.max_tasks,
         "runtime.auto_plan_limit": config.auto_plan_limit,
         "checks.timeout_seconds": config.check_timeout_seconds,
+        "checks.max_workers": config.max_check_workers,
+        "checks.baseline_cache_max_entries": config.baseline_cache_max_entries,
     }
     for name, value in positive.items():
         if value <= 0:
@@ -76,6 +83,14 @@ def validate_config(config: Config) -> None:
             raise ValueError(f"agents.{name}.max_workers must be greater than zero")
         if agent.timeout_seconds <= 0:
             raise ValueError(f"agents.{name}.timeout_seconds must be greater than zero")
+        for command_name, command in (
+            ("resume_command", agent.resume_command),
+            ("review_resume_command", agent.review_resume_command),
+        ):
+            if command and not any("{session_id}" in part for part in command):
+                raise ValueError(
+                    f"agents.{name}.{command_name} must contain {{session_id}}"
+                )
     if config.agents and config.default_agent not in config.agents:
         raise ValueError(f"unknown or disabled default_agent: {config.default_agent}")
     for role, name in (
@@ -107,6 +122,16 @@ def load_config(path: str | Path) -> Config:
                 if item.get("review_command")
                 else None
             ),
+            resume_command=(
+                tuple(shlex.split(item["resume_command"]))
+                if item.get("resume_command")
+                else None
+            ),
+            review_resume_command=(
+                tuple(shlex.split(item["review_resume_command"]))
+                if item.get("review_resume_command")
+                else None
+            ),
         )
         for name, item in raw.get("agents", {}).items()
         if item.get("enabled", True)
@@ -130,8 +155,19 @@ def load_config(path: str | Path) -> Config:
         max_attempts=int(runtime.get("max_attempts", 3)),
         max_task_attempts=int(runtime.get("max_task_attempts", 2)),
         checks=tuple(raw.get("checks", {}).get("commands", ["pytest -q"])),
+        task_checks=(
+            tuple(raw.get("checks", {}).get("task_commands", []))
+            if "task_commands" in raw.get("checks", {})
+            else None
+        ),
         check_timeout_seconds=int(raw.get("checks", {}).get("timeout_seconds", 1800)),
+        max_check_workers=int(
+            raw.get("checks", {}).get("max_workers", runtime.get("max_workers", 3))
+        ),
         baseline_cache_ttl_seconds=int(raw.get("checks", {}).get("baseline_cache_ttl_seconds", 300)),
+        baseline_cache_max_entries=int(
+            raw.get("checks", {}).get("baseline_cache_max_entries", 32)
+        ),
         checks_parallel=bool(raw.get("checks", {}).get("parallel", True)),
         review_task_mode=str(raw.get("review", {}).get("task_mode", "formal")),
         codegraph=CodegraphConfig(

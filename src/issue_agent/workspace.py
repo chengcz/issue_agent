@@ -103,16 +103,22 @@ class WorkspaceManager:
         return bool(await self.status(path))
 
     async def status(self, path: Path) -> str:
-        """Return tracked and non-ignored untracked repository changes."""
-        result = await run(("git", "status", "--porcelain", "--untracked-files=all"), cwd=path)
+        """Return repository changes, excluding orchestrator-owned ``.agent`` files."""
+        result = await run(
+            (
+                "git", "status", "--porcelain", "--untracked-files=all", "--", ".",
+                ":(exclude).agent",
+            ),
+            cwd=path,
+        )
         return result.stdout.strip()
 
     async def commit(self, path: Path, message: str) -> None:
-        await run(("git", "add", "--all"), cwd=path)
+        await run(("git", "add", "--all", "--", ".", ":(exclude).agent"), cwd=path)
         await run(("git", "commit", "-m", message), cwd=path)
 
     async def amend(self, path: Path) -> None:
-        await run(("git", "add", "--all"), cwd=path)
+        await run(("git", "add", "--all", "--", ".", ":(exclude).agent"), cwd=path)
         await run(("git", "commit", "--amend", "--no-edit"), cwd=path)
 
     async def push(self, path: Path, branch: str, *, dry_run: bool) -> None:
@@ -128,7 +134,7 @@ class WorkspaceManager:
         ``-fd`` deletes untracked files and directories but leaves gitignored
         ones (e.g. .venv, build artifacts) alone.
         """
-        await run(("git", "clean", "-fd"), cwd=path)
+        await run(("git", "clean", "-fd", "-e", ".agent/"), cwd=path)
 
     async def head_commit(self, path: Path) -> str:
         result = await run(("git", "rev-parse", "--short", "HEAD"), cwd=path)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -58,8 +59,10 @@ class GitHub:
 
     async def runnable_issues(self, ready_label: str, limit: int = 20) -> list[Issue]:
         """Include interrupted jobs whose ready label was already removed."""
-        issues = await self.ready_issues(ready_label, limit)
-        interrupted = await self.ready_issues("agent-running", limit)
+        issues, interrupted = await asyncio.gather(
+            self.ready_issues(ready_label, limit),
+            self.ready_issues("agent-running", limit),
+        )
         return list({issue.number: issue for issue in (*issues, *interrupted)}.values())
 
     async def labels(self, number: int, *, add: tuple[str, ...] = (), remove: tuple[str, ...] = ()) -> None:

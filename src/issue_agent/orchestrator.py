@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from collections import OrderedDict
 
 from .agents import (
     CliAgent,
@@ -161,14 +162,20 @@ class Orchestrator:
         )
         self.agents = {name: CliAgent(name, item) for name, item in config.agents.items()}
         self.global_limit = asyncio.Semaphore(config.max_workers)
+        self.check_limit = asyncio.Semaphore(config.max_check_workers)
         self.agent_limits = {
             name: asyncio.Semaphore(item.max_workers) for name, item in config.agents.items()
         }
         self.database_lock = asyncio.Lock()
         self.running: dict[int, asyncio.Task[None]] = {}
-        self._baseline_cache: dict[
+        self._baseline_cache: OrderedDict[
             tuple[str, tuple[str, ...]], tuple[float, dict[str, CheckBaseline]]
+        ] = OrderedDict()
+        self._baseline_inflight: dict[
+            tuple[str, tuple[str, ...]], asyncio.Task[dict[str, CheckBaseline]]
         ] = {}
+        self._run_ids: dict[int, int] = {}
+        self._wake = asyncio.Event()
         if guidance_block(config.repo, config.codegraph):
             log.info(
                 "codegraph index detected at %s; run 'codegraph install' to give agents MCP access",
@@ -178,6 +185,30 @@ class Orchestrator:
     def _codegraph_guidance(self) -> str:
         """Prompt guidance for agents; empty (prompts unchanged) without a ready index."""
         return guidance_block(self.config.repo, self.config.codegraph)
+
+    @staticmethod
+    def _session_role(role: str) -> str:
+        if "reviewer" in role:
+            return "reviewer"
+        if role == "planner":
+            return "planner"
+        return "worker"
+
+    def _resume_session(self, issue_number: int | None, agent_name: str, role: str) -> str:
+        if issue_number is None:
+            return ""
+        agent = self.agents[agent_name]
+        config = getattr(agent, "config", None)
+        if config is None:
+            return ""
+        resume = (
+            config.review_resume_command
+            if role in {"planner", "task reviewer", "final reviewer"}
+            else config.resume_command
+        )
+        if not resume:
+            return ""
+        return self.state.load_session(issue_number, agent_name, self._session_role(role))
 
     def recover(self) -> int:
         return self.state.recover_interrupted()
@@ -190,12 +221,13 @@ class Orchestrator:
         return name
 
     async def run_once(self) -> None:
-        runnable = await self.github.runnable_issues(self.config.ready_label)
-        planning = (
-            await self.github.unassigned_issues(self.config.auto_plan_limit)
-            if self.config.auto_plan_unlabeled
-            else []
-        )
+        runnable_call = self.github.runnable_issues(self.config.ready_label)
+        if self.config.auto_plan_unlabeled:
+            runnable, planning = await asyncio.gather(
+                runnable_call, self.github.unassigned_issues(self.config.auto_plan_limit)
+            )
+        else:
+            runnable, planning = await runnable_call, []
         persisted = {int(row["issue_number"]): row for row in self.state.rows()}
         for issue in runnable:
             if issue.number in self.running:
@@ -234,7 +266,14 @@ class Orchestrator:
     def _track(self, issue_number: int, coroutine) -> None:
         task = asyncio.create_task(coroutine)
         self.running[issue_number] = task
-        task.add_done_callback(lambda _task, number=issue_number: self.running.pop(number, None))
+
+        def done(_task, number=issue_number):
+            self.running.pop(number, None)
+            wake = getattr(self, "_wake", None)
+            if wake is not None:
+                wake.set()
+
+        task.add_done_callback(done)
 
     async def serve(self) -> None:
         while True:
@@ -242,7 +281,15 @@ class Orchestrator:
                 await self.run_once()
             except Exception:
                 log.exception("scheduler iteration failed")
-            await asyncio.sleep(self.config.poll_seconds)
+            wake = getattr(self, "_wake", None)
+            if wake is None:
+                await asyncio.sleep(self.config.poll_seconds)
+                continue
+            try:
+                await asyncio.wait_for(wake.wait(), timeout=self.config.poll_seconds)
+            except TimeoutError:
+                pass
+            wake.clear()
 
     async def shutdown(self) -> None:
         if not self.running:
@@ -251,11 +298,11 @@ class Orchestrator:
         await asyncio.gather(*tuple(self.running.values()), return_exceptions=True)
 
     async def _guarded_process(self, issue: Issue, agent_name: str) -> None:
-        async with self.global_limit:
-            if "resource:database-schema" in issue.labels:
-                async with self.database_lock:
-                    await self.process(issue, agent_name)
-            else:
+        if "resource:database-schema" in issue.labels:
+            async with self.database_lock, self.global_limit:
+                await self.process(issue, agent_name)
+        else:
+            async with self.global_limit:
                 await self.process(issue, agent_name)
 
     async def _guarded_plan_only(self, issue: Issue, planner_name: str) -> None:
@@ -263,7 +310,14 @@ class Orchestrator:
             await self.plan_only(issue)
 
     async def plan_only(self, issue: Issue) -> None:
-        """Create and publish a plan, then wait for a human to add agent-ready."""
+        """Create and publish a plan, then wait for the configured ready label."""
+        started = time.monotonic()
+        run_id = self.state.start_run(issue.number, "planning")
+        run_ids = getattr(self, "_run_ids", None)
+        if run_ids is None:
+            self._run_ids = run_ids = {}
+        run_ids[issue.number] = run_id
+        outcome = str(TaskStatus.BLOCKED)
         issue_log = IssueLog(self.config.log_dir, issue.number)
         issue_log.event("plan_only_started", title=issue.title, labels=issue.labels)
         try:
@@ -285,26 +339,39 @@ class Orchestrator:
                 issue_log.event("plan_reused", tasks=[task.to_dict() for task in plan])
             self.workspaces.write_plan_file(workspace, plan)
             self.state.update(issue.number, TaskStatus.PLANNED, current_seq=0)
+            outcome = str(TaskStatus.PLANNED)
             issue_log.event("awaiting_human_approval", plan_tasks=len(plan))
+            approval_label = f"`{self.config.ready_label}`"
             await self.github.comment(
                 issue.number,
                 "## Issue Agent Plan\n\n"
                 + format_plan(plan)
                 + "\n\n## Human approval required\n\n"
-                "Review or update this Issue and the plan above. Add the `agent-ready` "
+                + f"Review or update this Issue and the plan above. Add the {approval_label} "
                 "label when implementation may begin. Until then, Issue Agent will not "
                 "modify code, push a branch, or create a pull request.",
             )
+            await self.github.labels(issue.number, add=("agent-planned",))
         except CommandError as exc:
             log.error("issue #%s planning failed: %s", issue.number, exc)
             failures = self.state.record_failure(issue.number, TaskStatus.FAILED, str(exc))
+            outcome = str(TaskStatus.FAILED)
             issue_log.event("plan_failed", failures=failures, error=str(exc))
             await self._comment_planning_failure(issue, failures, str(exc))
         except Exception as exc:
             log.exception("issue #%s planning blocked", issue.number)
             failures = self.state.record_failure(issue.number, TaskStatus.BLOCKED, str(exc))
+            outcome = str(TaskStatus.BLOCKED)
             issue_log.event("plan_blocked", failures=failures, error=str(exc))
             await self._comment_planning_failure(issue, failures, str(exc))
+        finally:
+            self.state.finish_run(
+                run_id,
+                issue.number,
+                outcome,
+                wall_duration_ms=int((time.monotonic() - started) * 1000),
+            )
+            run_ids.pop(issue.number, None)
 
     async def _comment_planning_failure(self, issue: Issue, failures: int, error: str) -> None:
         retry = (
@@ -318,13 +385,24 @@ class Orchestrator:
         )
 
     async def process(self, issue: Issue, agent_name: str) -> None:
+        started = time.monotonic()
+        run_id = self.state.start_run(issue.number, "implementation")
+        run_ids = getattr(self, "_run_ids", None)
+        if run_ids is None:
+            self._run_ids = run_ids = {}
+        run_ids[issue.number] = run_id
+        outcome = str(TaskStatus.BLOCKED)
         issue_log = IssueLog(self.config.log_dir, issue.number)
         issue_log.event("implementation_started", title=issue.title, agent=agent_name, labels=issue.labels)
         try:
             workspace, branch = await self.workspaces.create(issue)
             issue_log.event("workspace_ready", workspace=workspace, branch=branch)
             self.state.update(issue.number, TaskStatus.PLANNING, branch=branch, worktree=str(workspace))
-            await self.github.labels(issue.number, add=("agent-running",), remove=(self.config.ready_label,))
+            await self.github.labels(
+                issue.number,
+                add=("agent-running",),
+                remove=(self.config.ready_label, "agent-planned"),
+            )
 
             plan = self.state.load_plan(issue.number)
             if plan is None:
@@ -347,7 +425,7 @@ class Orchestrator:
                 final_commit=final_commit if start_seq == len(plan) else None,
             )
             self.state.update(issue.number, TaskStatus.PLANNED, current_seq=start_seq)
-            baseline = await self._capture_baseline(workspace)
+            baseline = await self._capture_baseline(workspace, issue_number=issue.number)
             self.workspaces.write_plan_file(workspace, plan)
 
             for seq in range(start_seq, len(plan)):
@@ -361,23 +439,38 @@ class Orchestrator:
                 issue.number, branch, self.config.base_branch, issue.title, self.config.checks
             )
             self.state.update(issue.number, TaskStatus.HUMAN_REVIEW, pr_url=pr_url)
+            outcome = str(TaskStatus.HUMAN_REVIEW)
             issue_log.event("implementation_complete", pr_url=pr_url)
-            await self.github.labels(issue.number, add=("human-review",), remove=("agent-running", "agent-failed"))
-            await self.github.comment(issue.number, f"Implementation ready for human review: {pr_url}")
+            try:
+                await self.github.labels(
+                    issue.number,
+                    add=("human-review",),
+                    remove=("agent-running", "agent-failed"),
+                )
+                await self.github.comment(
+                    issue.number, f"Implementation ready for human review: {pr_url}"
+                )
+            except CommandError as exc:
+                # The PR and HUMAN_REVIEW state are already durable. Treat a
+                # notification failure as reconcilable instead of rerunning all work.
+                log.warning("issue #%s publication notification failed: %s", issue.number, exc)
+                issue_log.event("publication_notification_failed", error=str(exc))
         except CommandError as exc:
             log.error("issue #%s failed: %s", issue.number, exc)
             failures = self.state.record_failure(issue.number, TaskStatus.FAILED, str(exc))
+            outcome = str(TaskStatus.FAILED)
             issue_log.event("implementation_failed", failures=failures, error=str(exc))
             if isinstance(exc, ReviewRejected):
                 await self._park_after_review_failure(issue)
             else:
                 await self._park_or_requeue(issue, failures)
+            ready_label = self.config.ready_label
             note = (
                 "\n\nReview fix cycle exhausted; inspect the review log, then manually re-add "
-                "the agent-ready label to retry."
+                f"the {ready_label} label to retry."
                 if isinstance(exc, ReviewRejected)
-                else "\n\nRetry budget exhausted; reset the task row and re-add the agent-ready "
-                "label to rerun."
+                else f"\n\nRetry budget exhausted; reset the task row and re-add the "
+                f"{ready_label} label to rerun."
                 if failures >= self.config.max_attempts
                 else ""
             )
@@ -385,25 +478,38 @@ class Orchestrator:
         except Exception as exc:
             log.exception("issue #%s failed", issue.number)
             failures = self.state.record_failure(issue.number, TaskStatus.BLOCKED, str(exc))
+            outcome = str(TaskStatus.BLOCKED)
             issue_log.event("implementation_blocked", failures=failures, error=str(exc))
             await self._park_or_requeue(issue, failures)
             note = (
-                "\n\nRetry budget exhausted; reset the task row and re-add the agent-ready "
-                "label to rerun."
+                "\n\nRetry budget exhausted; reset the task row and re-add the "
+                f"{self.config.ready_label} label to rerun."
                 if failures >= self.config.max_attempts
                 else ""
             )
             await self.github.comment(issue.number, f"Agent run blocked.\n\n```text\n{str(exc)[-3000:]}\n```{note}")
+        finally:
+            self.state.finish_run(
+                run_id,
+                issue.number,
+                outcome,
+                wall_duration_ms=int((time.monotonic() - started) * 1000),
+            )
+            run_ids.pop(issue.number, None)
 
     async def _park_or_requeue(self, issue: Issue, failures: int) -> None:
         """Keep a failed issue in the runnable pool while its retry budget holds.
 
-        Under budget the agent-ready label is restored so the next scheduler poll
+        Under budget the configured ready label is restored so the next scheduler poll
         re-claims the issue; once the whole-issue failure budget is exhausted the
-        issue is parked (no agent-ready) until a human resets the task row.
+        issue is parked until a human resets the task row.
         """
         if failures < self.config.max_attempts:
-            await self.github.labels(issue.number, add=("agent-failed", "agent-ready"), remove=("agent-running",))
+            await self.github.labels(
+                issue.number,
+                add=("agent-failed", self.config.ready_label),
+                remove=("agent-running",),
+            )
         else:
             await self.github.labels(issue.number, add=("agent-failed",), remove=("agent-running",))
 
@@ -450,6 +556,8 @@ class Orchestrator:
         acquire_agent_limit: bool = False,
         issue_log: IssueLog | None = None,
         issue_number: int | None = None,
+        seq: int | None = None,
+        attempt: int | None = None,
     ):
         """Run a planner/reviewer and restore any repository changes it makes."""
         if acquire_agent_limit:
@@ -461,12 +569,35 @@ class Orchestrator:
                     role=role,
                     issue_log=issue_log,
                     issue_number=issue_number,
+                    seq=seq,
+                    attempt=attempt,
                 )
         if await self.workspaces.status(workspace):
             raise CommandError(f"cannot start read-only {role}: workspace is not clean")
         try:
-            result = await self.agents[agent_name].execute(workspace, prompt, review=True)
+            session_id = self._resume_session(issue_number, agent_name, role)
+            if session_id:
+                result = await self.agents[agent_name].execute(
+                    workspace, prompt, review=True, session_id=session_id
+                )
+            else:
+                result = await self.agents[agent_name].execute(workspace, prompt, review=True)
         except Exception as exc:
+            if issue_number is not None and isinstance(exc, CommandError):
+                failed_result = exc.result or Result(
+                    1, "", "", duration_ms=exc.duration_ms
+                )
+                self._log_agent_call(
+                    issue_log,
+                    agent_name,
+                    role,
+                    failed_result,
+                    issue_number=issue_number,
+                    seq=seq,
+                    attempt=attempt,
+                    success=False,
+                    error=str(exc),
+                )
             if await self.workspaces.status(workspace):
                 await self.workspaces.reset(workspace, "HEAD")
                 await self.workspaces.clean(workspace)
@@ -475,10 +606,29 @@ class Orchestrator:
                 ) from exc
             raise
         if await self.workspaces.status(workspace):
+            self._log_agent_call(
+                issue_log,
+                agent_name,
+                role,
+                result,
+                issue_number=issue_number,
+                seq=seq,
+                attempt=attempt,
+                success=False,
+                error=f"read-only {role} modified the workspace",
+            )
             await self.workspaces.reset(workspace, "HEAD")
             await self.workspaces.clean(workspace)
             raise ReadOnlyViolation(f"read-only {role} modified the workspace")
-        self._log_agent_call(issue_log, agent_name, role, result, issue_number=issue_number)
+        self._log_agent_call(
+            issue_log,
+            agent_name,
+            role,
+            result,
+            issue_number=issue_number,
+            seq=seq,
+            attempt=attempt,
+        )
         return result
 
     async def _execute_agent(
@@ -489,11 +639,43 @@ class Orchestrator:
         *,
         issue_log: IssueLog | None = None,
         issue_number: int | None = None,
+        seq: int | None = None,
+        attempt: int | None = None,
+        role: str = "worker",
     ):
         """Run one coding-agent invocation under that agent's own limit."""
-        async with self.agent_limits[agent_name]:
-            result = await self.agents[agent_name].execute(workspace, prompt)
-        self._log_agent_call(issue_log, agent_name, "worker", result, issue_number=issue_number)
+        try:
+            async with self.agent_limits[agent_name]:
+                session_id = self._resume_session(issue_number, agent_name, role)
+                if session_id:
+                    result = await self.agents[agent_name].execute(
+                        workspace, prompt, session_id=session_id
+                    )
+                else:
+                    result = await self.agents[agent_name].execute(workspace, prompt)
+        except CommandError as exc:
+            failed_result = exc.result or Result(1, "", "", duration_ms=exc.duration_ms)
+            self._log_agent_call(
+                issue_log,
+                agent_name,
+                role,
+                failed_result,
+                issue_number=issue_number,
+                seq=seq,
+                attempt=attempt,
+                success=False,
+                error=str(exc),
+            )
+            raise
+        self._log_agent_call(
+            issue_log,
+            agent_name,
+            role,
+            result,
+            issue_number=issue_number,
+            seq=seq,
+            attempt=attempt,
+        )
         return result
 
     def _log_agent_call(
@@ -504,6 +686,10 @@ class Orchestrator:
         result: Result,
         *,
         issue_number: int | None = None,
+        seq: int | None = None,
+        attempt: int | None = None,
+        success: bool = True,
+        error: str = "",
     ) -> None:
         """Record token usage and wall-clock duration for one agent invocation.
 
@@ -511,7 +697,17 @@ class Orchestrator:
         are updated only when *issue_number* is supplied.
         """
         if issue_log is not None:
-            fields: dict[str, object] = {"agent": agent_name, "role": role}
+            fields: dict[str, object] = {
+                "agent": agent_name,
+                "role": role,
+                "success": success,
+            }
+            if seq is not None:
+                fields["sequence"] = seq
+            if attempt is not None:
+                fields["attempt"] = attempt
+            if error:
+                fields["error"] = error
             if result.duration_ms is not None:
                 fields["duration_ms"] = result.duration_ms
             if result.usage:
@@ -523,12 +719,33 @@ class Orchestrator:
                     "cost_usd",
                     "total_cost_usd",
                     "num_turns",
+                    "reasoning_output_tokens",
+                    "session_id",
                 ):
                     if key in result.usage:
                         fields[key] = result.usage[key]
             issue_log.event("agent_call", **fields)
         if issue_number is not None:
-            self.state.accumulate_usage(issue_number, result.usage, duration_ms=result.duration_ms)
+            self.state.record_agent_call(
+                issue_number,
+                run_id=getattr(self, "_run_ids", {}).get(issue_number),
+                seq=seq,
+                attempt=attempt,
+                agent=agent_name,
+                role=role,
+                success=success,
+                duration_ms=result.duration_ms,
+                usage=result.usage,
+                error=error,
+            )
+            session_id = str((result.usage or {}).get("session_id") or "")
+            if session_id:
+                self.state.save_session(
+                    issue_number,
+                    agent_name,
+                    self._session_role(role),
+                    session_id,
+                )
 
     def _resume_seq(self, issue_number: int, plan: list[PlanTask]) -> int:
         """First plan index that is not DONE; len(plan) when all tasks are done (final phase)."""
@@ -570,7 +787,9 @@ class Orchestrator:
         await self.workspaces.reset(workspace, f"origin/{self.config.base_branch}")
         await self.workspaces.clean(workspace)
 
-    async def _capture_baseline(self, workspace) -> dict[str, CheckBaseline]:
+    async def _capture_baseline(
+        self, workspace, *, issue_number: int | None = None
+    ) -> dict[str, CheckBaseline]:
         """Record which checks already fail on the anchor commit, before the agent works.
 
         The worktree sits at the anchor (origin/base or the last completed task
@@ -578,21 +797,69 @@ class Orchestrator:
         pre-existing on the base and are not the agent's responsibility; later
         checks only fail on failures *new* relative to this baseline.
         """
+        task_checks = getattr(self.config, "task_checks", None)
+        baseline_checks = tuple(
+            dict.fromkeys((*self.config.checks, *(task_checks or ())))
+        )
         cache = getattr(self, "_baseline_cache", None)
         cache_key: tuple[str, tuple[str, ...]] | None = None
+        now = time.monotonic()
         if cache is not None and self.config.baseline_cache_ttl_seconds > 0:
-            cache_key = (await self.workspaces.head_commit(workspace), self.config.checks)
+            cache_key = (await self.workspaces.head_commit(workspace), baseline_checks)
+            for key, item in list(cache.items()):
+                if now - item[0] >= self.config.baseline_cache_ttl_seconds:
+                    cache.pop(key, None)
             cached = cache.get(cache_key)
-            if cached is not None and time.monotonic() - cached[0] < self.config.baseline_cache_ttl_seconds:
+            if cached is not None:
+                if hasattr(cache, "move_to_end"):
+                    cache.move_to_end(cache_key)
                 return cached[1]
-        baseline = await capture_baseline(
-            workspace,
-            self.config.checks,
-            timeout=self.config.check_timeout_seconds,
-            parallel=self.config.checks_parallel,
-        )
+
+        async def capture() -> dict[str, CheckBaseline]:
+            limit = getattr(self, "check_limit", None)
+            if limit is not None:
+                async with limit:
+                    return await capture_baseline(
+                        workspace,
+                        baseline_checks,
+                        timeout=self.config.check_timeout_seconds,
+                        parallel=self.config.checks_parallel,
+                    )
+            return await capture_baseline(
+                workspace,
+                baseline_checks,
+                timeout=self.config.check_timeout_seconds,
+                parallel=self.config.checks_parallel,
+            )
+
+        started = time.monotonic()
+        inflight = getattr(self, "_baseline_inflight", None)
+        if inflight is None:
+            self._baseline_inflight = inflight = {}
+        owner = cache_key is None or cache_key not in inflight
+        operation = asyncio.create_task(capture()) if owner else inflight[cache_key]
+        if cache_key is not None and owner:
+            inflight[cache_key] = operation
+        try:
+            baseline = await operation
+        finally:
+            if cache_key is not None and owner:
+                inflight.pop(cache_key, None)
+            if issue_number is not None:
+                self.state.record_check_duration(
+                    issue_number,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
         if cache_key is not None:
             cache[cache_key] = (time.monotonic(), baseline)
+            if hasattr(cache, "move_to_end"):
+                cache.move_to_end(cache_key)
+            maximum = getattr(self.config, "baseline_cache_max_entries", 32)
+            while len(cache) > maximum:
+                if hasattr(cache, "move_to_end"):
+                    cache.popitem(last=False)
+                else:
+                    cache.pop(next(iter(cache)))
         return baseline
 
     async def _run_checks(
@@ -606,17 +873,51 @@ class Orchestrator:
         stage: str = "task",
     ) -> None:
         """Run the configured checks; see :mod:`issue_agent.checks` for tolerance semantics."""
-        await run_checks(
-            workspace,
-            issue_log,
-            baseline,
-            checks=self.config.checks,
-            timeout=self.config.check_timeout_seconds,
-            parallel=self.config.checks_parallel,
-            seq=seq,
-            attempt=attempt,
-            stage=stage,
+        configured_task_checks = getattr(self.config, "task_checks", None)
+        checks = (
+            configured_task_checks
+            if stage == "task" and configured_task_checks is not None
+            else self.config.checks
         )
+        if not checks:
+            issue_log.event("task_checks_skipped", sequence=seq, attempt=attempt)
+            return
+        started = time.monotonic()
+        try:
+            limit = getattr(self, "check_limit", None)
+            if limit is not None:
+                async with limit:
+                    await run_checks(
+                        workspace,
+                        issue_log,
+                        baseline,
+                        checks=checks,
+                        timeout=self.config.check_timeout_seconds,
+                        parallel=self.config.checks_parallel,
+                        seq=seq,
+                        attempt=attempt,
+                        stage=stage,
+                    )
+            else:
+                await run_checks(
+                    workspace,
+                    issue_log,
+                    baseline,
+                    checks=checks,
+                    timeout=self.config.check_timeout_seconds,
+                    parallel=self.config.checks_parallel,
+                    seq=seq,
+                    attempt=attempt,
+                    stage=stage,
+                )
+        finally:
+            issue_number = getattr(issue_log, "issue_number", None)
+            if issue_number is not None:
+                self.state.record_check_duration(
+                    issue_number,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    seq=seq,
+                )
 
     def _task_review_active(self) -> bool:
         """Whether per-task review runs: formal always; full only with a reviewer agent."""
@@ -651,6 +952,8 @@ class Orchestrator:
                 acquire_agent_limit=True,
                 issue_log=issue_log,
                 issue_number=issue.number,
+                seq=seq,
+                attempt=attempt,
             )
             verdict = review_verdict(review.stdout)
             issue_log.review(
@@ -704,6 +1007,29 @@ class Orchestrator:
         issue_log: IssueLog,
         baseline: dict[str, CheckBaseline],
     ) -> None:
+        started = time.monotonic()
+        self.state.start_plan_task(issue.number, seq)
+        try:
+            await self._run_task_inner(
+                workspace, issue, plan, seq, agent_name, issue_log, baseline
+            )
+        finally:
+            self.state.finish_plan_task(
+                issue.number,
+                seq,
+                wall_duration_ms=int((time.monotonic() - started) * 1000),
+            )
+
+    async def _run_task_inner(
+        self,
+        workspace,
+        issue: Issue,
+        plan: list[PlanTask],
+        seq: int,
+        agent_name: str,
+        issue_log: IssueLog,
+        baseline: dict[str, CheckBaseline],
+    ) -> None:
         task = plan[seq]
         issue_log.event("task_started", sequence=seq, task=task.to_dict(), agent=agent_name)
         self.workspaces.write_task_file(workspace, issue, task)
@@ -737,13 +1063,15 @@ class Orchestrator:
                     ),
                     issue_log=issue_log,
                     issue_number=issue.number,
+                    seq=seq,
+                    attempt=attempt,
                 )
                 issue_log.event("agent_implementation_finished", sequence=seq, attempt=attempt)
+                if not await self.workspaces.changed(workspace):
+                    raise CommandError("agent completed without changing files")
                 self.state.update(issue.number, TaskStatus.TESTING)
                 await self._run_checks(workspace, issue_log, baseline, seq=seq, attempt=attempt)
 
-                if not await self.workspaces.changed(workspace):
-                    raise CommandError("agent completed without changing files")
                 if task_committed:
                     await self.workspaces.amend(workspace)
                     issue_log.event("task_commit_amended", sequence=seq, attempt=attempt)
@@ -812,6 +1140,7 @@ class Orchestrator:
                         acquire_agent_limit=True,
                         issue_log=issue_log,
                         issue_number=issue.number,
+                        attempt=attempt,
                     )
                     verdict = review_verdict(review.stdout)
                     issue_log.review("final", review.stdout, attempt=attempt, verdict=verdict or "invalid")
@@ -861,6 +1190,8 @@ class Orchestrator:
                     agent_name, workspace, make_final_fix_prompt(issue, last_error),
                     issue_log=issue_log,
                     issue_number=issue.number,
+                    attempt=attempt,
+                    role="final fixer",
                 )
             except CommandError as exc:
                 self.state.update_final_context(issue.number, last_error=str(exc))

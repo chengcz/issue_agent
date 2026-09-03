@@ -191,7 +191,7 @@ done
 各标签的用途见后文「标签规则」：没有 `agent-*` 标签是自动规划入口；`agent-ready` 是编码执行入口；
 `agent:<name>` 选择实现 Agent；
 `reviewer:<name>` 按 Issue 选择 Reviewer（当前 `reviewer_agent` 仍是全局配置，需要按 Issue 选择时扩展调度器）；
-`resource:database-schema` 对数据库 schema 任务全局串行；`agent-running`、`agent-failed`、`human-review`
+`resource:database-schema` 对数据库 schema 任务全局串行；`agent-planned`、`agent-running`、`agent-failed`、`human-review`
 由编排器维护，不要手工使用。
 
 编辑 `issue-agent.toml`：
@@ -213,10 +213,16 @@ CLI 启动时会验证 Agent 名称、并发数、重试次数和 timeout；无�
 - `runtime.auto_plan_limit`：每轮最多扫描多少个候选 Issue。
 - `runtime.log_dir`：每个 Issue 的执行和 Review JSONL 日志目录。
 - `checks.commands`：目标项目真实的验收命令。
+- `checks.task_commands`：每个 plan task 后执行的快速检查；省略时兼容旧行为并执行全部
+  `checks.commands`，设为 `[]` 时只在最终 gate 执行完整检查。
 - `checks.timeout_seconds`：每条检查命令的超时，默认 1800 秒；超时会终止整个命令进程组，避免残留
   测试进程持续占用资源；任务取消时也会执行同样的进程树清理。
+- `checks.max_workers`：同时运行的 check 批次数，默认跟随 `runtime.max_workers`，防止多 Issue 与
+  单 Issue 内并行命令相乘后压垮 CPU/磁盘。
 - `checks.baseline_cache_ttl_seconds`：同一 anchor/checks 基线缓存有效期，默认 300 秒；设为 `0` 可
   禁用缓存，适用于强依赖外部环境的集成检查。
+- `checks.baseline_cache_max_entries`：baseline LRU 最大条目数，默认 32；相同 key 的并发请求会
+  single-flight，只执行一次。
 - `review.task_mode`：任务级审查模式，默认 `formal`（确定性形式审查：secrets/禁改文件/空 diff，
   零 LLM 调用）；`full` 恢复每任务 LLM 深度 Review（需配置 `reviewer_agent`）；`off` 跳过任务级
   审查。最终阶段的整分支 LLM Review 不受此项影响。
@@ -229,6 +235,8 @@ issue-agent --config issue-agent.toml once
 issue-agent --config issue-agent.toml status
 issue-agent --config issue-agent.toml status --active
 issue-agent --config issue-agent.toml status --json
+issue-agent --config issue-agent.toml report
+issue-agent --config issue-agent.toml report --issue 42 --json
 ```
 
 `status` 输出列：`ISSUE`、`STATUS`、`CURRENT TASK`、`AGENT`、`TOKENS`（输入+输出 token 合计，
@@ -237,6 +245,10 @@ k/M 紧凑格式）、`COST`（累计美元开销）、`TIME`（累计 Agent 壁
 TIME 有值；无数据时显示 `-`。`--json` 输出含全部累积字段（`total_input_tokens`、
 `total_output_tokens`、`total_cache_read_tokens`、`total_cache_creation_tokens`、
 `total_cost_usd`、`total_duration_ms`）。
+
+`report` 同时输出 Issue 的 `queue`/`wall` 以及各 plan task 的累计 `wall`、`agent`、`checks`、
+token、cost 和 attempts；
+`--json` 还包含逐次 `issue_runs`，适合后续导入监控系统。失败和超时的 Agent 调用也计入统计。
 
 确认无误后，可在当前终端持续轮询；按 `Ctrl+C` 停止：
 
@@ -250,11 +262,15 @@ issue-agent --config issue-agent.toml serve
 
 ```toml
 [agents.codex]
-command = "codex exec --sandbox workspace-write -"
+command = "codex exec --json --sandbox workspace-write -"
+resume_command = "codex exec resume --json {session_id} -"
 max_workers = 2
 
 [agents.claude]
-command = "claude -p"
+command = "claude -p --output-format json"
+review_command = "claude -p --permission-mode plan --output-format json"
+resume_command = "claude -p --resume {session_id} --output-format json"
+review_resume_command = "claude -p --resume {session_id} --permission-mode plan --output-format json"
 max_workers = 1
 
 [agents.custom]
@@ -265,10 +281,10 @@ command = "your-agent --prompt {prompt}"
 
 ### Token 与耗时追踪
 
-orchestrator 对每次 Agent CLI 调用自动记录壁钟耗时；若 CLI 输出为 JSON result envelope
-（Claude CLI 加 `--output-format json`），还会自动解析 token 用量（输入/输出/缓存读/缓存写）、
-cost 与 API 耗时。**stdout 会自动 unwrap 为纯文本**，下游解析（plan JSON、review verdict）
-不受影响；不加该 flag 时优雅降级为仅计时。
+orchestrator 对每次 Agent CLI 调用自动记录壁钟耗时，包括失败和超时。它支持 Claude JSON result
+envelope（`--output-format json`）与 Codex JSONL（`--json`），自动解析最终消息、输入/输出/缓存/
+reasoning token、cost（CLI 提供时）和 session ID。**stdout 会自动 unwrap 为纯文本**，下游解析
+（plan JSON、review verdict）不受影响；纯文本 CLI 优雅降级为仅计时。
 
 ```toml
 [agents.claude]
@@ -280,15 +296,17 @@ review_command = "claude -p --model sonnet --permission-mode plan --output-forma
 
 - `logs/issue-<N>.jsonl` 的 `agent_call` 事件：每次调用的完整明细（agent、role、duration_ms、
   input_tokens、output_tokens、cache_read_input_tokens、cache_creation_input_tokens、cost_usd）。
-- SQLite 状态库：按 Issue 累积总量（`total_input_tokens` 等 6 列），供 `status` 命令快速查询，
+- SQLite 状态库：按 Issue 累积 token、成本、Agent/check/wall time，供 `status` 和 `report` 快速查询，
   显示为 TOKENS（输入+输出合计，k/M 紧凑格式）、COST、TIME 三列。
+- SQLite 的 `issue_runs`、`agent_calls` 与扩展后的 `plan_tasks` 保存逐次运行、调用以及每个 task 的
+  明细；配置 `resume_command` / `review_resume_command` 后，同一 Issue 会复用对应角色的 session。
 
 Issue 标签示例：
 
 - `agent-ready`：允许调度。
 - `agent:codex` / `agent:claude`：选择实现 Agent。
 - `resource:database-schema`：全局串行，避免 Alembic 多头迁移。
-- `agent-running`、`agent-failed`、`human-review`：由调度器维护。
+- `agent-planned`、`agent-running`、`agent-failed`、`human-review`：由调度器维护。
 
 ### 为不同任务使用不同 Claude 模型
 
@@ -342,8 +360,8 @@ task_mode = "formal"  # formal（默认）| full | off
 commands = ["./scripts/check.sh"]
 ```
 
-`.agent/plan.md`（完整 plan）和 `.agent/task.md`（当前任务）由 orchestrator 创建，通常应加入目标项目的
-`.gitignore`。如果希望 PR 保留任务快照，则不要忽略。
+`.agent/plan.md`、`.agent/task.md`、feedback 和 check output 由 orchestrator 创建。Workspace 操作会
+显式从 status、commit/amend 和 clean 中排除 `.agent`，因此它们不会再造成“有代码改动”的误判或进入 PR。
 
 ## BioAgent 任务发布
 
@@ -410,7 +428,7 @@ gh issue edit ISSUE_NUMBER \
 - `agent:codex`：由 Codex 实现。
 - `agent:claude`：由 Claude Code 实现。
 - `resource:database-schema`：涉及数据库 schema 时添加，同一进程内串行执行。
-- `agent-running`、`agent-failed`、`human-review`：由编排器维护，不要手工用于发布任务。
+- `agent-planned`、`agent-running`、`agent-failed`、`human-review`：由编排器维护，不要手工用于发布任务。
 - `bug`、`enhancement`、`documentation`：描述任务类型，可与 Agent 标签组合。
 
 不要同时添加多个 `agent:<name>` 标签。一个 Issue 应对应一个可独立审查的 PR；大型需求应拆成有依赖关系的多个 Issue。
