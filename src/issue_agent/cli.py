@@ -35,16 +35,54 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def _format_tokens(row: dict[str, object]) -> str:
+    """Combined input+output token count, compact notation for large values."""
+    total = int(row.get("total_input_tokens") or 0) + int(row.get("total_output_tokens") or 0)
+    if total == 0:
+        return "-"
+    if total >= 1_000_000:
+        return f"{total / 1_000_000:.1f}M"
+    if total >= 1_000:
+        return f"{total / 1_000:.1f}k"
+    return str(total)
+
+
+def _format_cost(row: dict[str, object]) -> str:
+    cost = float(row.get("total_cost_usd") or 0.0)
+    if cost == 0.0:
+        return "-"
+    if cost < 0.01:
+        return f"${cost:.4f}"
+    return f"${cost:.2f}"
+
+
+def _format_duration(row: dict[str, object]) -> str:
+    ms = int(row.get("total_duration_ms") or 0)
+    if ms == 0:
+        return "-"
+    seconds = ms // 1000
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, secs = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, mins = divmod(minutes, 60)
+    return f"{hours}h{mins:02d}m"
+
+
 def format_status(rows: list[dict[str, object]]) -> str:
     if not rows:
         return "No matching tasks."
-    headings = ("ISSUE", "STATUS", "CURRENT TASK", "AGENT", "UPDATED")
+    headings = ("ISSUE", "STATUS", "CURRENT TASK", "AGENT", "TOKENS", "COST", "TIME", "UPDATED")
     values = [
         (
             f"#{row['issue_number']}",
             str(row["status"]),
             str(row.get("current_task") or row.get("title") or "-"),
             str(row.get("agent") or "-"),
+            _format_tokens(row),
+            _format_cost(row),
+            _format_duration(row),
             str(row.get("updated_at") or "-").replace("T", " ")[:19],
         )
         for row in rows

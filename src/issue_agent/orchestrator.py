@@ -434,6 +434,7 @@ class Orchestrator:
                 role="planner",
                 acquire_agent_limit=acquire_agent_limit,
                 issue_log=issue_log,
+                issue_number=issue.number,
             )
             plan = parse_plan(result.stdout, self.config.max_tasks)
         self.state.save_plan(issue.number, plan)
@@ -448,6 +449,7 @@ class Orchestrator:
         role: str,
         acquire_agent_limit: bool = False,
         issue_log: IssueLog | None = None,
+        issue_number: int | None = None,
     ):
         """Run a planner/reviewer and restore any repository changes it makes."""
         if acquire_agent_limit:
@@ -458,6 +460,7 @@ class Orchestrator:
                     prompt,
                     role=role,
                     issue_log=issue_log,
+                    issue_number=issue_number,
                 )
         if await self.workspaces.status(workspace):
             raise CommandError(f"cannot start read-only {role}: workspace is not clean")
@@ -475,37 +478,57 @@ class Orchestrator:
             await self.workspaces.reset(workspace, "HEAD")
             await self.workspaces.clean(workspace)
             raise ReadOnlyViolation(f"read-only {role} modified the workspace")
-        self._log_agent_call(issue_log, agent_name, role, result)
+        self._log_agent_call(issue_log, agent_name, role, result, issue_number=issue_number)
         return result
 
-    async def _execute_agent(self, agent_name: str, workspace, prompt: str, *, issue_log: IssueLog | None = None):
+    async def _execute_agent(
+        self,
+        agent_name: str,
+        workspace,
+        prompt: str,
+        *,
+        issue_log: IssueLog | None = None,
+        issue_number: int | None = None,
+    ):
         """Run one coding-agent invocation under that agent's own limit."""
         async with self.agent_limits[agent_name]:
             result = await self.agents[agent_name].execute(workspace, prompt)
-        self._log_agent_call(issue_log, agent_name, "worker", result)
+        self._log_agent_call(issue_log, agent_name, "worker", result, issue_number=issue_number)
         return result
 
-    @staticmethod
-    def _log_agent_call(issue_log: IssueLog | None, agent_name: str, role: str, result: Result) -> None:
-        """Record token usage and wall-clock duration for one agent invocation."""
-        if issue_log is None:
-            return
-        fields: dict[str, object] = {"agent": agent_name, "role": role}
-        if result.duration_ms is not None:
-            fields["duration_ms"] = result.duration_ms
-        if result.usage:
-            for key in (
-                "input_tokens",
-                "output_tokens",
-                "cache_creation_input_tokens",
-                "cache_read_input_tokens",
-                "cost_usd",
-                "total_cost_usd",
-                "num_turns",
-            ):
-                if key in result.usage:
-                    fields[key] = result.usage[key]
-        issue_log.event("agent_call", **fields)
+    def _log_agent_call(
+        self,
+        issue_log: IssueLog | None,
+        agent_name: str,
+        role: str,
+        result: Result,
+        *,
+        issue_number: int | None = None,
+    ) -> None:
+        """Record token usage and wall-clock duration for one agent invocation.
+
+        Dual-write: the JSONL log always receives the event; the state DB totals
+        are updated only when *issue_number* is supplied.
+        """
+        if issue_log is not None:
+            fields: dict[str, object] = {"agent": agent_name, "role": role}
+            if result.duration_ms is not None:
+                fields["duration_ms"] = result.duration_ms
+            if result.usage:
+                for key in (
+                    "input_tokens",
+                    "output_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                    "cost_usd",
+                    "total_cost_usd",
+                    "num_turns",
+                ):
+                    if key in result.usage:
+                        fields[key] = result.usage[key]
+            issue_log.event("agent_call", **fields)
+        if issue_number is not None:
+            self.state.accumulate_usage(issue_number, result.usage, duration_ms=result.duration_ms)
 
     def _resume_seq(self, issue_number: int, plan: list[PlanTask]) -> int:
         """First plan index that is not DONE; len(plan) when all tasks are done (final phase)."""
@@ -620,6 +643,7 @@ class Orchestrator:
                 role="task reviewer",
                 acquire_agent_limit=True,
                 issue_log=issue_log,
+                issue_number=issue.number,
             )
             verdict = review_verdict(review.stdout)
             issue_log.review(
@@ -705,6 +729,7 @@ class Orchestrator:
                         guidance=self._codegraph_guidance(),
                     ),
                     issue_log=issue_log,
+                    issue_number=issue.number,
                 )
                 issue_log.event("agent_implementation_finished", sequence=seq, attempt=attempt)
                 self.state.update(issue.number, TaskStatus.TESTING)
@@ -779,6 +804,7 @@ class Orchestrator:
                         role="final reviewer",
                         acquire_agent_limit=True,
                         issue_log=issue_log,
+                        issue_number=issue.number,
                     )
                     verdict = review_verdict(review.stdout)
                     issue_log.review("final", review.stdout, attempt=attempt, verdict=verdict or "invalid")
@@ -827,6 +853,7 @@ class Orchestrator:
                 await self._execute_agent(
                     agent_name, workspace, make_final_fix_prompt(issue, last_error),
                     issue_log=issue_log,
+                    issue_number=issue.number,
                 )
             except CommandError as exc:
                 self.state.update_final_context(issue.number, last_error=str(exc))

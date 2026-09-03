@@ -182,6 +182,94 @@ def test_state_reset_returns_none_for_unknown_issue(tmp_path: Path):
     assert state.reset(99) is None
 
 
+# ---------------------------------------------------------------------------
+# usage accumulation tests
+# ---------------------------------------------------------------------------
+
+def test_accumulate_usage_stores_tokens_and_cost(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(7, "T", "B"), "codex")
+    state.accumulate_usage(
+        7,
+        {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 20,
+         "cache_creation_input_tokens": 5, "cost_usd": 0.01},
+        duration_ms=1200,
+    )
+    row = next(r for r in state.rows() if r["issue_number"] == 7)
+    assert row["total_input_tokens"] == 100
+    assert row["total_output_tokens"] == 50
+    assert row["total_cache_read_tokens"] == 20
+    assert row["total_cache_creation_tokens"] == 5
+    assert row["total_cost_usd"] == 0.01
+    assert row["total_duration_ms"] == 1200
+
+
+def test_accumulate_usage_sums_across_calls(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(7, "T", "B"), "codex")
+    state.accumulate_usage(7, {"input_tokens": 100, "output_tokens": 50, "cost_usd": 0.01}, duration_ms=1000)
+    state.accumulate_usage(7, {"input_tokens": 200, "output_tokens": 80, "cost_usd": 0.02}, duration_ms=2000)
+    row = next(r for r in state.rows() if r["issue_number"] == 7)
+    assert row["total_input_tokens"] == 300
+    assert row["total_output_tokens"] == 130
+    assert abs(row["total_cost_usd"] - 0.03) < 1e-9
+    assert row["total_duration_ms"] == 3000
+
+
+def test_accumulate_usage_treats_missing_keys_as_zero(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(7, "T", "B"), "codex")
+    state.accumulate_usage(7, {"input_tokens": 42}, duration_ms=None)
+    row = next(r for r in state.rows() if r["issue_number"] == 7)
+    assert row["total_input_tokens"] == 42
+    assert row["total_output_tokens"] == 0
+    assert row["total_cost_usd"] == 0.0
+    assert row["total_duration_ms"] == 0
+
+
+def test_accumulate_usage_ignores_unknown_issue(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    # no row for issue 99 — must not raise
+    state.accumulate_usage(99, {"input_tokens": 10}, duration_ms=5)
+    assert all(r["issue_number"] != 99 for r in state.rows())
+
+
+def test_status_rows_include_usage_fields(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(7, "T", "B"), "codex")
+    state.accumulate_usage(7, {"input_tokens": 10, "output_tokens": 5, "cost_usd": 0.005}, duration_ms=500)
+    rows = state.status_rows()
+    row = next(r for r in rows if r["issue_number"] == 7)
+    assert row["total_input_tokens"] == 10
+    assert row["total_output_tokens"] == 5
+    assert row["total_cost_usd"] == 0.005
+    assert row["total_duration_ms"] == 500
+
+
+def test_usage_columns_migrate_on_existing_db(tmp_path: Path):
+    """A DB created before usage columns exist gains them on reopen."""
+    import sqlite3
+
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as db:
+        db.execute("""CREATE TABLE tasks (
+            issue_number INTEGER PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL,
+            agent TEXT, branch TEXT, worktree TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+            failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, pr_url TEXT, plan TEXT,
+            current_seq INTEGER NOT NULL DEFAULT -1, final_commit_hash TEXT,
+            final_last_error TEXT, updated_at TEXT NOT NULL
+        )""")
+        db.execute(
+            "INSERT INTO tasks(issue_number,title,status,updated_at) VALUES(1,'Old','pending','2026-01-01')"
+        )
+
+    state = StateStore(db_path)  # triggers migration
+    state.accumulate_usage(1, {"input_tokens": 7}, duration_ms=99)
+    row = next(r for r in state.rows() if r["issue_number"] == 1)
+    assert row["total_input_tokens"] == 7
+    assert row["total_duration_ms"] == 99
+
+
 def test_cli_reset_requeues_and_guards_running_tasks(tmp_path: Path):
     config_file = tmp_path / "issue-agent.toml"
     config_file.write_text(
@@ -531,6 +619,78 @@ def test_status_parser_and_human_format():
     assert "#7" in output
     assert "testing" in output
     assert "Check CLI" in output
+
+
+def test_format_status_shows_token_cost_time_columns():
+    """Status table includes TOKENS, COST, TIME columns from accumulated usage."""
+    output = format_status(
+        [
+            {
+                "issue_number": 7,
+                "status": "testing",
+                "title": "Check CLI",
+                "agent": "codex",
+                "updated_at": "2026-08-28T12:34:56+00:00",
+                "total_input_tokens": 1200,
+                "total_output_tokens": 350,
+                "total_cache_read_tokens": 800,
+                "total_cache_creation_tokens": 50,
+                "total_cost_usd": 0.0123,
+                "total_duration_ms": 95000,
+            }
+        ]
+    )
+    assert "TOKENS" in output
+    assert "COST" in output
+    assert "TIME" in output
+    # tokens shown as combined in+out (1200+350=1550 -> "1.6k")
+    assert "1.6k" in output or "1550" in output
+    # cost formatted with dollar sign (0.0123 -> "$0.01" at 2 decimals)
+    assert "$0.01" in output
+    # duration formatted human-readable (95000ms -> 1m35s)
+    assert "1m35s" in output or "95s" in output
+
+
+def test_format_status_handles_zero_usage_gracefully():
+    """Issues with no agent calls yet show dashes or zeros, not errors."""
+    output = format_status(
+        [
+            {
+                "issue_number": 8,
+                "status": "pending",
+                "title": "Fresh",
+                "agent": None,
+                "updated_at": "2026-08-28T12:34:56+00:00",
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "total_cache_read_tokens": 0,
+                "total_cache_creation_tokens": 0,
+                "total_cost_usd": 0.0,
+                "total_duration_ms": 0,
+            }
+        ]
+    )
+    assert "#8" in output
+    assert "TOKENS" in output
+    # zero usage should render as "-" or "0", not crash
+    assert "-" in output or "0" in output
+
+
+def test_format_status_handles_missing_usage_keys():
+    """Rows without usage keys (old DB rows) still render without KeyError."""
+    output = format_status(
+        [
+            {
+                "issue_number": 9,
+                "status": "pending",
+                "title": "Legacy",
+                "agent": "codex",
+                "updated_at": "2026-08-28T12:34:56+00:00",
+            }
+        ]
+    )
+    assert "#9" in output
+    assert "TOKENS" in output
 
 
 def test_cli_uses_public_issue_agent_name():
