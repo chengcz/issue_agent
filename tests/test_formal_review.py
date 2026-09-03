@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from issue_agent.formal_review import FormalReviewResult, formal_review
 
 
@@ -111,3 +113,18 @@ class TestFormalReviewResult:
         r = FormalReviewResult(approved=False, reason="found secret")
         assert not r.approved
         assert "secret" in r.reason
+
+
+class TestGitErrorHandling:
+    def test_git_failure_raises_runtime_error(self, tmp_path):
+        """_git() must raise RuntimeError with stderr when git command fails."""
+        from issue_agent.formal_review import _git
+
+        # tmp_path is not a git repo — git diff will fail
+        with pytest.raises(RuntimeError, match="git diff.*failed"):
+            _git(tmp_path, "diff", "--name-only", "HEAD^", "HEAD")
+
+    def test_formal_review_propagates_git_error(self, tmp_path):
+        """formal_review() on a non-git directory raises RuntimeError, not silent empty."""
+        with pytest.raises(RuntimeError, match="git.*failed"):
+            formal_review(tmp_path)
