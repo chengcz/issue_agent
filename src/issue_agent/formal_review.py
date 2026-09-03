@@ -1,7 +1,9 @@
 """Deterministic formal review: secrets scan, forbidden files, empty-diff check.
 
-No LLM calls. Raises nothing — returns a :class:`FormalReviewResult` so the
-caller can decide how to react (log, retry, or hard-fail).
+No LLM calls. Review outcomes are returned as a :class:`FormalReviewResult` so
+the caller decides how to react (log, retry, or hard-fail). Infrastructure
+failures (git errors) raise :class:`~issue_agent.process.CommandError` so the
+task retry loop can catch and recover from transient problems.
 """
 
 from __future__ import annotations
@@ -10,6 +12,8 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+from .process import CommandError
 
 # ---------------------------------------------------------------------------
 # Secret patterns
@@ -59,7 +63,7 @@ def _git(workspace: Path, *args: str) -> str:
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(
+        raise CommandError(
             f"git {' '.join(args)} failed (exit {result.returncode}): {result.stderr.strip()}"
         )
     return result.stdout

@@ -1127,3 +1127,148 @@ def test_execute_agent_without_issue_number_skips_state_write(tmp_path):
     assert any(e[0] == "agent_call" for e in log.events)
     # no state rows touched
     assert app.state.rows() == []
+
+
+# ---------------------------------------------------------------------------
+# formal review without reviewer_agent (Fix #1)
+# ---------------------------------------------------------------------------
+
+def test_formal_review_runs_without_reviewer_agent(tmp_path, monkeypatch):
+    """formal mode is deterministic — it must run even with no reviewer agent configured."""
+    from issue_agent.formal_review import FormalReviewResult
+
+    app = make_orchestrator(tmp_path, reviewer="")
+    app.config.review_task_mode = "formal"
+    calls = {"n": 0}
+
+    def fake_formal_review(workspace):
+        calls["n"] += 1
+        return FormalReviewResult(approved=True, reason="")
+
+    monkeypatch.setattr("issue_agent.orchestrator.formal_review", fake_formal_review)
+    app.workspaces.changed.side_effect = [True, False]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+
+    assert calls["n"] == 1, "formal review must run without reviewer_agent"
+    app.workspaces.push.assert_awaited_once()
+    assert app.state.rows()[0]["status"] == str(TaskStatus.HUMAN_REVIEW)
+
+
+def test_formal_review_without_reviewer_agent_uses_review_attempt_budget(tmp_path, monkeypatch):
+    """With formal review active, attempt_limit is _REVIEW_ATTEMPTS (2), not max_task_attempts (3)."""
+    from issue_agent.formal_review import FormalReviewResult
+
+    app = make_orchestrator(tmp_path, attempts=3, reviewer="")
+    app.config.review_task_mode = "formal"
+    calls = {"n": 0}
+
+    def rejecting_formal_review(workspace):
+        calls["n"] += 1
+        return FormalReviewResult(approved=False, reason="Forbidden file modified: .env")
+
+    monkeypatch.setattr("issue_agent.orchestrator.formal_review", rejecting_formal_review)
+    app.workspaces.changed.side_effect = [True, True]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+
+    # review budget is 2 attempts even though max_task_attempts is 3
+    assert calls["n"] == 2
+    assert app.agents["worker"].execute.await_count == 2
+    app.workspaces.push.assert_not_awaited()
+    row = app.state.rows()[0]
+    assert row["status"] == str(TaskStatus.FAILED)
+    assert "formal review rejected after the allowed fix cycle" in row["last_error"]
+
+
+def test_full_mode_without_reviewer_agent_skips_review(tmp_path, monkeypatch):
+    """full mode requires an LLM reviewer; without one, review is skipped (backward compat)."""
+    from issue_agent.formal_review import FormalReviewResult
+
+    app = make_orchestrator(tmp_path, reviewer="")
+    app.config.review_task_mode = "full"
+    calls = {"n": 0}
+
+    def fake_formal_review(workspace):
+        calls["n"] += 1
+        return FormalReviewResult(approved=True, reason="")
+
+    monkeypatch.setattr("issue_agent.orchestrator.formal_review", fake_formal_review)
+    app.workspaces.changed.side_effect = [True, False]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+
+    assert calls["n"] == 0, "full mode must not fall back to formal review"
+    app.workspaces.push.assert_awaited_once()
+
+
+def test_formal_review_git_failure_retries_via_command_error(tmp_path, monkeypatch):
+    """A transient git failure in formal review raises CommandError and the task retries."""
+    from issue_agent.formal_review import FormalReviewResult
+    from issue_agent.process import CommandError
+
+    app = make_orchestrator(tmp_path)
+    app.config.review_task_mode = "formal"
+    calls = {"n": 0}
+
+    def flaky_formal_review(workspace):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise CommandError("git diff --name-only HEAD^ HEAD failed (exit 128): lock busy")
+        return FormalReviewResult(approved=True, reason="")
+
+    monkeypatch.setattr("issue_agent.orchestrator.formal_review", flaky_formal_review)
+    app.workspaces.changed.side_effect = [True, True, False]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+
+    # first call raised (retryable), second approved — issue still completes
+    assert calls["n"] == 2
+    assert app.agents["worker"].execute.await_count == 2
+    app.workspaces.push.assert_awaited_once()
+    assert app.state.rows()[0]["status"] == str(TaskStatus.HUMAN_REVIEW)
+
+
+def test_process_accumulates_usage_from_all_agent_calls_in_state_db(tmp_path):
+    """E2E: a full process() run sums worker + task-reviewer + final-reviewer usage into the DB."""
+    app = make_orchestrator(tmp_path)
+    # worker: one call with usage
+    app.agents["worker"].execute = AsyncMock(
+        return_value=Result(
+            returncode=0, stdout="", stderr="", duration_ms=1000,
+            usage={"input_tokens": 100, "output_tokens": 50, "cost_usd": 0.01},
+        )
+    )
+    # reviewer: task review + final review, both APPROVE with usage
+    app.agents["reviewer"].execute = AsyncMock(
+        return_value=Result(
+            returncode=0, stdout=APPROVE, stderr="", duration_ms=500,
+            usage={"input_tokens": 30, "output_tokens": 10, "cost_usd": 0.003},
+        )
+    )
+    app.workspaces.changed.side_effect = [True, False]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+
+    assert app.state.rows()[0]["status"] == str(TaskStatus.HUMAN_REVIEW)
+    row = next(r for r in app.state.rows() if r["issue_number"] == 4)
+    # worker(1) + task reviewer(1) + final reviewer(1)
+    assert row["total_input_tokens"] == 100 + 30 + 30
+    assert row["total_output_tokens"] == 50 + 10 + 10
+    assert abs(row["total_cost_usd"] - (0.01 + 0.003 + 0.003)) < 1e-9
+    assert row["total_duration_ms"] == 1000 + 500 + 500

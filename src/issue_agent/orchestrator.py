@@ -618,6 +618,13 @@ class Orchestrator:
             stage=stage,
         )
 
+    def _task_review_active(self) -> bool:
+        """Whether per-task review runs: formal always; full only with a reviewer agent."""
+        mode = self.config.review_task_mode
+        if mode == "formal":
+            return True
+        return mode == "full" and bool(self.config.reviewer_agent)
+
     async def _run_task_review(
         self,
         workspace,
@@ -631,7 +638,7 @@ class Orchestrator:
 
         Raises CommandError (retryable) or ReviewRejected (terminal) on rejection.
         """
-        if not self.config.reviewer_agent:
+        if not self._task_review_active():
             return
         self.state.update(issue.number, TaskStatus.REVIEWING)
         mode = self.config.review_task_mode
@@ -705,7 +712,7 @@ class Orchestrator:
         # first attempt with the last recorded task failure.
         last_error = self.state.plan_task_last_error(issue.number, seq)
         attempt_limit = (
-            _REVIEW_ATTEMPTS if self.config.reviewer_agent else self.config.max_task_attempts
+            _REVIEW_ATTEMPTS if self._task_review_active() else self.config.max_task_attempts
         )
         for attempt in range(1, attempt_limit + 1):
             issue_log.event("task_attempt_started", sequence=seq, attempt=attempt)
