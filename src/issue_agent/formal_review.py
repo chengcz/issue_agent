@@ -58,6 +58,10 @@ def _git(workspace: Path, *args: str) -> str:
         text=True,
         check=False,
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
     return result.stdout
 
 

@@ -564,6 +564,73 @@ class Orchestrator:
             stage=stage,
         )
 
+    async def _run_task_review(
+        self,
+        workspace,
+        issue: Issue,
+        task: PlanTask,
+        seq: int,
+        attempt: int,
+        issue_log: IssueLog,
+    ) -> None:
+        """Execute the per-task review according to config.review_task_mode.
+
+        Raises CommandError (retryable) or ReviewRejected (terminal) on rejection.
+        """
+        if not self.config.reviewer_agent:
+            return
+        self.state.update(issue.number, TaskStatus.REVIEWING)
+        mode = self.config.review_task_mode
+        if mode == "full":
+            review = await self._execute_read_only(
+                self.config.reviewer_agent,
+                workspace,
+                make_task_review_prompt(issue, task, guidance=self._codegraph_guidance()),
+                role="task reviewer",
+                acquire_agent_limit=True,
+            )
+            verdict = review_verdict(review.stdout)
+            issue_log.review(
+                "task",
+                review.stdout,
+                sequence=seq,
+                attempt=attempt,
+                task=task.title,
+                verdict=verdict or "invalid",
+            )
+            if verdict == "VERDICT: REQUEST_CHANGES":
+                if attempt == _REVIEW_ATTEMPTS:
+                    raise ReviewRejected(
+                        "review requested changes after the allowed fix cycle:\n"
+                        f"{review.stdout[-4000:]}"
+                    )
+                raise CommandError(f"review requested changes:\n{review.stdout[-4000:]}")
+            if verdict != "VERDICT: APPROVE":
+                raise InvalidReviewVerdict(
+                    "review returned no valid final verdict; expected "
+                    "VERDICT: APPROVE or VERDICT: REQUEST_CHANGES\n"
+                    f"{review.stdout[-4000:]}"
+                )
+        elif mode == "formal":
+            fr_result = await asyncio.get_running_loop().run_in_executor(
+                None, formal_review, workspace
+            )
+            issue_log.review(
+                "task",
+                f"formal review: {'APPROVE' if fr_result.approved else 'REQUEST_CHANGES'}\n{fr_result.reason}",
+                sequence=seq,
+                attempt=attempt,
+                task=task.title,
+                verdict="VERDICT: APPROVE" if fr_result.approved else "VERDICT: REQUEST_CHANGES",
+            )
+            if not fr_result.approved:
+                if attempt == _REVIEW_ATTEMPTS:
+                    raise ReviewRejected(
+                        f"formal review rejected after the allowed fix cycle:\n{fr_result.reason}"
+                    )
+                raise CommandError(f"formal review requested changes:\n{fr_result.reason}")
+        # mode == "off": skip review entirely
+
     async def _run_task(
         self,
         workspace,
@@ -620,57 +687,7 @@ class Orchestrator:
                     task_committed = True
                     issue_log.event("task_committed", sequence=seq, attempt=attempt)
 
-                if self.config.reviewer_agent:
-                    self.state.update(issue.number, TaskStatus.REVIEWING)
-                    if self.config.review_task_mode == "full":
-                        review = await self._execute_read_only(
-                            self.config.reviewer_agent,
-                            workspace,
-                            make_task_review_prompt(issue, task, guidance=self._codegraph_guidance()),
-                            role="task reviewer",
-                            acquire_agent_limit=True,
-                        )
-                        verdict = review_verdict(review.stdout)
-                        issue_log.review(
-                            "task",
-                            review.stdout,
-                            sequence=seq,
-                            attempt=attempt,
-                            task=task.title,
-                            verdict=verdict or "invalid",
-                        )
-                        if verdict == "VERDICT: REQUEST_CHANGES":
-                            if attempt == _REVIEW_ATTEMPTS:
-                                raise ReviewRejected(
-                                    "review requested changes after the allowed fix cycle:\n"
-                                    f"{review.stdout[-4000:]}"
-                                )
-                            raise CommandError(f"review requested changes:\n{review.stdout[-4000:]}")
-                        if verdict != "VERDICT: APPROVE":
-                            raise InvalidReviewVerdict(
-                                "review returned no valid final verdict; expected "
-                                "VERDICT: APPROVE or VERDICT: REQUEST_CHANGES\n"
-                                f"{review.stdout[-4000:]}"
-                            )
-                    elif self.config.review_task_mode == "formal":
-                        fr_result = await asyncio.get_event_loop().run_in_executor(
-                            None, formal_review, workspace
-                        )
-                        issue_log.review(
-                            "task",
-                            f"formal review: {'APPROVE' if fr_result.approved else 'REQUEST_CHANGES'}\n{fr_result.reason}",
-                            sequence=seq,
-                            attempt=attempt,
-                            task=task.title,
-                            verdict="VERDICT: APPROVE" if fr_result.approved else "VERDICT: REQUEST_CHANGES",
-                        )
-                        if not fr_result.approved:
-                            if attempt == _REVIEW_ATTEMPTS:
-                                raise ReviewRejected(
-                                    f"formal review rejected after the allowed fix cycle:\n{fr_result.reason}"
-                                )
-                            raise CommandError(f"formal review requested changes:\n{fr_result.reason}")
-                    # review_task_mode == "off": skip review entirely
+                await self._run_task_review(workspace, issue, task, seq, attempt, issue_log)
 
                 self.state.update_plan_task(
                     issue.number, seq, status=TaskStatus.DONE,
