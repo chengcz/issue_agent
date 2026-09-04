@@ -305,6 +305,9 @@ review_command = "claude -p --model sonnet --permission-mode plan --output-forma
   明细；配置 `resume_command` / `review_resume_command` 后，同一 Issue 会复用对应角色的 session。
   resumed 调用失败（会话过期/损坏）时自动清除存储的 session，下一次尝试降级为全新会话，
   不会反复撞同一个死会话耗尽预算。
+- Agent CLI 输出会被**全量捕获进内存**以解析结构化 usage（Claude JSON envelope / Codex JSONL
+  需要完整输出）；失控 CLI 产生超大输出时内存占用随之增长，兜底手段是
+  `agents.<name>.timeout_seconds`（超时杀整棵进程树）。这是已知取舍，不做流式截断。
 
 Issue 标签示例：
 
