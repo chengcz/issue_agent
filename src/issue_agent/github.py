@@ -10,14 +10,15 @@ from .process import CommandError, run
 
 # Labels the orchestrator applies itself, with recommended colors and
 # descriptions used to generate `gh label create` guidance at startup.
+# Keep in sync with the init script in README「初始化 GitHub Labels」.
 ORCHESTRATOR_LABELS: dict[str, tuple[str, str]] = {
-    "agent-running": ("fbca04", "Currently being processed by the coding agent"),
-    "agent-planned": ("1d76db", "Plan published; awaiting human approval"),
-    "agent-failed": ("d73a46", "Agent run failed or parked; needs human action"),
-    "human-review": ("5319e7", "Pull request awaits human review"),
+    "agent-running": ("1d76db", "Implementation in progress"),
+    "agent-planned": ("7057ff", "Plan published; awaiting human approval"),
+    "agent-failed": ("d73a4a", "Agent run failed"),
+    "human-review": ("fbca04", "Awaiting human review"),
 }
-_READY_LABEL_SPEC = ("0e8a16", "Ready for the coding agent to claim")
-_AGENT_ROUTE_COLOR = "c5def5"
+_READY_LABEL_SPEC = ("0e8a16", "Ready for coding-agent implementation")
+_AGENT_ROUTE_COLOR = "a219d8"
 
 
 def required_label_specs(
@@ -33,7 +34,7 @@ def required_label_specs(
     for name in agent_names:
         specs[f"agent:{name}"] = (
             _AGENT_ROUTE_COLOR,
-            f"Route this Issue to the '{name}' agent",
+            f"Implement with the '{name}' agent",
         )
     return specs
 
