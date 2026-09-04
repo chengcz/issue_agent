@@ -205,8 +205,10 @@ CLI 启动时会验证 Agent 名称、并发数、重试次数和 timeout；无�
 - `runtime.planner_agent`：规划 Agent（把 Issue 拆成多个任务）；不配置时回退为单任务流程。
 - `runtime.max_tasks`：单个 plan 的任务数上限，默认 8。
 - `runtime.max_attempts`：整个 Issue 的失败重排队预算，默认 3。
-- `runtime.max_task_attempts`：未配置 Reviewer 时，单个 task/最终检查在一次 Issue 执行中的内部
-  尝试次数，默认 2；与整个 Issue 的预算独立。
+- `runtime.max_task_attempts`：单个 task/最终检查在一次 Issue 执行中的内部尝试次数，默认 2；
+  与整个 Issue 的预算独立。任务级审查开启时（默认 `formal`，或 `full` 且配置了 Reviewer）尝试
+  下限为 2，且**第二次**审查拒绝即终止（按拒绝次数计，与尝试序号无关）；调大该值只延长
+  检查/执行失败的重试，不会延长审查返修轮数。
 - `runtime.fetch_ttl_seconds`：同一仓库 base branch fetch 的短期复用窗口，默认 30 秒；并发 Issue
   共用一次 fetch，避免重复网络请求和 Git 锁竞争。
 - `runtime.auto_plan_unlabeled`：是否自动为没有 `agent-*` 工作流标签的新 Issue 生成 Plan；名称为兼容旧配置保留，默认 `false`。
