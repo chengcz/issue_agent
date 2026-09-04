@@ -5,6 +5,7 @@ import json
 from collections.abc import Iterable
 from pathlib import Path
 
+from .formal_review import redact_secrets
 from .models import Issue
 from .process import CommandError, run
 
@@ -124,6 +125,7 @@ class GitHub:
     async def create_pr(self, number: int, branch: str, base: str, title: str, checks: tuple[str, ...]) -> str:
         if self.dry_run:
             return f"dry-run://pr/{number}"
+        title = redact_secrets(title)
         existing = await self.find_pr(branch)
         if existing:
             return existing
@@ -145,5 +147,6 @@ class GitHub:
         return str(items[0]["url"]) if items else ""
 
     async def comment(self, number: int, body: str) -> None:
+        body = redact_secrets(body)
         if not self.dry_run:
             await self._gh("issue", "comment", str(number), "--body", body)
