@@ -1187,6 +1187,96 @@ def test_formal_review_without_reviewer_agent_uses_review_attempt_budget(tmp_pat
     assert "formal review rejected after the allowed fix cycle" in row["last_error"]
 
 
+def test_check_failure_retries_honor_max_task_attempts_when_review_is_active(tmp_path):
+    """With review active, raising max_task_attempts above 2 extends check/agent-failure
+    retries; the review-rejection cap stays at two rejections (see the tests below)."""
+    app = make_orchestrator(tmp_path, attempts=1)
+    app.config.review_task_mode = "formal"
+    app.config.reviewer_agent = ""
+    app.config.max_task_attempts = 4
+    app.agents["worker"].execute.side_effect = CommandError("agent unavailable")
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    asyncio.run(app.process(issue, "worker"))
+
+    assert app.agents["worker"].execute.await_count == 4
+    row = app.state.rows()[0]
+    assert row["status"] == str(TaskStatus.FAILED)
+
+
+def test_review_rejection_cap_survives_larger_max_task_attempts(tmp_path, monkeypatch):
+    """A larger max_task_attempts must not extend the review fix cycle: the second
+    rejection still terminates immediately."""
+    from issue_agent.formal_review import FormalReviewResult
+
+    app = make_orchestrator(tmp_path, attempts=1)
+    app.config.review_task_mode = "formal"
+    app.config.reviewer_agent = ""
+    app.config.max_task_attempts = 4
+    calls = {"n": 0}
+
+    def rejecting_formal_review(workspace):
+        calls["n"] += 1
+        return FormalReviewResult(approved=False, reason="Forbidden file modified: .env")
+
+    monkeypatch.setattr("issue_agent.orchestrator.formal_review", rejecting_formal_review)
+    app.workspaces.changed.side_effect = [True, True]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    asyncio.run(app.process(issue, "worker"))
+
+    assert calls["n"] == 2
+    assert app.agents["worker"].execute.await_count == 2
+    app.workspaces.push.assert_not_awaited()
+    row = app.state.rows()[0]
+    assert row["status"] == str(TaskStatus.FAILED)
+    assert "formal review rejected after the allowed fix cycle" in row["last_error"]
+
+
+def test_second_review_rejection_terminates_regardless_of_attempt_index(tmp_path, monkeypatch):
+    """The two-rejection cap counts rejections, not attempt indexes: after a check
+    failure consumes attempt 1, rejections on attempts 2 and 3 still terminate on 3."""
+    from issue_agent.formal_review import FormalReviewResult
+
+    app = make_orchestrator(tmp_path, attempts=1)
+    app.config.review_task_mode = "formal"
+    app.config.reviewer_agent = ""
+    app.config.max_task_attempts = 4
+    app.config.checks = ("pytest -q",)
+    calls = {"shell": 0, "review": 0}
+
+    async def fake_shell(command: str, **kwargs: object) -> Result:
+        # call order: baseline capture, attempt-1 checks (fail), attempt-2/3 checks (pass)
+        calls["shell"] += 1
+        if calls["shell"] == 2:
+            raise CommandError("pytest failed: 1 failed")
+        return result()
+
+    def rejecting_formal_review(workspace):
+        calls["review"] += 1
+        return FormalReviewResult(approved=False, reason="Forbidden file modified: .env")
+
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
+    monkeypatch.setattr("issue_agent.orchestrator.formal_review", rejecting_formal_review)
+    app.workspaces.changed.side_effect = [True, True, True]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    asyncio.run(app.process(issue, "worker"))
+
+    assert app.agents["worker"].execute.await_count == 3
+    assert calls["review"] == 2
+    app.workspaces.push.assert_not_awaited()
+    row = app.state.rows()[0]
+    assert row["status"] == str(TaskStatus.FAILED)
+    assert "formal review rejected after the allowed fix cycle" in row["last_error"]
+
+
 def test_full_mode_without_reviewer_agent_skips_review(tmp_path, monkeypatch):
     """full mode requires an LLM reviewer; without one, review is skipped (backward compat)."""
     from issue_agent.formal_review import FormalReviewResult

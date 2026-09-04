@@ -42,6 +42,19 @@ class ReadOnlyViolation(CommandError):
     """A planner or reviewer changed the repository during a read-only run."""
 
 
+class ReviewChangesRequested(CommandError):
+    """A task review asked for changes; retryable within the task loop.
+
+    ``terminal`` carries the message for the ``ReviewRejected`` the task loop
+    raises once the allowed fix cycle (two rejections, counted across attempts)
+    is exhausted.
+    """
+
+    def __init__(self, message: str, *, terminal: str):
+        super().__init__(message)
+        self.terminal = terminal
+
+
 def review_verdict(stdout: str) -> str | None:
     """Return a review verdict only when it is the final non-empty output line."""
     lines = [line.strip() for line in stdout.splitlines() if line.strip()]
@@ -937,7 +950,8 @@ class Orchestrator:
     ) -> None:
         """Execute the per-task review according to config.review_task_mode.
 
-        Raises CommandError (retryable) or ReviewRejected (terminal) on rejection.
+        Raises CommandError (retryable) or, on rejection, ReviewChangesRequested;
+        the task loop turns the second rejection into a terminal ReviewRejected.
         """
         if not self._task_review_active():
             return
@@ -965,12 +979,11 @@ class Orchestrator:
                 verdict=verdict or "invalid",
             )
             if verdict == "VERDICT: REQUEST_CHANGES":
-                if attempt == _REVIEW_ATTEMPTS:
-                    raise ReviewRejected(
-                        "review requested changes after the allowed fix cycle:\n"
-                        f"{review.stdout[-4000:]}"
-                    )
-                raise CommandError(f"review requested changes:\n{review.stdout[-4000:]}")
+                raise ReviewChangesRequested(
+                    f"review requested changes:\n{review.stdout[-4000:]}",
+                    terminal="review requested changes after the allowed fix cycle:\n"
+                    f"{review.stdout[-4000:]}",
+                )
             if verdict != "VERDICT: APPROVE":
                 raise InvalidReviewVerdict(
                     "review returned no valid final verdict; expected "
@@ -990,11 +1003,11 @@ class Orchestrator:
                 verdict="VERDICT: APPROVE" if fr_result.approved else "VERDICT: REQUEST_CHANGES",
             )
             if not fr_result.approved:
-                if attempt == _REVIEW_ATTEMPTS:
-                    raise ReviewRejected(
-                        f"formal review rejected after the allowed fix cycle:\n{fr_result.reason}"
-                    )
-                raise CommandError(f"formal review requested changes:\n{fr_result.reason}")
+                raise ReviewChangesRequested(
+                    f"formal review requested changes:\n{fr_result.reason}",
+                    terminal="formal review rejected after the allowed fix cycle:\n"
+                    f"{fr_result.reason}",
+                )
         # mode == "off": skip review entirely
 
     async def _run_task(
@@ -1037,8 +1050,13 @@ class Orchestrator:
         # A whole-issue retry resets the worktree to the anchor, so seed the
         # first attempt with the last recorded task failure.
         last_error = self.state.plan_task_last_error(issue.number, seq)
-        attempt_limit = (
-            _REVIEW_ATTEMPTS if self._task_review_active() else self.config.max_task_attempts
+        review_rejections = 0
+        # Review-active modes guarantee the one fix cycle (2 attempts) the review
+        # cap needs; a larger max_task_attempts extends check/agent-failure retries
+        # without ever extending the review fix cycle (see ReviewChangesRequested).
+        attempt_limit = max(
+            self.config.max_task_attempts,
+            _REVIEW_ATTEMPTS if self._task_review_active() else 0,
         )
         for attempt in range(1, attempt_limit + 1):
             issue_log.event("task_attempt_started", sequence=seq, attempt=attempt)
@@ -1088,6 +1106,19 @@ class Orchestrator:
                 )
                 issue_log.event("task_completed", sequence=seq, attempt=attempt)
                 return
+            except ReviewChangesRequested as exc:
+                review_rejections += 1
+                last_error = str(exc)
+                issue_log.event("task_attempt_failed", sequence=seq, attempt=attempt, error=last_error)
+                if review_rejections >= _REVIEW_ATTEMPTS:
+                    last_error = exc.terminal
+                    self.state.update_plan_task(
+                        issue.number, seq, status=TaskStatus.PENDING, last_error=last_error
+                    )
+                    self.state.update(
+                        issue.number, TaskStatus.FAILED, current_seq=-1, last_error=last_error
+                    )
+                    raise ReviewRejected(exc.terminal) from exc
             except CommandError as exc:
                 last_error = str(exc)
                 issue_log.event("task_attempt_failed", sequence=seq, attempt=attempt, error=last_error)
