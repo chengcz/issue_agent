@@ -1456,6 +1456,68 @@ def test_worker_session_is_reused_when_resume_command_is_configured(tmp_path):
     assert execute.await_args_list[1].kwargs["session_id"] == "thread-4"
 
 
+def test_failed_resumed_call_clears_session_so_next_attempt_starts_fresh(tmp_path):
+    """A dead/expired session must not poison every retry: after a resumed call
+    fails, the stored session is dropped and the next call starts fresh."""
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    execute = AsyncMock(
+        side_effect=[
+            Result(0, "ok", "", usage={"session_id": "thread-4"}),
+            CommandError("resume failed: session not found"),
+            Result(0, "ok", ""),
+        ]
+    )
+    app.agents["worker"] = SimpleNamespace(
+        config=SimpleNamespace(
+            resume_command=("worker", "resume", "{session_id}"),
+            review_resume_command=None,
+        ),
+        execute=execute,
+    )
+
+    asyncio.run(app._execute_agent("worker", tmp_path, "first", issue_number=4))
+    with pytest.raises(CommandError):
+        asyncio.run(app._execute_agent("worker", tmp_path, "second", issue_number=4))
+    asyncio.run(app._execute_agent("worker", tmp_path, "third", issue_number=4))
+
+    assert execute.await_args_list[1].kwargs["session_id"] == "thread-4"
+    assert "session_id" not in execute.await_args_list[2].kwargs
+    assert app.state.load_session(4, "worker", "worker") == ""
+
+
+def test_failed_resumed_review_call_clears_reviewer_session(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_session(4, "reviewer", "reviewer", "thread-9")
+    execute = AsyncMock(side_effect=[CommandError("resume failed"), result(APPROVE)])
+    app.agents["reviewer"] = SimpleNamespace(
+        config=SimpleNamespace(
+            resume_command=None,
+            review_resume_command=("reviewer", "resume", "{session_id}"),
+        ),
+        execute=execute,
+    )
+
+    with pytest.raises(CommandError):
+        asyncio.run(
+            app._execute_read_only(
+                "reviewer", tmp_path, "review", role="task reviewer", issue_number=4
+            )
+        )
+    asyncio.run(
+        app._execute_read_only(
+            "reviewer", tmp_path, "review", role="task reviewer", issue_number=4
+        )
+    )
+
+    assert execute.await_args_list[0].kwargs["session_id"] == "thread-9"
+    assert "session_id" not in execute.await_args_list[1].kwargs
+    assert app.state.load_session(4, "reviewer", "reviewer") == ""
+
+
 def test_failed_issue_requeues_with_configured_ready_label(tmp_path):
     app = make_orchestrator(tmp_path)
     app.config.ready_label = "automation-ready"

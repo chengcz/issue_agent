@@ -587,6 +587,7 @@ class Orchestrator:
                 )
         if await self.workspaces.status(workspace):
             raise CommandError(f"cannot start read-only {role}: workspace is not clean")
+        session_id = ""
         try:
             session_id = self._resume_session(issue_number, agent_name, role)
             if session_id:
@@ -596,6 +597,10 @@ class Orchestrator:
             else:
                 result = await self.agents[agent_name].execute(workspace, prompt, review=True)
         except Exception as exc:
+            if session_id and issue_number is not None and isinstance(exc, CommandError):
+                # A failed resumed call must not poison the next attempt: drop
+                # the stored session so the retry starts a fresh one.
+                self.state.clear_session(issue_number, agent_name, self._session_role(role))
             if issue_number is not None and isinstance(exc, CommandError):
                 failed_result = exc.result or Result(
                     1, "", "", duration_ms=exc.duration_ms
@@ -657,6 +662,7 @@ class Orchestrator:
         role: str = "worker",
     ):
         """Run one coding-agent invocation under that agent's own limit."""
+        session_id = ""
         try:
             async with self.agent_limits[agent_name]:
                 session_id = self._resume_session(issue_number, agent_name, role)
@@ -667,6 +673,10 @@ class Orchestrator:
                 else:
                     result = await self.agents[agent_name].execute(workspace, prompt)
         except CommandError as exc:
+            if session_id and issue_number is not None:
+                # A failed resumed call must not poison the next attempt: drop
+                # the stored session so the retry starts a fresh one.
+                self.state.clear_session(issue_number, agent_name, self._session_role(role))
             failed_result = exc.result or Result(1, "", "", duration_ms=exc.duration_ms)
             self._log_agent_call(
                 issue_log,

@@ -569,6 +569,19 @@ class StateStore:
                 (issue_number, agent, role, session_id, datetime.now(UTC).isoformat()),
             )
 
+    def clear_session(self, issue_number: int, agent: str, role: str) -> None:
+        """Drop a stored session so the next call starts a fresh one.
+
+        Used when a resumed call fails: the stored session may be expired or
+        corrupt, and retrying against it would fail identically until a human
+        resets the issue.
+        """
+        with self.connect() as db:
+            db.execute(
+                "DELETE FROM agent_sessions WHERE issue_number=? AND agent=? AND role=?",
+                (issue_number, agent, role),
+            )
+
     def rows(self) -> list[dict[str, object]]:
         with self.connect() as db:
             return [dict(row) for row in db.execute("SELECT * FROM tasks ORDER BY updated_at DESC")]
