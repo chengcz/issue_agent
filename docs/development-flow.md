@@ -62,7 +62,9 @@ flowchart TD
     ReviewGuard -->|APPROVE| TaskDone
     TaskDone --> MoreTasks{还有未完成任务?}
     MoreTasks -->|是| TaskLoop
-    MoreTasks -->|否| FinalReviewer{配置 Reviewer?}
+    MoreTasks -->|否| FinalReuse{已有同 commit 的终审通过记录?}
+    FinalReuse -->|是| PushState
+    FinalReuse -->|否| FinalReviewer{配置 Reviewer?}
     FinalReviewer -->|是| FinalReview[整分支只读 Review]
     FinalReviewer -->|否| FinalChecks
 
@@ -99,6 +101,8 @@ flowchart TD
   无限重试。
 - 每个完成的 Plan 任务保存 commit hash。失败重试先回到最近完成任务的 commit，并将该任务最后一次
   错误重新提供给实现 Agent。
+- 终审通过后持久化已批准的 commit；push/PR 失败的重试在同一 commit 上复用该结果（跳过重审与
+  完整 checks），commit 变化则重新终审。
 - push 和 PR 创建只由 orchestrator 执行；编码 Agent、Planner 与 Reviewer 的 prompt 均禁止执行
   GitHub、merge、部署、迁移、secrets 等外部操作。
 
