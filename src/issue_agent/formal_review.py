@@ -102,6 +102,18 @@ def _scan_forbidden_files(files: list[str]) -> str | None:
     return None
 
 
+def redact_secrets(text: str) -> str:
+    """Replace secret-pattern matches with markers before text reaches GitHub.
+
+    Used at the comment/PR boundary: failure reports and review output may quote
+    secrets that already leaked into a diff, and echoing them into comments would
+    widen the exposure.
+    """
+    for label, pattern in _SECRET_PATTERNS:
+        text = pattern.sub(f"[REDACTED {label}]", text)
+    return text
+
+
 def formal_review(workspace: Path) -> FormalReviewResult:
     """Run all deterministic formal checks on the last commit in *workspace*.
 
