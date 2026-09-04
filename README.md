@@ -302,6 +302,8 @@ review_command = "claude -p --model sonnet --permission-mode plan --output-forma
   显示为 TOKENS（输入+输出合计，k/M 紧凑格式）、COST、TIME 三列。
 - SQLite 的 `issue_runs`、`agent_calls` 与扩展后的 `plan_tasks` 保存逐次运行、调用以及每个 task 的
   明细；配置 `resume_command` / `review_resume_command` 后，同一 Issue 会复用对应角色的 session。
+  resumed 调用失败（会话过期/损坏）时自动清除存储的 session，下一次尝试降级为全新会话，
+  不会反复撞同一个死会话耗尽预算。
 
 Issue 标签示例：
 
