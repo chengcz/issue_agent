@@ -161,6 +161,7 @@ cp issue-agent.example.toml issue-agent.toml
 ```bash
 REPO="chengcz/bioagent"   # 换成编排器实际操作的目标仓库
 labels=(
+  "agent-planned|7057ff|Plan published; awaiting human approval"
   "agent-ready|0e8a16|Ready for coding-agent implementation"
   "agent-running|1d76db|Implementation in progress"
   "agent-failed|d73a4a|Agent run failed"
