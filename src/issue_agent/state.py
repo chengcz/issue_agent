@@ -610,8 +610,14 @@ class StateStore:
         with self.connect() as db:
             return [dict(row) for row in db.execute(sql, parameters)]
 
-    def recover_interrupted(self) -> int:
-        """Make work interrupted by a process restart claimable again."""
+    def recover_interrupted(self, max_attempts: int = 3) -> int:
+        """Make work interrupted by a process restart claimable again.
+
+        Each interruption consumes one unit of the whole-issue failure budget, so
+        an issue that reproducibly crashes the orchestrator eventually parks as
+        FAILED (claimable only via a human ``reset``) instead of burning tokens
+        on every restart.
+        """
         now_dt = datetime.now(UTC)
         now = now_dt.isoformat()
         placeholders = ",".join("?" for _ in _ACTIVE)
@@ -646,16 +652,25 @@ class StateStore:
                     (duration, now, task["issue_number"], task["seq"]),
                 )
             planning = db.execute(
-                "UPDATE tasks SET status=?, last_error=?, updated_at=? WHERE status=?",
-                (str(TaskStatus.PENDING), "orchestrator restarted during planning", now, str(TaskStatus.PLANNING)),
+                "UPDATE tasks SET failures=failures+1, updated_at=?,"
+                " status=CASE WHEN failures+1>=? THEN ? ELSE ? END, last_error=?"
+                " WHERE status=?",
+                (
+                    now, max_attempts, str(TaskStatus.FAILED), str(TaskStatus.PENDING),
+                    "orchestrator restarted during planning", str(TaskStatus.PLANNING),
+                ),
             )
             resumed = db.execute(
-                f"UPDATE tasks SET status=?, last_error=?, updated_at=? "
-                f"WHERE status IN ({placeholders}) AND plan IS NOT NULL AND plan != ''",
-                (str(TaskStatus.PLANNED), "orchestrator restarted while task was active", now, *active),
+                f"UPDATE tasks SET failures=failures+1, updated_at=?,"
+                f" status=CASE WHEN failures+1>=? THEN ? ELSE ? END, last_error=?"
+                f" WHERE status IN ({placeholders}) AND plan IS NOT NULL AND plan != ''",
+                (
+                    now, max_attempts, str(TaskStatus.FAILED), str(TaskStatus.PLANNED),
+                    "orchestrator restarted while task was active", *active,
+                ),
             )
             failed = db.execute(
-                f"UPDATE tasks SET status=?, last_error=?, updated_at=? "
+                f"UPDATE tasks SET failures=failures+1, status=?, last_error=?, updated_at=? "
                 f"WHERE status IN ({placeholders}) AND (plan IS NULL OR plan = '')",
                 (str(TaskStatus.FAILED), "orchestrator restarted while task was active", now, *active),
             )

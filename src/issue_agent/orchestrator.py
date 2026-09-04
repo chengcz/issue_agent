@@ -224,7 +224,7 @@ class Orchestrator:
         return self.state.load_session(issue_number, agent_name, self._session_role(role))
 
     def recover(self) -> int:
-        return self.state.recover_interrupted()
+        return self.state.recover_interrupted(self.config.max_attempts)
 
     def select_agent(self, issue: Issue) -> str:
         requested = next((x.split(":", 1)[1] for x in issue.labels if x.startswith("agent:")), "")
