@@ -32,6 +32,13 @@ baseline_cache_max_entries = 32
 # Run multiple check commands concurrently; set false if they contend in the worktree.
 parallel = true
 
+# Per-task review mode. formal (default): deterministic secrets/forbidden-file/empty-diff
+# checks, no LLM calls; full: read-only LLM review of each task commit via reviewer_agent;
+# off: skip per-task review. The final whole-branch review always runs when reviewer_agent
+# is configured, regardless of this setting.
+[review]
+task_mode = "formal"
+
 # CodeGraph (form B): when the target repo's main checkout has a .codegraph/ index,
 # planner/worker/reviewer prompts gain a guidance block pointing agents at the
 # codegraph MCP tools (or read-only CLI). The index is user-maintained:
