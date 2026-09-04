@@ -7,7 +7,9 @@
 
 ```mermaid
 flowchart TD
-    Start[once / serve 启动] --> Recover[恢复被中断的 SQLite 状态]
+    Start[once / serve 启动] --> Preflight{必需 labels 都存在?<br/>dry_run 时跳过}
+    Preflight -->|否| PreflightFail[打印 gh label create 指引<br/>退出码 1，不启动 worker]
+    Preflight -->|是| Recover[恢复被中断的 SQLite 状态]
     Recover --> Poll[拉取 agent-ready、agent-running<br/>以及可选的无 agent-* Issue]
 
     Poll --> Kind{Issue 类型}
