@@ -7,8 +7,9 @@ import logging
 import sys
 
 from .config import load_config
-from .github import GitHub
+from .github import GitHub, required_label_specs
 from .orchestrator import Orchestrator
+from .process import CommandError
 from .state import StateStore
 
 # Task statuses that are safe to reset. Running statuses are excluded so an
@@ -181,6 +182,41 @@ async def reset_issue(config, issue_number: int, *, no_label: bool) -> int:
     return 0
 
 
+async def preflight_labels(config) -> int:
+    """Fail fast when the GitHub repo lacks labels the orchestrator applies.
+
+    Prints paste-ready ``gh label create`` guidance for every missing label and
+    returns a non-zero exit code so no worker starts against a repo where claim,
+    requeue, park, and hand-off transitions would fail mid-run. ``dry_run`` skips
+    the check; a failing ``gh`` call (not logged in, unreachable repo) warns and
+    also refuses to start.
+    """
+    if config.dry_run:
+        return 0
+    github = GitHub(config.github_repo, config.repo)
+    specs = required_label_specs(config.ready_label, config.agents)
+    try:
+        existing = await github.label_names()
+    except (CommandError, ValueError) as exc:
+        print(f"warning: cannot verify GitHub labels: {exc}", file=sys.stderr)
+        print(
+            "warning: refusing to start; check 'gh auth status' and the github.repo setting",
+            file=sys.stderr,
+        )
+        return 1
+    missing = [name for name in specs if name not in existing]
+    if not missing:
+        return 0
+    print("error: GitHub repo is missing labels required by issue-agent:", file=sys.stderr)
+    for name in missing:
+        color, description = specs[name]
+        print(
+            f'  gh label create "{name}" --color {color} --description "{description}"',
+            file=sys.stderr,
+        )
+    return 1
+
+
 async def async_main(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     if args.command == "status":
@@ -193,6 +229,10 @@ async def async_main(args: argparse.Namespace) -> int:
         return 0
     if args.command == "reset":
         return await reset_issue(config, args.issue, no_label=args.no_label)
+
+    exit_code = await preflight_labels(config)
+    if exit_code:
+        return exit_code
 
     app = Orchestrator(config)
     recovered = app.recover()

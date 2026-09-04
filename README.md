@@ -308,6 +308,12 @@ Issue 标签示例：
 - `resource:database-schema`：全局串行，避免 Alembic 多头迁移。
 - `agent-planned`、`agent-running`、`agent-failed`、`human-review`：由调度器维护。
 
+`serve`/`once` 启动时会先预检必需标签是否已在目标仓库创建：配置的 `ready_label`、四个调度器
+维护标签，以及每个启用 Agent 对应的 `agent:<name>` 路由标签。缺失时拒绝启动，并按缺失清单
+输出可直接执行的 `gh label create "<name>" --color ... --description ...` 命令；`gh` 未登录或
+仓库不可达时同样输出警告并退出。`dry_run = true` 时跳过该检查。`resource:database-schema`
+等用户侧提示标签属可选，不在预检范围内。
+
 ### 为不同任务使用不同 Claude 模型
 
 可以为每个 Claude 模型定义一个独立的 Agent 名称。实现命令使用目标模型，`review_command`
