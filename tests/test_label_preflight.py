@@ -107,6 +107,20 @@ def test_preflight_labels_prints_create_commands_for_missing_labels(tmp_path, mo
         assert "--color" in err and "--description" in err
 
 
+def test_preflight_labels_notices_repo_fallback_when_github_repo_unset(tmp_path, monkeypatch, capsys):
+    from issue_agent.cli import preflight_labels
+
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text(CONFIG_TEMPLATE.format(dry_run="false").replace('repo = "a/b"', 'repo = ""'))
+    config = load_config(config_file)
+    existing = [{"name": name} for name in ("go-agent", *ORCHESTRATOR_LABELS, "agent:codex")]
+    monkeypatch.setattr("issue_agent.github.run", fake_label_run(json.dumps(existing), []))
+    assert asyncio.run(preflight_labels(config)) == 0
+    err = capsys.readouterr().err
+    assert "notice" in err.lower()
+    assert "github.repo" in err
+
+
 def test_preflight_labels_skips_github_in_dry_run(tmp_path, monkeypatch, capsys):
     from issue_agent.cli import preflight_labels
 

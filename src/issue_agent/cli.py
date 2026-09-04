@@ -193,6 +193,12 @@ async def preflight_labels(config) -> int:
     """
     if config.dry_run:
         return 0
+    if not config.github_repo:
+        print(
+            f"notice: github.repo is not set; verifying labels against the git "
+            f"remote of {config.repo}",
+            file=sys.stderr,
+        )
     github = GitHub(config.github_repo, config.repo)
     specs = required_label_specs(config.ready_label, config.agents)
     try:
