@@ -109,10 +109,23 @@ class CliAgent:
         command = resume if session_id and resume else (
             self.config.review_command if review and self.config.review_command else self.config.command
         )
-        rendered = [
-            part.replace("{prompt}", prompt).replace("{session_id}", session_id)
-            for part in command
-        ]
+        rendered: list[str] = []
+        for part in command:
+            value = part.replace("{prompt}", prompt).replace("{session_id}", session_id)
+            if (
+                value != part
+                and part.strip() in ("{prompt}", "{session_id}")
+                and value.startswith("-")
+            ):
+                # Untrusted text (issue bodies, agent-reported session ids) must
+                # not become a flag-like standalone argv element for the target
+                # CLI. Embedded forms like --prompt={prompt} stay allowed.
+                raise CommandError(
+                    f"refusing to pass a value starting with '-' as a standalone "
+                    f"{part.strip()} argument; embed it (e.g. --prompt={{prompt}}) "
+                    "or rely on stdin instead"
+                )
+            rendered.append(value)
         has_placeholder = any("{prompt}" in part for part in command)
         try:
             result = await run(
