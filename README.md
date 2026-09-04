@@ -346,6 +346,8 @@ Issue 添加 `agent:claude_opus` 或 `agent:claude_sonnet` 后，编排器会选
 如果需要按 Issue 选择 Reviewer，可约定 `reviewer:<name>` 标签，例如
 `reviewer:claude_sonnet`，并扩展调度器读取该标签；没有标签时回退到全局
 `reviewer_agent`。Review 命令应使用只读的 `--permission-mode plan`，避免 Reviewer 修改工作区。
+注意编排器的只读守护基于 `git status`，不覆盖 gitignored 文件（`.venv`、缓存等 ignored 状态的
+改动不会触发恢复）——CLI 自身的只读模式是主防线，守护只是兜底。
 
 ### 任务级审查模式
 
