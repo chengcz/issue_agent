@@ -71,6 +71,14 @@ def test_required_label_specs_cover_ready_orchestrator_and_agent_routes():
     assert "codex" in specs["agent:codex"][1]
 
 
+def test_ready_label_collision_keeps_orchestrator_spec():
+    from issue_agent import github
+
+    specs = github.required_label_specs("agent-running", [])
+    assert len(specs) == 4
+    assert specs["agent-running"] == github.ORCHESTRATOR_LABELS["agent-running"]
+
+
 def test_preflight_labels_passes_when_every_required_label_exists(tmp_path, monkeypatch, capsys):
     from issue_agent.cli import preflight_labels
 
