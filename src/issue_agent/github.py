@@ -2,10 +2,40 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterable
 from pathlib import Path
 
 from .models import Issue
 from .process import CommandError, run
+
+# Labels the orchestrator applies itself, with recommended colors and
+# descriptions used to generate `gh label create` guidance at startup.
+ORCHESTRATOR_LABELS: dict[str, tuple[str, str]] = {
+    "agent-running": ("fbca04", "Currently being processed by the coding agent"),
+    "agent-planned": ("1d76db", "Plan published; awaiting human approval"),
+    "agent-failed": ("d73a46", "Agent run failed or parked; needs human action"),
+    "human-review": ("5319e7", "Pull request awaits human review"),
+}
+_READY_LABEL_SPEC = ("0e8a16", "Ready for the coding agent to claim")
+_AGENT_ROUTE_COLOR = "c5def5"
+
+
+def required_label_specs(
+    ready_label: str, agent_names: Iterable[str]
+) -> dict[str, tuple[str, str]]:
+    """Every label the orchestrator applies, mapped to a suggested (color, description).
+
+    Covers the configured ready label, the four orchestrator-maintained workflow
+    labels, and one ``agent:<name>`` routing label per enabled agent. User-side
+    hint labels (e.g. ``resource:database-schema``) are optional and not listed.
+    """
+    specs = {ready_label: _READY_LABEL_SPEC, **ORCHESTRATOR_LABELS}
+    for name in agent_names:
+        specs[f"agent:{name}"] = (
+            _AGENT_ROUTE_COLOR,
+            f"Route this Issue to the '{name}' agent",
+        )
+    return specs
 
 
 class GitHub:
@@ -64,6 +94,21 @@ class GitHub:
             self.ready_issues("agent-running", limit),
         )
         return list({issue.number: issue for issue in (*issues, *interrupted)}.values())
+
+    async def label_names(self) -> set[str]:
+        """All label names defined in the repository (single read-only call).
+
+        ``--limit 500`` caps one page; repositories with more than 500 labels
+        would need pagination, which is out of scope for the startup preflight.
+        Malformed entries (no ``name`` key) raise ``ValueError`` so callers can
+        treat them like any other verification failure.
+        """
+        output = await self._gh("label", "list", "--json", "name", "--limit", "500")
+        items = json.loads(output)
+        names = {item.get("name") for item in items}
+        if not all(isinstance(name, str) for name in names):
+            raise ValueError("unexpected 'gh label list' payload: label entries missing 'name'")
+        return set(names)
 
     async def labels(self, number: int, *, add: tuple[str, ...] = (), remove: tuple[str, ...] = ()) -> None:
         if self.dry_run:
