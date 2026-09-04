@@ -94,7 +94,9 @@ flowchart TD
 ## 持久化顺序原则
 
 - 领取、规划、编码、测试、Review、push 和人审状态均先写入 SQLite，再执行对应的 GitHub Label
-  变化；进程重启后依靠 SQLite 与残留的 `agent-running` 标签恢复。
+  变化；进程重启后依靠 SQLite 与残留的 `agent-running` 标签恢复。崩溃中断会计入该 Issue 的
+  失败预算（每次恢复 `failures` +1），预算耗尽即搁置等待 `reset`，防止可复现崩溃的 Issue
+  无限重试。
 - 每个完成的 Plan 任务保存 commit hash。失败重试先回到最近完成任务的 commit，并将该任务最后一次
   错误重新提供给实现 Agent。
 - push 和 PR 创建只由 orchestrator 执行；编码 Agent、Planner 与 Reviewer 的 prompt 均禁止执行
