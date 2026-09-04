@@ -104,6 +104,9 @@ flowchart TD
 
 - Planner 开始前工作区会回到 `origin/<base_branch>`；Planner 或 Reviewer 如果产生 tracked 或
   non-ignored untracked 改动，orchestrator 会恢复到安全 commit 并将本轮标记失败。
+- 只读守护不覆盖 gitignored 文件：`.venv`、构建缓存、被 ignore 的 `.env` 等 ignored 状态的改动
+  不会触发恢复。主防线是 Planner/Review 命令自身的只读模式（如 `--permission-mode plan`、
+  只读 sandbox），git status 守护只是兜底。
 - 任务级审查按 `review.task_mode` 分档：`formal`（默认）为确定性检查（diff 中 secrets 模式、
   禁改文件、空 commit），零 LLM 调用且不依赖 Reviewer 配置；`full` 为 LLM 只读深度 Review；
   `off` 跳过。git 基础设施故障（如 worktree 损坏）以可重试错误处理，参与任务内返修循环。
