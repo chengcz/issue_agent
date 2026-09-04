@@ -81,10 +81,11 @@ flowchart TD
     FailureBudget -->|否| Requeue[添加 agent-failed 和 agent-ready]
     FailureBudget -->|是| Park[添加 agent-failed，等待 reset]
     PlanFailureBudget -->|否| Poll
-    PlanFailureBudget -->|是| Park
+    PlanFailureBudget -->|是| PlanPark[保持无 agent-* 标签<br/>拒绝再次领取，等待 reset]
     ManualReview --> Park
     Requeue --> Poll
     Park --> Reset[人工 issue-agent reset]
+    PlanPark --> Reset
     Reset --> Poll
 ```
 
