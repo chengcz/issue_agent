@@ -93,6 +93,9 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
 - 通过后再完整执行一遍 `checks.commands`，若仍产生改动则再提交。
 - 最终修复后 checks 已通过且只读 Reviewer 未改变 HEAD 时，复用该结果，不对同一 commit 连续执行
   两次完整 checks。
+- finalize 通过后记录**已批准的 commit**（`final_approved_commit`）：push/PR 失败后的重试只要
+  HEAD 未变化就跳过终审与完整 checks（执行日志事件 `final_review_reused`），直接重新 push；
+  HEAD 变化则必定重新终审。
 
 ### Push 与 PR
 

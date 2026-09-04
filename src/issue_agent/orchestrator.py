@@ -438,13 +438,30 @@ class Orchestrator:
                 final_commit=final_commit if start_seq == len(plan) else None,
             )
             self.state.update(issue.number, TaskStatus.PLANNED, current_seq=start_seq)
-            baseline = await self._capture_baseline(workspace, issue_number=issue.number)
+            # A push/PR-failure retry resets to the very commit finalize already
+            # approved: reuse that result instead of re-reviewing identical work.
+            # Without an approved record the head probe is skipped entirely, so
+            # first runs keep the historical git call sequence.
+            approved = self.state.final_approved_commit(issue.number)
+            head = await self.workspaces.head_commit(workspace) if approved else ""
+            reuse_final = bool(approved) and approved == head and start_seq == len(plan)
+            baseline: dict[str, CheckBaseline] = (
+                {}
+                if reuse_final
+                else await self._capture_baseline(workspace, issue_number=issue.number)
+            )
             self.workspaces.write_plan_file(workspace, plan)
 
             for seq in range(start_seq, len(plan)):
                 await self._run_task(workspace, issue, plan, seq, agent_name, issue_log, baseline)
 
-            await self._finalize(workspace, issue, plan, agent_name, issue_log, baseline)
+            if reuse_final:
+                issue_log.event("final_review_reused", commit=head)
+            else:
+                await self._finalize(workspace, issue, plan, agent_name, issue_log, baseline)
+                self.state.set_final_approved(
+                    issue.number, await self.workspaces.head_commit(workspace)
+                )
             self.state.update(issue.number, TaskStatus.PUSHING, current_seq=-1)
             issue_log.event("push_started", branch=branch)
             await self.workspaces.push(workspace, branch, dry_run=self.config.dry_run)

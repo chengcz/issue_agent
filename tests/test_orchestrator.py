@@ -630,7 +630,9 @@ def test_final_review_retry_resumes_from_final_fix_commit(tmp_path):
         result(APPROVE),
     ]
     app.workspaces.changed.side_effect = [True, True, False]
-    app.workspaces.head_commit.side_effect = ["task111", "final222"]
+    # heads: task-1 commit, final-fix commit, and the approval probe after the
+    # retry's finalize (HEAD stays at the final-fix commit)
+    app.workspaces.head_commit.side_effect = ["task111", "final222", "final222"]
     issue = Issue(4, "Task", "Body")
     app.state.claim(issue, "worker")
     app.state.save_plan(4, [PlanTask("One", "D")])
@@ -1516,6 +1518,47 @@ def test_failed_resumed_review_call_clears_reviewer_session(tmp_path):
     assert execute.await_args_list[0].kwargs["session_id"] == "thread-9"
     assert "session_id" not in execute.await_args_list[1].kwargs
     assert app.state.load_session(4, "reviewer", "reviewer") == ""
+
+
+def test_push_failure_retry_reuses_approved_final_review(tmp_path):
+    """A push-failure retry lands on the same approved commit: finalize (final review +
+    full checks) must be reused, not re-run, while HEAD matches."""
+    app = make_orchestrator(tmp_path)
+    app.workspaces.push.side_effect = [CommandError("push failed"), None]
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    run_process(app, issue)
+    assert app.state.rows()[0]["status"] == str(TaskStatus.FAILED)
+    reviewer_calls = app.agents["reviewer"].execute.await_count
+    worker_calls = app.agents["worker"].execute.await_count
+
+    assert app.state.claim(issue, "worker")
+    asyncio.run(app.process(issue, "worker"))
+
+    assert app.state.rows()[0]["status"] == str(TaskStatus.HUMAN_REVIEW)
+    assert app.agents["reviewer"].execute.await_count == reviewer_calls
+    assert app.agents["worker"].execute.await_count == worker_calls
+    assert app.workspaces.push.await_count == 2
+    execution_log = (tmp_path / "logs" / "issue-4.jsonl").read_text(encoding="utf-8")
+    assert "final_review_reused" in execution_log
+
+
+def test_final_review_reruns_when_head_differs_from_approved_commit(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+    app.state.update_plan_task(4, 0, status=TaskStatus.DONE, commit_hash="abc1234")
+    app.state.set_final_approved(4, "stale000")
+
+    run_process(app, issue)
+
+    assert app.state.rows()[0]["status"] == str(TaskStatus.HUMAN_REVIEW)
+    assert app.state.final_approved_commit(4) == "abc1234"
+    prompts = [call.args[1] for call in app.agents["reviewer"].execute.await_args_list]
+    assert any("complete implementation" in prompt for prompt in prompts)
 
 
 def test_failed_issue_requeues_with_configured_ready_label(tmp_path):

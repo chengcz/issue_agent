@@ -35,7 +35,7 @@ class StateStore:
                 agent TEXT, branch TEXT, worktree TEXT, attempts INTEGER NOT NULL DEFAULT 0,
                 failures INTEGER NOT NULL DEFAULT 0, last_error TEXT, pr_url TEXT, plan TEXT,
                 current_seq INTEGER NOT NULL DEFAULT -1, final_commit_hash TEXT,
-                final_last_error TEXT,
+                final_last_error TEXT, final_approved_commit TEXT,
                 total_input_tokens INTEGER NOT NULL DEFAULT 0,
                 total_output_tokens INTEGER NOT NULL DEFAULT 0,
                 total_cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -79,6 +79,7 @@ class StateStore:
                 ("total_wall_duration_ms", "INTEGER NOT NULL DEFAULT 0"),
                 ("started_at", "TEXT"),
                 ("finished_at", "TEXT"),
+                ("final_approved_commit", "TEXT"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
@@ -334,6 +335,26 @@ class StateStore:
                 f"UPDATE tasks SET {sql} WHERE issue_number=?",
                 (*fields.values(), issue_number),
             )
+
+    def set_final_approved(self, issue_number: int, commit: str) -> None:
+        """Record the commit whose whole-branch finalize passed, enabling reuse.
+
+        A push/PR-failure retry that resets to this exact commit skips the final
+        review and full checks; any other HEAD always re-runs finalize.
+        """
+        with self.connect() as db:
+            db.execute(
+                "UPDATE tasks SET final_approved_commit=? WHERE issue_number=?",
+                (commit, issue_number),
+            )
+
+    def final_approved_commit(self, issue_number: int) -> str:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT final_approved_commit FROM tasks WHERE issue_number=?",
+                (issue_number,),
+            ).fetchone()
+        return str(row["final_approved_commit"]) if row and row["final_approved_commit"] else ""
 
     def accumulate_usage(
         self, issue_number: int, usage: dict[str, object] | None, *, duration_ms: int | None
