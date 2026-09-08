@@ -23,6 +23,7 @@ from .github import GitHub
 from .issue_log import IssueLog
 from .models import Issue, PlanTask, TaskStatus
 from .process import CommandError, Result
+from .schedule import ScheduleConfig
 from .state import StateStore
 from .workspace import WorkspaceManager
 
@@ -233,7 +234,32 @@ class Orchestrator:
             raise ValueError(f"unknown or disabled agent: {name}")
         return name
 
+    def _schedule_allows(self) -> bool:
+        allowed = getattr(self.config, "schedule", ScheduleConfig()).allows()
+        previous = getattr(self, "_schedule_open", None)
+        if allowed != previous:
+            if not allowed:
+                log.info("execution window closed; skipping new tasks (schedule)")
+            elif previous is False:
+                log.info("execution window open; accepting new tasks")
+            self._schedule_open = allowed
+        return allowed
+
+    def _eligible(self, row, *, planning: bool = False) -> bool:
+        # Read-only prefilter prevents completed/parked candidates from repeatedly
+        # waking serve. The transactional claim remains authoritative at admission.
+        if row is None:
+            return True
+        status = row["status"]
+        if status in (str(TaskStatus.FAILED), str(TaskStatus.BLOCKED)):
+            return int(row["failures"]) < self.config.max_attempts
+        if planning:
+            return status == str(TaskStatus.PENDING) and not row["plan"]
+        return status in (str(TaskStatus.PENDING), str(TaskStatus.PLANNED))
+
     async def run_once(self) -> None:
+        if not self._schedule_allows():
+            return
         runnable_call = self.github.runnable_issues(self.config.ready_label)
         if self.config.auto_plan_unlabeled:
             runnable, planning = await asyncio.gather(
@@ -258,7 +284,7 @@ class Orchestrator:
             except ValueError as exc:
                 log.error("issue #%s: %s", issue.number, exc)
                 continue
-            if not self.state.claim(issue, agent_name, self.config.max_attempts):
+            if not self._eligible(row):
                 continue
             self._track(issue.number, self._guarded_process(issue, agent_name))
 
@@ -269,10 +295,7 @@ class Orchestrator:
         for issue in planning:
             if issue.number in self.running:
                 continue
-            recorded_agent = planner_name or self.config.default_agent
-            if not self.state.claim_for_planning(
-                issue, recorded_agent, self.config.max_attempts
-            ):
+            if not self._eligible(persisted.get(issue.number), planning=True):
                 continue
             self._track(issue.number, self._guarded_plan_only(issue, planner_name))
 
@@ -313,14 +336,23 @@ class Orchestrator:
     async def _guarded_process(self, issue: Issue, agent_name: str) -> None:
         if "resource:database-schema" in issue.labels:
             async with self.database_lock, self.global_limit:
-                await self.process(issue, agent_name)
+                await self._admit_process(issue, agent_name)
         else:
             async with self.global_limit:
-                await self.process(issue, agent_name)
+                await self._admit_process(issue, agent_name)
+
+    async def _admit_process(self, issue: Issue, agent_name: str) -> None:
+        if self._schedule_allows() and self.state.claim(
+            issue, agent_name, self.config.max_attempts
+        ):
+            await self.process(issue, agent_name)
 
     async def _guarded_plan_only(self, issue: Issue, planner_name: str) -> None:
         async with self.global_limit:
-            await self.plan_only(issue)
+            if self._schedule_allows() and self.state.claim_for_planning(
+                issue, planner_name or self.config.default_agent, self.config.max_attempts
+            ):
+                await self.plan_only(issue)
 
     async def plan_only(self, issue: Issue) -> None:
         """Create and publish a plan, then wait for the configured ready label."""

@@ -16,6 +16,21 @@ auto_plan_unlabeled = true
 auto_plan_limit = 20
 dry_run = false
 
+# Optional weekly admission windows (uncomment to enable; restart after editing).
+# No allow rules means all times are allowed except deny rules; deny wins overlaps.
+# Omitted days means every day; overnight windows belong to their starting weekday.
+# Already started Issues finish even after the window closes.
+# [schedule]
+# timezone = "Asia/Shanghai" # Omit to use the system local timezone.
+# [[schedule.deny]]
+# days = ["mon", "tue", "wed", "thu", "fri"]
+# start = "09:00"
+# end = "18:00"
+# Alternatively, allow only nights every day:
+# [[schedule.allow]]
+# start = "18:00"
+# end = "09:00"
+
 [github]
 repo = "OWNER/REPO"
 base_branch = "main"

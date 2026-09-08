@@ -236,6 +236,12 @@ async def async_main(args: argparse.Namespace) -> int:
     if args.command == "reset":
         return await reset_issue(config, args.issue, no_label=args.no_label)
 
+    if args.command == "once" and not config.schedule.allows():
+        logging.getLogger(__name__).info(
+            "execution window closed; skipping new tasks (schedule)"
+        )
+        return 0
+
     exit_code = await preflight_labels(config)
     if exit_code:
         return exit_code

@@ -407,7 +407,8 @@ def test_run_once_routes_issue_without_agent_workflow_label_to_plan_only(tmp_pat
     app.running = {}
     app.github.runnable_issues = AsyncMock(return_value=[])
     app.github.unassigned_issues = AsyncMock(return_value=[issue])
-    app._guarded_plan_only = AsyncMock()
+    app.global_limit = asyncio.Semaphore(1)
+    app.plan_only = AsyncMock()
 
     async def run_scheduler() -> None:
         await app.run_once()
@@ -416,7 +417,7 @@ def test_run_once_routes_issue_without_agent_workflow_label_to_plan_only(tmp_pat
     asyncio.run(run_scheduler())
 
     app.github.unassigned_issues.assert_awaited_once_with(20)
-    app._guarded_plan_only.assert_awaited_once_with(issue, "planner")
+    app.plan_only.assert_awaited_once_with(issue)
     assert app.state.rows()[0]["status"] == str(TaskStatus.CLAIMED)
 
 
@@ -1603,3 +1604,114 @@ def test_notification_failure_after_pr_does_not_rerun_implementation(tmp_path):
     assert app.agents["worker"].execute.await_count == 1
     log = (tmp_path / "logs" / "issue-4.jsonl").read_text(encoding="utf-8")
     assert "publication_notification_failed" in log
+
+
+@pytest.mark.parametrize("planning", [False, True])
+@pytest.mark.parametrize("database", [False, True])
+def test_schedule_rechecks_after_resource_wait(tmp_path, planning, database):
+    app = make_orchestrator(tmp_path)
+    app.running = {}
+    app.global_limit = asyncio.Semaphore(1)
+    app.database_lock = asyncio.Lock()
+    app.config.schedule = SimpleNamespace(allows=Mock(return_value=True))
+    issue = Issue(44, "Queued", "Body", ("resource:database-schema",) if database else ())
+    app.github.runnable_issues = AsyncMock(return_value=[] if planning else [issue])
+    app.github.unassigned_issues = AsyncMock(return_value=[issue] if planning else [])
+    app.process = AsyncMock()
+    app.plan_only = AsyncMock()
+
+    async def scenario():
+        lock = app.database_lock if database and not planning else app.global_limit
+        await lock.acquire()
+        await app.run_once()
+        await asyncio.sleep(0)
+        assert app.state.rows() == []
+        await app.run_once()
+        assert len(app.running) == 1
+        app.config.schedule.allows.return_value = False
+        pending = tuple(app.running.values())
+        lock.release()
+        await asyncio.gather(*pending)
+        assert app.state.rows() == []
+        app.process.assert_not_awaited()
+        app.plan_only.assert_not_awaited()
+        app.github.labels.assert_not_awaited()
+        app.config.schedule.allows.return_value = True
+        await app.run_once()
+        await asyncio.gather(*tuple(app.running.values()))
+        assert app.state.rows()[0]["status"] == str(TaskStatus.CLAIMED)
+        (app.plan_only if planning else app.process).assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_schedule_closed_skips_poll_and_logs_once(tmp_path, caplog):
+    app = make_orchestrator(tmp_path)
+    app.config.schedule = SimpleNamespace(allows=Mock(return_value=False))
+    app.github.runnable_issues = AsyncMock()
+    app.github.unassigned_issues = AsyncMock()
+    with caplog.at_level("INFO"):
+        asyncio.run(app.run_once())
+        asyncio.run(app.run_once())
+    assert caplog.text.count("execution window closed") == 1
+    assert app.state.rows() == []
+    app.github.runnable_issues.assert_not_awaited()
+    app.github.unassigned_issues.assert_not_awaited()
+
+
+def test_schedule_does_not_interrupt_started_issue(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.global_limit = asyncio.Semaphore(1)
+    app.config.schedule = SimpleNamespace(allows=Mock(return_value=True))
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+    app.state.update(4, TaskStatus.PENDING)
+    app.workspaces.changed.side_effect = [True, False]
+
+    async def close_window(*args, **kwargs):
+        app.config.schedule.allows.return_value = False
+        return result()
+
+    app.agents["worker"].execute.side_effect = close_window
+    asyncio.run(app._guarded_process(issue, "worker"))
+    assert app.state.rows()[0]["status"] == str(TaskStatus.HUMAN_REVIEW)
+    app.workspaces.push.assert_awaited_once()
+
+
+@pytest.mark.parametrize("planning", [False, True])
+@pytest.mark.parametrize("status,failures,eligible", [
+    (TaskStatus.PENDING, 0, True),
+    (TaskStatus.FAILED, 1, True),
+    (TaskStatus.FAILED, 2, False),
+    (TaskStatus.BLOCKED, 2, False),
+    (TaskStatus.DONE, 0, False),
+    (TaskStatus.CLAIMED, 0, False),
+])
+def test_admission_prefilter_preserves_retry_budget(tmp_path, planning, status, failures, eligible):
+    app = make_orchestrator(tmp_path)
+    row = {"status": str(status), "failures": failures, "plan": None}
+    assert app._eligible(row, planning=planning) is eligible
+
+
+def test_serve_reopens_on_next_poll(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.config.poll_seconds = 60
+    app.config.schedule = SimpleNamespace(allows=Mock(return_value=False))
+    app.running = {}
+    app.github.runnable_issues = AsyncMock(return_value=[])
+    app.github.unassigned_issues = AsyncMock(return_value=[])
+
+    class Wake:
+        async def wait(self):
+            if app.config.schedule.allows.return_value:
+                raise asyncio.CancelledError
+            app.config.schedule.allows.return_value = True
+
+        def clear(self):
+            pass
+
+    app._wake = Wake()
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(app.serve())
+    app.github.runnable_issues.assert_awaited_once()

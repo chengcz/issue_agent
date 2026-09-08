@@ -720,3 +720,45 @@ issue-agent --config issue-agent.toml reset 42 --no-label # 只重置本地状�
 MVP 使用 `gh` CLI 和 SQLite，适合单机 1–5 个并发 worker。多机部署时再替换为 GitHub App + PostgreSQL/Redis 分布式锁，并增加心跳、取消、PR 创建后的 review 循环和指标监控。不要在单机版上直接启动多个 orchestrator 实例。
 
 Codex 的非交互自动化入口是 `codex exec`；官方也建议非交互运行使用 workspace-write sandbox。GitHub Actions 中可另行使用官方 Codex Action，但它不是本地常驻调度器的必需依赖。
+
+
+### 任务执行时间窗口
+
+通过 TOML 的 `[schedule]` 设置每周重复的允许/禁止时段。省略此配置时全天可执行；
+修改后需要重启。以下配置禁止工作日 09:00–18:00 启动任务，周末全天允许：
+
+```toml
+[schedule]
+timezone = "Asia/Shanghai"
+
+[[schedule.deny]]
+days = ["mon", "tue", "wed", "thu", "fri"]
+start = "09:00"
+end = "18:00"
+```
+
+若希望每天仅夜间执行，将上面的配置替换为：
+
+```toml
+[schedule]
+timezone = "Asia/Shanghai"
+
+[[schedule.allow]]
+start = "18:00"
+end = "09:00"
+```
+
+- `allow` 和 `deny` 均可重复定义多条：同类取并集，禁止优先。没有 `allow` 规则时，
+  除禁止时段外均允许；两者均为空时全天允许。
+- `days` 为非空星期列表（`mon` 至 `sun`），省略表示每天。跨午夜规则按开始日期所属星期
+  计算，例如 `days = ["fri"]`、`18:00–09:00` 表示周五晚到周六早晨。
+- 开始时间包含、结束时间不包含，严格使用 `HH:MM`。仅结束时间可用 `24:00`；
+  全天写作 `00:00–24:00`，起止相同会报错。
+- `timezone` 使用 IANA 时区名称，省略时采用系统本地时区；按当地实际时间判断，
+  夏令时重复出现的时间分别遵守相同规则。非法配置在启动时拒绝。
+- `serve` 和 `once` 同时限制自动规划及编码任务的启动；窗口关闭后不领取任务，
+  也不因时间限制更改 Issue 标签或消耗失败预算。等待资源的候选在实际开始前重新检查时间。
+- **已开始的 Issue 会完成当前轮**，包括后续检查、审查及 PR 发布，可能延续到禁止时段；
+  自动规划同样完成当前轮。失败后的下一轮执行重新受窗口限制。
+- `serve` 按 `runtime.poll_seconds` 重新检查，窗口打开后最迟下一轮开始调度；
+  `once` 在窗口外记录跳过原因并正常退出。日志仅记录窗口状态变化，避免重复刷屏。

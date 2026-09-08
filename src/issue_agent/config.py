@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .codegraph import CodegraphConfig
+from .schedule import ScheduleConfig, load_schedule
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class Config:
     checks_parallel: bool = True
     review_task_mode: str = "formal"  # "full" | "formal" | "off"
     codegraph: CodegraphConfig = field(default_factory=CodegraphConfig)
+    schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     default_agent: str = "codex"
     reviewer_agent: str = ""
     planner_agent: str = ""
@@ -181,6 +183,7 @@ def load_config(path: str | Path) -> Config:
         auto_plan_limit=int(runtime.get("auto_plan_limit", 20)),
         dry_run=bool(runtime.get("dry_run", False)),
         agents=agents,
+        schedule=load_schedule(raw.get("schedule", {})),
     )
     validate_config(config)
     return config
