@@ -72,32 +72,47 @@ class WorkspaceManager:
                 )
             )
             await run(command, cwd=self.repo)
-        task_dir = path / ".agent"
-        task_dir.mkdir(exist_ok=True)
         self.write_task_file(path, issue, PlanTask(issue.title, issue.body))
         return path, branch
 
+    def _agent_dir(self, path: Path) -> Path:
+        """The orchestrator's scratch dir, self-ignored so it never enters a commit.
+
+        ``.agent`` holds plan/task/feedback files that must never be committed.
+        Writing ``*`` into ``.agent/.gitignore`` makes ``git add`` skip the whole
+        directory in every repo — including repos whose own ``.gitignore`` does
+        not cover it — without naming ``.agent`` in a pathspec. That matters
+        because ``git add`` refuses a ``:(exclude).agent`` pathspec with a hard
+        error when the repo already ignores dotfiles (``.*``).
+        """
+        agent = path / ".agent"
+        agent.mkdir(parents=True, exist_ok=True)
+        ignore = agent / ".gitignore"
+        if not ignore.exists():
+            ignore.write_text("*\n", encoding="utf-8")
+        return agent
+
     def write_plan_file(self, path: Path, plan: list[PlanTask]) -> None:
-        (path / ".agent").mkdir(parents=True, exist_ok=True)
+        agent = self._agent_dir(path)
         content = "# Plan\n\n" + "\n".join(
             f"{i + 1}. **{task.title}**\n   {task.description}" for i, task in enumerate(plan)
         ) + "\n"
-        (path / ".agent" / "plan.md").write_text(content, encoding="utf-8")
+        (agent / "plan.md").write_text(content, encoding="utf-8")
 
     def write_feedback_file(self, path: Path, feedback: str) -> None:
         """Persist the full failure report a retry prompt only excerpts."""
-        (path / ".agent").mkdir(parents=True, exist_ok=True)
-        (path / ".agent" / "feedback.md").write_text(feedback + "\n", encoding="utf-8")
+        agent = self._agent_dir(path)
+        (agent / "feedback.md").write_text(feedback + "\n", encoding="utf-8")
 
     def write_task_file(self, path: Path, issue: Issue, task: PlanTask) -> None:
-        (path / ".agent").mkdir(parents=True, exist_ok=True)
+        agent = self._agent_dir(path)
         content = (
             f"# GitHub Issue #{issue.number}\n\n## {issue.title}\n\n{issue.body}\n\n"
             f"## 当前任务\n\n### {task.title}\n\n{task.description}\n\n## Labels\n\n"
             + "\n".join(f"- {x}" for x in issue.labels)
             + "\n"
         )
-        (path / ".agent" / "task.md").write_text(content, encoding="utf-8")
+        (agent / "task.md").write_text(content, encoding="utf-8")
 
     async def changed(self, path: Path) -> bool:
         return bool(await self.status(path))
@@ -114,11 +129,11 @@ class WorkspaceManager:
         return result.stdout.strip()
 
     async def commit(self, path: Path, message: str) -> None:
-        await run(("git", "add", "--all", "--", ".", ":(exclude).agent"), cwd=path)
+        await run(("git", "add", "--all", "--", "."), cwd=path)
         await run(("git", "commit", "-m", message), cwd=path)
 
     async def amend(self, path: Path) -> None:
-        await run(("git", "add", "--all", "--", ".", ":(exclude).agent"), cwd=path)
+        await run(("git", "add", "--all", "--", "."), cwd=path)
         await run(("git", "commit", "--amend", "--no-edit"), cwd=path)
 
     async def push(self, path: Path, branch: str, *, dry_run: bool) -> None:

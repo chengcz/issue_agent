@@ -78,8 +78,56 @@ def test_workspace_git_mutations_preserve_and_exclude_agent_files(tmp_path, monk
     asyncio.run(manager.amend(tmp_path))
     asyncio.run(manager.clean(tmp_path))
 
-    assert ("git", "add", "--all", "--", ".", ":(exclude).agent") in calls
+    assert ("git", "add", "--all", "--", ".") in calls
     assert ("git", "clean", "-fd", "-e", ".agent/") in calls
+
+
+def _init_git_repo(tmp_path: Path, gitignore: str) -> None:
+    import subprocess
+
+    (tmp_path / ".gitignore").write_text(gitignore, encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "-f", ".gitignore"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
+
+
+def _tracked(tmp_path: Path) -> list[str]:
+    import subprocess
+
+    return subprocess.run(
+        ["git", "ls-files"], cwd=tmp_path, check=True, capture_output=True, text=True
+    ).stdout.splitlines()
+
+
+def _commit_with_agent_dir(tmp_path: Path, gitignore: str) -> list[str]:
+    manager = WorkspaceManager(tmp_path, tmp_path / "worktrees", "main")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("print(1)\n", encoding="utf-8")
+    manager.write_task_file(tmp_path, Issue(1, "T", "B"), PlanTask("t", "d"))
+    asyncio.run(manager.commit(tmp_path, "feat: add main"))
+    return _tracked(tmp_path)
+
+
+def test_workspace_commit_excludes_agent_even_when_the_repo_ignores_dotfiles(tmp_path):
+    """`git add` rejects a `:(exclude).agent` pathspec in a dotfile-ignoring repo."""
+    _init_git_repo(tmp_path, ".*\n")
+
+    tracked = _commit_with_agent_dir(tmp_path, ".*\n")
+
+    assert "src/main.py" in tracked
+    assert not any(name.startswith(".agent") for name in tracked)
+
+
+def test_workspace_commit_excludes_agent_when_the_repo_does_not_ignore_it(tmp_path):
+    """The self-ignore must keep `.agent` out even without a repo `.gitignore` rule."""
+    _init_git_repo(tmp_path, ".venv/\n")
+
+    tracked = _commit_with_agent_dir(tmp_path, ".venv/\n")
+
+    assert "src/main.py" in tracked
+    assert not any(name.startswith(".agent") for name in tracked)
 
 
 def test_workspace_fetch_is_shared_within_ttl(tmp_path, monkeypatch):

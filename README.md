@@ -451,8 +451,11 @@ task_mode = "formal"  # formal（默认）| full | off
 commands = ["./scripts/check.sh"]
 ```
 
-`.agent/plan.md`、`.agent/task.md`、feedback 和 check output 由 orchestrator 创建。Workspace 操作会
-显式从 status、commit/amend 和 clean 中排除 `.agent`，因此它们不会再造成“有代码改动”的误判或进入 PR。
+`.agent/plan.md`、`.agent/task.md`、feedback 和 check output 由 orchestrator 创建。`.agent` 目录会
+写入一份自忽略的 `.agent/.gitignore`（内容为 `*`），因此无论目标仓库自身的 `.gitignore` 是否覆盖
+点文件，`.agent` 都不会被 `git add` 纳入、也不会造成“有代码改动”的误判或进入 PR。之所以不依赖
+`:(exclude).agent` 这类 pathspec，是因为当仓库的 `.gitignore` 已忽略点文件（如 `.*`）时，`git add`
+会对显式点名的忽略路径硬报错；自忽略则对两种仓库都成立。
 
 ## BioAgent 任务发布
 
