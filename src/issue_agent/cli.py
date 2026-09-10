@@ -25,19 +25,33 @@ _RESETTABLE = frozenset({"pending", "planned", "failed", "blocked", "split"})
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(prog="issue-agent")
-    result.add_argument("--config", default="issue-agent.toml")
-    result.add_argument("--verbose", action="store_true")
+    # The global flags exist twice: on the main parser (before the subcommand)
+    # and — with SUPPRESS defaults so they never clobber already-parsed values —
+    # on every subparser, because `status --config x` is the natural CLI order.
+    leading = argparse.ArgumentParser(add_help=False)
+    leading.add_argument("--config", default="issue-agent.toml")
+    leading.add_argument("--verbose", action="store_true")
+    trailing = argparse.ArgumentParser(add_help=False)
+    trailing.add_argument("--config", default=argparse.SUPPRESS)
+    trailing.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS)
+
+    result = argparse.ArgumentParser(prog="issue-agent", parents=[leading])
     sub = result.add_subparsers(dest="command", required=True)
-    sub.add_parser("serve", help="poll GitHub continuously")
-    sub.add_parser("once", help="poll GitHub once and wait for workers")
-    status = sub.add_parser("status", help="show current and persisted task state")
+    sub.add_parser("serve", help="poll GitHub continuously", parents=[trailing])
+    sub.add_parser("once", help="poll GitHub once and wait for workers", parents=[trailing])
+    status = sub.add_parser(
+        "status", help="show current and persisted task state", parents=[trailing]
+    )
     status.add_argument("--active", action="store_true", help="show only running tasks")
     status.add_argument("--json", action="store_true", help="output machine-readable JSON")
-    report = sub.add_parser("report", help="show per-Issue and per-task time and token usage")
+    report = sub.add_parser(
+        "report", help="show per-Issue and per-task time and token usage", parents=[trailing]
+    )
     report.add_argument("--issue", type=int, help="limit the report to one GitHub Issue")
     report.add_argument("--json", action="store_true", help="output machine-readable JSON")
-    reset = sub.add_parser("reset", help="reset a task so it can be claimed and run again")
+    reset = sub.add_parser(
+        "reset", help="reset a task so it can be claimed and run again", parents=[trailing]
+    )
     reset.add_argument("issue", type=int, help="GitHub issue number to reset")
     reset.add_argument(
         "--no-label", action="store_true", help="reset state only; do not re-add the ready label"
@@ -218,13 +232,20 @@ def format_report(rows: list[dict[str, object]]) -> str:
             for task in tasks
         ]
         widths = [
-            max(len(headings[index]), *(len(value[index]) for value in values))
+            max(_display_width(headings[index]), *(_display_width(value[index]) for value in values))
             for index in range(len(headings))
         ]
+
+        def render(cells: tuple[str, ...], *, widths: list[int] = widths) -> str:
+            return "  ".join(
+                cell + " " * (widths[index] - _display_width(cell))
+                for index, cell in enumerate(cells)
+            )
+
         table = [
-            "  ".join(value.ljust(widths[index]) for index, value in enumerate(headings)),
+            render(headings),
             "  ".join("-" * width for width in widths),
-            *("  ".join(value.ljust(widths[index]) for index, value in enumerate(item)) for item in values),
+            *(render(item) for item in values),
         ]
         sections.append(summary + "\n" + "\n".join(table))
     return "\n\n".join(sections)
@@ -405,7 +426,12 @@ def main() -> None:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    raise SystemExit(asyncio.run(async_main(args)))
+    try:
+        code = asyncio.run(async_main(args))
+    except KeyboardInterrupt:
+        # shutdown() already waited for the workers; exit like a SIGINT process.
+        code = 130
+    raise SystemExit(code)
 
 
 if __name__ == "__main__":

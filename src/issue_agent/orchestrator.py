@@ -565,9 +565,9 @@ class Orchestrator:
         if issue.number in issue.blocked_by or issue.number in declared:
             # A self-link can never close; hold the issue rather than spin on a
             # dependency that will never resolve, and leave the comment as the
-            # only signal a human gets.
+            # only signal a human gets. The warning and its audit event are
+            # one-shot (notice-deduplicated), not once per poll.
             await self._warn_self_dependency(issue)
-            self._audit(issue).event("dependency_blocked", blockers=[issue.number])
             return True
         if not issue.blocked_by:
             return False
@@ -678,9 +678,11 @@ class Orchestrator:
             issue.number,
             "⚠️ **Self-dependency**\n\n"
             f"This issue is listed as blocked by itself (#{issue.number}), a "
-            "relation that can never close. Remove the self-link to let the "
-            "workflow proceed.",
+            "relation that can never close. Remove the native blocked-by link "
+            "— or the body line that declares it — to let the workflow "
+            "proceed.",
         )
+        self._audit(issue).event("dependency_blocked", blockers=[issue.number])
         notices["self"] = True
         self.state.save_blocker_notices(issue.number, notices)
 
@@ -737,6 +739,22 @@ class Orchestrator:
                     continue
             except ValueError as exc:
                 log.error("issue #%s: %s", issue.number, exc)
+                # A dead routing label must not stay invisible to humans: say
+                # so once, deduplicated like the dependency warnings.
+                route = next(
+                    (x for x in issue.labels if x.startswith("agent:")), "agent:"
+                )
+                notices = self.state.load_blocker_notices(issue.number)
+                if not notices.get(f"route:{route}"):
+                    await self.github.comment(
+                        issue.number,
+                        "⚠️ **Unknown agent route**\n\n"
+                        f"{exc}. The issue is skipped until the `agent:<name>` "
+                        "label is fixed or an agent with that name is "
+                        "configured.",
+                    )
+                    notices[f"route:{route}"] = True
+                    self.state.save_blocker_notices(issue.number, notices)
                 continue
             except CommandError as exc:
                 # One candidate's GitHub failure (deleted blocker, label churn,

@@ -744,6 +744,13 @@ def test_dependency_gate_warns_once_about_a_native_self_dependency(tmp_path):
 
     self_warnings = [body for body in comments(app) if "itself" in body]
     assert len(self_warnings) == 1
+    # The audit event rides the one-shot warning, not every poll.
+    assert names(app).count("dependency_blocked") == 1
+    assert "body line" in self_warnings[0]
+
+    app.state.save_blocker_notices(4, {})
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+    assert names(app).count("dependency_blocked") == 2
 
 
 def test_dependency_gate_holds_an_issue_whose_body_blocks_on_itself(tmp_path):
@@ -1456,6 +1463,22 @@ def test_clarification_marker_comes_from_the_posted_comment(tmp_path):
     run_plan_only(app, issue)
 
     assert app.state.clarify_state(4) == (1, "2026-09-10T01:00:05Z")
+
+
+def test_run_once_comments_once_about_an_unknown_agent_route(tmp_path):
+    """A dead `agent:<name>` routing label must be visible to humans, not only
+    in the orchestrator log — posted once per (issue, label), then deduplicated."""
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Routed nowhere", "B", ("agent-ready", "agent:nobody"))
+    app.github.runnable_issues = AsyncMock(return_value=[issue])
+    app._dependency_gate = AsyncMock(return_value=False)
+
+    asyncio.run(app.run_once())
+    asyncio.run(app.run_once())
+
+    route_notes = [body for body in comments(app) if "Unknown agent route" in body]
+    assert len(route_notes) == 1
+    assert "nobody" in route_notes[0]
 
 
 def test_single_task_fallback_without_planner(tmp_path):

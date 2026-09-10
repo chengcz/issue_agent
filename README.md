@@ -177,7 +177,8 @@ orchestrator 统一 push 分支（finalize 前从不 push，因此 amend/reset �
 `issue-agent --config issue-agent.toml reset <issue> [--no-label]` 用于重置搁置的
 `failed`/`blocked` 任务：清零失败计数与重试标记、状态回 `pending`（保留 Plan 与已完成的
 plan 任务），默认重新添加 `agent-ready`，下一次轮询即重新领取并从断点续跑。只允许重置
-`pending`/`planned`/`failed`/`blocked`；运行中或已到 `human-review`/`done` 的任务会被拒绝。
+`pending`/`planned`/`failed`/`blocked`/`split`（`split` 是人工否决拆分、按单 Issue 重新规划的
+方式）；运行中或已到 `human-review`/`done` 的任务会被拒绝。
 
 ## 快速开始
 

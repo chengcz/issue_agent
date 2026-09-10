@@ -978,6 +978,46 @@ repo = "a/b"
         load_config(config_file)
 
 
+def test_parser_accepts_global_flags_after_the_subcommand():
+    args = parser().parse_args(["status", "--config", "x.toml", "--verbose"])
+    assert args.config == "x.toml" and args.verbose and args.command == "status"
+
+    args = parser().parse_args(["--config", "y.toml", "once"])
+    assert args.config == "y.toml"
+
+
+def test_format_report_aligns_cjk_titles_by_display_width():
+    rows = [
+        {
+            "issue_number": 4,
+            "title": "实现解析器",
+            "status": "done",
+            "tasks": [
+                {
+                    "seq": 0,
+                    "status": "done",
+                    "attempts": 1,
+                    "title": "实现解析器核心",
+                    "total_input_tokens": 10,
+                    "total_output_tokens": 5,
+                    "total_cost_usd": 0.0,
+                    "total_duration_ms": 1000,
+                    "total_check_duration_ms": 0,
+                    "total_wall_duration_ms": 2000,
+                }
+            ],
+        }
+    ]
+    from issue_agent.cli import _display_width
+
+    table = format_report(rows).splitlines()
+    # Every line of the task table shares one display width: CJK titles
+    # occupy two terminal cells each, so raw len() padding misaligned them.
+    widths = {_display_width(line) for line in table[1:]}
+    assert len(widths) == 1
+    assert any("实现解析器核心" in line for line in table)
+
+
 def test_config_errors_exit_with_a_one_line_message(tmp_path, capsys):
     """Every subcommand pays the same clean error: no raw tracebacks for a
     missing file, broken TOML, or invalid values (status/report need the
