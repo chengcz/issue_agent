@@ -76,7 +76,9 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
 - 人工在 Issue 里评论回答后，下一轮轮询检测到「作者不是本机登录名、时间晚于提问、且不在
   `clarify_ignore_authors` 里」的评论，就移除标签、回到规划队列；重新规划时把提问以来的评论作为
   澄清记录传给 planner。
-- 轮数上限 `max_clarify_rounds`（默认 2）用尽后不再自动等待，评论提示人工回答后执行 `reset`。
+- 轮数上限 `max_clarify_rounds`（默认 2）是自动等待的提问轮数：每轮的人工回答都会被自动捡起。
+  预算用尽后若 planner 再次提问，会发布一条收尾评论（仍列出问题）并停止监听，评论提示人工回答
+  后执行 `reset`。
 - 无法确定本机登录名（未认证、离线或 dry-run）时不检测回复，标签交由人工移除，避免把自己的提问
   当成人工答复。
 
@@ -281,8 +283,8 @@ CLI 启动时会验证 Agent 名称、并发数、重试次数和 timeout；无�
 - `runtime.allow_split`：是否允许 planner 把过大的 Issue 拆成多个子 Issue，默认 `false`
   （见「拆分」）。
 - `runtime.max_split_children`：单次拆分的子 Issue 数量上限，默认 5；超限按规划失败处理。
-- `runtime.max_clarify_rounds`：planner 就同一个 Issue 提问的次数上限，默认 2；用尽后不再自动等待
-  人工回复，需要 `reset`（见「澄清回环」）。
+- `runtime.max_clarify_rounds`：planner 自动等待回答的提问轮数上限，默认 2；预算用尽后发布收尾
+  评论并停止监听人工回复，需要 `reset`（见「澄清回环」）。
 - `runtime.clarify_ignore_authors`：除本机登录名外，永远不算作人工答复的评论作者（如 `dependabot`），
   默认空。
 - `runtime.log_dir`：每个 Issue 的执行和 Review JSONL 日志目录。

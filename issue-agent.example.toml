@@ -25,8 +25,9 @@ auto_ready_with_plan = false
 #   issues. Children never get the ready label automatically.
 allow_split = false
 max_split_children = 5
-# max_clarify_rounds: how many times the planner may ask for more information
-#   before the issue is parked for a human reset.
+# max_clarify_rounds: how many live question rounds the planner gets (each
+#   answer is picked up automatically). After the budget is spent one final
+#   handoff comment is posted and the issue parks for a human reset.
 max_clarify_rounds = 2
 # clarify_ignore_authors: extra comment authors (beyond this machine's login)
 #   that never count as a human answer to a planner question.

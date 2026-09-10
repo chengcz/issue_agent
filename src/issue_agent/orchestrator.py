@@ -817,29 +817,32 @@ class Orchestrator:
     async def _clarification(self, issue_number: int) -> str:
         """The question-and-answer transcript to re-plan from, or "".
 
-        Gated on the clarify marker rather than the round counter: a reset
-        restores the ask budget (rounds back to zero) on purpose, but the
-        conversation that led there is exactly the context a re-plan after that
-        reset needs, so it must keep flowing. Issues never asked anything have
-        an empty marker and pay no extra API call.
+        Gated on the clarify bookkeeping rather than on any single field: a
+        reset restores the ask budget (rounds back to zero) but keeps the
+        marker, a consumed answer clears the marker but keeps the rounds, and a
+        produced plan clears the marker while the rounds stay spent — in every
+        one of those states the conversation is exactly the context a re-plan
+        needs, so it must keep flowing. Issues never asked anything have neither
+        field set and pay no extra API call.
         """
-        if not self.state.clarify_state(issue_number)[1]:
+        rounds, marker = self.state.clarify_state(issue_number)
+        if not marker and not rounds:
             return ""
         return clarification_notes(
             await self.github.comments(issue_number), await self._my_login()
         )
 
     async def _request_clarification(
-        self, issue: Issue, questions: tuple[str, ...], *, marker: str, issue_log: IssueLog
+        self, issue: Issue, questions: tuple[str, ...], *, issue_log: IssueLog
     ) -> None:
         """Publish the planner's questions and hold the issue for a human answer.
 
-        The round budget bounds how many times the planner may ask over the
-        issue's life. Once it is spent the label stays on and the comment says
-        what a human has to do instead, because the orchestrator has stopped
-        watching for a reply.
+        The round budget bounds how many live rounds the planner gets — an
+        answer to each is picked up automatically. Once the budget is spent the
+        label stays on and the comment says what a human has to do instead,
+        because the orchestrator has stopped watching for a reply.
         """
-        rounds = self.state.record_clarify_round(issue.number, marker)
+        rounds = self.state.clarify_state(issue.number)[0] + 1
         issue_log.event("clarify_requested", rounds=rounds, questions=list(questions))
         listing = "\n".join(f"{index}. {question}" for index, question in enumerate(questions, 1))
         if rounds > self.config.max_clarify_rounds:
@@ -858,6 +861,30 @@ class Orchestrator:
                 "A later poll picks the answer up and plans again; no label needs removing."
             )
         await self.github.comment(issue.number, body)
+        # The reply detector compares GitHub server timestamps against this
+        # marker. Reading it back from the question comment GitHub just dated
+        # takes the local clock out of the comparison: a machine whose clock
+        # runs fast used to mark an instant human reply as "older than the
+        # marker", so the answer was never detected and the issue waited
+        # forever. Failure to read back falls back to the local timestamp.
+        marker = datetime.now(UTC).isoformat()
+        try:
+            login = (await self._my_login()).lower()
+            mine = [
+                comment
+                for comment in await self.github.comments(issue.number)
+                if comment.author.lower() == login
+                and comment.body.strip().startswith(CLARIFY_HEADING)
+            ]
+            if mine:
+                marker = mine[-1].created_at
+        except CommandError as exc:
+            log.warning(
+                "issue #%s: cannot read back the question comment; using the local clock: %s",
+                issue.number,
+                exc,
+            )
+        self.state.record_clarify_round(issue.number, marker)
         await self.github.labels(issue.number, add=(NEEDS_INFO_LABEL,))
 
     async def _release_answered_clarifications(self, persisted: dict[int, dict]) -> None:
@@ -868,8 +895,10 @@ class Orchestrator:
         query, and rows whose round budget is spent fall out of the scan on their
         own — their reply must not re-queue them. Removing the label is the whole
         handoff, because that label is what keeps the issue out of the planning
-        pool. The marker stays until a plan is produced: it is also the offset the
-        clarification transcript is read from.
+        pool. Consuming the answer clears the marker, so the same reply is not
+        re-detected on every later poll while the re-plan it triggered keeps
+        failing; the transcript is read from the machine's first question
+        comment, so clearing the marker loses nothing.
         """
         login = (await self._my_login()).lower()
         if not login:
@@ -893,7 +922,12 @@ class Orchestrator:
                 for comment in comments
             )
             if answered:
-                await self.github.labels(number, remove=(NEEDS_INFO_LABEL,))
+                try:
+                    await self.github.labels(number, remove=(NEEDS_INFO_LABEL,))
+                except CommandError as exc:
+                    log.warning("issue #%s: cannot drop the needs-info label: %s", number, exc)
+                    continue
+                self.state.clear_clarify(number)
                 IssueLog(self.config.log_dir, number).event("clarify_answered")
                 log.info("issue #%s: clarification answered; back in the planning queue", number)
 
@@ -978,12 +1012,9 @@ class Orchestrator:
                     outcome = str(TaskStatus.SPLIT)
                     return
                 if planned.questions:
-                    # The marker has to predate the comment, so that any reply
-                    # that follows is necessarily newer than it.
                     await self._request_clarification(
                         issue,
                         planned.questions,
-                        marker=datetime.now(UTC).isoformat(),
                         issue_log=issue_log,
                     )
                     # PENDING with no plan is what makes the issue claimable
@@ -1163,7 +1194,6 @@ class Orchestrator:
                     await self._request_clarification(
                         issue,
                         planned.questions,
-                        marker=datetime.now(UTC).isoformat(),
                         issue_log=issue_log,
                     )
                     # The ready label went with admission; nothing is running

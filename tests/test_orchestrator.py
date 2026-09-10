@@ -1367,6 +1367,69 @@ def test_run_once_ignores_replies_from_configured_bots(tmp_path):
     app.github.labels.assert_not_awaited()
 
 
+def test_run_once_hands_off_the_answer_and_stops_watching_for_it(tmp_path):
+    """The handoff consumes the answer: the marker is cleared so a re-plan that
+    keeps failing cannot make every later poll re-detect the same comment. The
+    round budget stays spent and the transcript keeps flowing for the re-plan."""
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Vague", "Improve this")
+    app.state.claim_for_planning(issue, "planner")
+    app.state.record_clarify_round(4, "2026-09-10T01:00:00+00:00")
+    app.github.comments = AsyncMock(
+        return_value=[
+            Comment("octocat", "2026-09-10T01:00:01+00:00", CLARIFY_QUESTION),
+            Comment("alice", "2026-09-10T02:00:00+00:00", "The parser module."),
+        ]
+    )
+
+    asyncio.run(app.run_once())
+
+    app.github.labels.assert_awaited_once()
+    assert app.state.clarify_state(4) == (1, "")
+    assert asyncio.run(app._clarification(4)) != ""
+
+
+def test_run_once_keeps_scanning_after_one_label_removal_fails(tmp_path):
+    """A failed needs-info removal (deleted label, gh hiccup) is contained:
+    later waiting rows still get their answers released."""
+    app = make_orchestrator(tmp_path)
+    for number in (4, 5):
+        app.state.claim_for_planning(Issue(number, "Vague", "Improve this"), "planner")
+        app.state.record_clarify_round(number, "2026-09-10T01:00:00+00:00")
+    app.github.comments = AsyncMock(
+        return_value=[Comment("alice", "2026-09-10T02:00:00+00:00", "The parser module.")]
+    )
+    app.github.labels = AsyncMock(side_effect=[CommandError("label gone"), None])
+
+    asyncio.run(app.run_once())
+
+    assert app.github.labels.await_count == 2
+    # Exactly one handoff completed: the failed row keeps its marker (the
+    # answer is not consumed), the healthy row's marker is cleared. Row order
+    # from the state DB is not pinned, so assert as a set.
+    markers = [app.state.clarify_state(number)[1] == "" for number in (4, 5)]
+    assert sorted(markers) == [False, True]
+
+
+def test_clarification_marker_comes_from_the_posted_comment(tmp_path):
+    """The marker is read back from the question comment GitHub just dated, so
+    a local clock running fast cannot make an instant human reply count as
+    'older than the marker' and stay undetected forever."""
+    app = make_orchestrator(tmp_path)
+    asks_questions(app)
+    issue = Issue(4, "Vague", "Improve this")
+    app.github.comments = AsyncMock(
+        return_value=[
+            Comment("alice", "2026-09-09T00:00:00Z", "unrelated discussion"),
+            Comment("octocat", "2026-09-10T01:00:05Z", CLARIFY_QUESTION),
+        ]
+    )
+
+    run_plan_only(app, issue)
+
+    assert app.state.clarify_state(4) == (1, "2026-09-10T01:00:05Z")
+
+
 def test_single_task_fallback_without_planner(tmp_path):
     app = make_orchestrator(tmp_path)
     app.config.planner_agent = ""
