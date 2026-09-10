@@ -1575,7 +1575,7 @@ def test_run_once_routes_issue_without_agent_workflow_label_to_plan_only(tmp_pat
 
     asyncio.run(run_scheduler())
 
-    app.github.unassigned_issues.assert_awaited_once_with(20)
+    app.github.unassigned_issues.assert_awaited_once_with(20, ready_label="agent-ready")
     app.plan_only.assert_awaited_once_with(issue)
     assert app.state.rows()[0]["status"] == str(TaskStatus.CLAIMED)
 

@@ -1267,6 +1267,24 @@ def test_github_unassigned_issues_keeps_product_labels(tmp_path: Path):
     assert "--search" not in github._gh.await_args.args
 
 
+def test_unassigned_issues_excludes_a_custom_ready_label(tmp_path: Path):
+    """The ready label is configurable and need not be agent-prefixed: a ready
+    issue must not also surface in the auto-plan pool and get processed twice
+    in the same poll."""
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(
+        return_value="""[
+            {"number": 1, "title": "Ready custom", "body": "", "labels": [{"name": "todo"}], "url": "u1"},
+            {"number": 2, "title": "Plain", "body": "", "labels": [{"name": "bug"}], "url": "u2"},
+            {"number": 3, "title": "Workflow", "body": "", "labels": [{"name": "agent-planned"}], "url": "u3"}
+        ]"""
+    )
+
+    issues = asyncio.run(github.unassigned_issues(ready_label="todo"))
+
+    assert [issue.number for issue in issues] == [2]
+
+
 def test_create_pr_reuses_existing_branch_pr(tmp_path: Path):
     github = GitHub("owner/repo", tmp_path)
     github._gh = AsyncMock(return_value='[{"url": "https://example.test/pr/42"}]')

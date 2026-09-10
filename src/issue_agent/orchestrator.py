@@ -707,7 +707,10 @@ class Orchestrator:
         runnable_call = self.github.runnable_issues(self.config.ready_label)
         if self.config.auto_plan_unlabeled:
             runnable, planning = await asyncio.gather(
-                runnable_call, self.github.unassigned_issues(self.config.auto_plan_limit)
+                runnable_call,
+                self.github.unassigned_issues(
+                    self.config.auto_plan_limit, ready_label=self.config.ready_label
+                ),
             )
         else:
             runnable, planning = await runnable_call, []
