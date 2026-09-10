@@ -878,9 +878,11 @@ class StateStore:
         FAILED/BLOCKED issue can be claimed again. Any existing plan is kept;
         DONE plan items stay DONE so execution resumes from the first unfinished
         task. The recorded dependency notices go too, so a human who resets an
-        issue gets told again about whatever still blocks it, as does the
-        clarification budget, so a parked issue is worth asking about again.
-        A recorded split is dropped for the same reason: resetting a split
+        issue gets told again about whatever still blocks it. The ask budget
+        (``clarify_rounds``) resets so the planner may ask again, but the
+        outstanding-question marker is kept: the question-and-answer transcript
+        is read from it, and a re-plan after a reset must still see the answers
+        the human already gave. A recorded split is dropped: resetting a split
         parent is how a human asks for it to be planned again as one unit.
         Returns None when no row exists for the issue.
         """
@@ -892,7 +894,7 @@ class StateStore:
             old_status = str(row["status"])
             db.execute(
                 "UPDATE tasks SET status=?, failures=0, attempts=0, last_error='', "
-                "current_seq=-1, clarify_rounds=0, clarify_marker=NULL, split=NULL, updated_at=? "
+                "current_seq=-1, clarify_rounds=0, split=NULL, updated_at=? "
                 "WHERE issue_number=?",
                 (str(TaskStatus.PENDING), now, issue_number),
             )

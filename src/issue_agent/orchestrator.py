@@ -817,10 +817,13 @@ class Orchestrator:
     async def _clarification(self, issue_number: int) -> str:
         """The question-and-answer transcript to re-plan from, or "".
 
-        Read only for issues that have actually been asked something, so an
-        ordinary planning run pays no extra API call for the feature.
+        Gated on the clarify marker rather than the round counter: a reset
+        restores the ask budget (rounds back to zero) on purpose, but the
+        conversation that led there is exactly the context a re-plan after that
+        reset needs, so it must keep flowing. Issues never asked anything have
+        an empty marker and pay no extra API call.
         """
-        if not self.state.clarify_state(issue_number)[0]:
+        if not self.state.clarify_state(issue_number)[1]:
             return ""
         return clarification_notes(
             await self.github.comments(issue_number), await self._my_login()
@@ -1144,14 +1147,46 @@ class Orchestrator:
 
             plan = self.state.load_plan(issue.number)
             if plan is None:
-                plan = require_tasks(
-                    await self._plan(
-                        workspace,
+                planned = await self._plan(
+                    workspace,
+                    issue,
+                    acquire_agent_limit=bool(self.config.planner_agent),
+                    issue_log=issue_log,
+                    clarification=await self._clarification(issue.number),
+                )
+                if planned.questions:
+                    # Design-spec §11 D3: a planner that cannot name concrete
+                    # tasks on the coding path re-routes through the plan-only
+                    # clarification flow instead of burning the whole-issue
+                    # failure budget on repeated planner runs.
+                    issue_log.event("planner_needs_info", questions=list(planned.questions))
+                    await self._request_clarification(
                         issue,
-                        acquire_agent_limit=bool(self.config.planner_agent),
+                        planned.questions,
+                        marker=datetime.now(UTC).isoformat(),
                         issue_log=issue_log,
                     )
-                )
+                    # The ready label went with admission; nothing is running
+                    # while the issue waits for an answer, so drop the running
+                    # label too — the needs-info label is what keeps the issue
+                    # out of the scheduling pools.
+                    await self.github.labels(issue.number, remove=("agent-running",))
+                    self.state.update(issue.number, TaskStatus.PENDING)
+                    outcome = str(TaskStatus.PENDING)
+                    return
+                if planned.split:
+                    # The decision lands before the first creation, so a crash
+                    # mid-split resumes from the record rather than asking the
+                    # planner for a second, differently-worded proposal.
+                    recorded = [RecordedChild.from_child(child) for child in planned.split]
+                    self.state.save_split(issue.number, recorded)
+                    issue_log.event(
+                        "split_proposed", children=[child.title for child in recorded]
+                    )
+                    await self._complete_split(issue, recorded, issue_log=issue_log)
+                    outcome = str(TaskStatus.SPLIT)
+                    return
+                plan = require_tasks(planned)
                 await self.github.comment(issue.number, "## Agent Plan\n\n" + format_plan(plan))
                 issue_log.event("plan_generated", tasks=[task.to_dict() for task in plan])
             else:

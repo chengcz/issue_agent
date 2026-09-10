@@ -613,6 +613,51 @@ def test_once_mode_returns_zero_when_every_worker_succeeds(tmp_path):
     assert asyncio.run(scenario()) == 0
 
 
+def test_coding_path_routes_planner_questions_to_clarification(tmp_path):
+    """Spec §11 D3: questions on the coding path must ask the human instead of
+    burning the whole-issue failure budget on repeated planner runs."""
+    app = make_orchestrator(tmp_path)
+    app.agents["planner"].execute = AsyncMock(
+        return_value=result('```json\n{"questions": ["What auth?", "Which DB?"]}\n```\n')
+    )
+    issue = Issue(4, "Ambiguous", "Body")
+
+    run_process(app, issue)
+
+    row = app.state.rows()[0]
+    assert row["status"] == str(TaskStatus.PENDING)
+    assert row["failures"] == 0
+    added = [call.kwargs.get("add") for call in app.github.labels.await_args_list]
+    removed = [call.kwargs.get("remove") for call in app.github.labels.await_args_list]
+    assert ("agent-needs-info",) in added
+    assert ("agent-running",) in removed
+    assert any("More information needed" in body for body in comments(app))
+
+
+def test_coding_path_routes_a_split_proposal_to_the_split_flow(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.config.allow_split = True
+    app.agents["planner"].execute = AsyncMock(
+        return_value=result(
+            '```json\n{"split": [{"title": "Child A", "body": "A body"},'
+            ' {"title": "Child B", "body": "B body", "depends_on": [0]}]}\n```\n'
+        )
+    )
+    app.github.create_issue = AsyncMock(
+        side_effect=[
+            (11, "https://github.com/o/r/issues/11"),
+            (12, "https://github.com/o/r/issues/12"),
+        ]
+    )
+    issue = Issue(4, "Too big", "Body")
+
+    run_process(app, issue)
+
+    row = app.state.rows()[0]
+    assert row["status"] == str(TaskStatus.SPLIT)
+    assert [child.number for child in app.state.load_split(4)] == [11, 12]
+
+
 def comments(app: Orchestrator) -> list[str]:
     return [call.args[1] for call in app.github.comment.await_args_list]
 

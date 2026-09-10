@@ -349,13 +349,16 @@ def test_state_clear_clarify_keeps_the_round_budget(tmp_path: Path):
 
 
 def test_state_reset_restores_the_whole_clarify_budget(tmp_path: Path):
+    """The ask budget resets so the planner may ask again, but the marker stays:
+    the Q&A transcript is read from it, and a re-plan after the reset must still
+    see the answers the human already gave."""
     state = StateStore(tmp_path / "state.db")
     state.claim(Issue(4, "T", "B"), "planner")
     state.record_clarify_round(4, "2026-09-10T00:00:00+00:00")
 
     state.reset(4)
 
-    assert state.clarify_state(4) == (0, "")
+    assert state.clarify_state(4) == (0, "2026-09-10T00:00:00+00:00")
 
 
 # ---------------------------------------------------------------------------
