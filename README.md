@@ -52,7 +52,12 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
   已有 worktree 目录直接复用，不重复创建。
 - 打上 `agent-running`、移除 `agent-ready`。
 - 已有持久化 Plan 则复用（断点续跑）；否则 planner agent 把 Issue 拆成 1..N 个顺序任务，
-  存 SQLite 与 `.agent/plan.md`。planner 未配置时退化为单任务（整条 Issue 作为唯一任务）。
+  存 SQLite 与 `.agent/plan.md`。若 Issue 正文的明确计划章节（如 `实施计划`、
+  `Implementation Plan`，支持 Markdown 子标题）已有至少两条操作步骤，且步骤中至少
+  包含一个文件路径、函数名或反引号标注的技术对象，则跳过 planner，将完整正文保存为
+  单个任务，并记录 `planner_skipped` 日志；普通需求列表、空模板仍交给 planner。
+  此判断也适用于 Plan-only，仍需等待 ready 标签才执行实现。
+  planner 未配置时退化为单任务（整条 Issue 作为唯一任务）。
 - 从第一个未完成的任务继续；执行前把工作区硬重置到上一个已完成任务的 commit，
   丢弃半截提交，保证重试干净。
 
@@ -254,6 +259,10 @@ k/M 紧凑格式）、`COST`（累计美元开销）、`TIME`（累计 Agent 壁
 TIME 有值；无数据时显示 `-`。`--json` 输出含全部累积字段（`total_input_tokens`、
 `total_output_tokens`、`total_cache_read_tokens`、`total_cache_creation_tokens`、
 `total_cost_usd`、`total_duration_ms`）。
+
+表格自动适配终端宽度：`CURRENT TASK` 最多占 60 个显示列，长内容自动换行；
+中文和全角字符按两列计算，英文优先在单词边界换行。其他过长列也会换行并保持对齐。
+终端窄到无法容纳表头时，自动改为逐条 Issue 的字段列表，保留所有字段；`--json` 不受影响。
 
 `report` 同时输出 Issue 的 `queue`/`wall` 以及各 plan task 的累计 `wall`、`agent`、`checks`、
 token、cost 和 attempts；

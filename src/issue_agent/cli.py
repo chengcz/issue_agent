@@ -4,7 +4,10 @@ import argparse
 import asyncio
 import json
 import logging
+import shutil
 import sys
+import unicodedata
+from functools import lru_cache
 
 from .config import load_config
 from .github import GitHub, required_label_specs
@@ -74,7 +77,59 @@ def _format_duration(row: dict[str, object]) -> str:
     return f"{hours}h{mins:02d}m"
 
 
-def format_status(rows: list[dict[str, object]]) -> str:
+@lru_cache(maxsize=4096)
+def _char_width(char: str) -> int:
+    if unicodedata.category(char) in {"Mn", "Me", "Cf"}:
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+
+
+def _display_width(text: str) -> int:
+    """Terminal cells: CJK/fullwidth characters use two, combining marks zero."""
+    return sum(map(_char_width, text))
+
+
+def _wrap_display(text: str, width: int) -> list[str]:
+    lines: list[str] = []
+    line = ""
+    used = 0
+    for char in text:
+        size = _char_width(char)
+        if used + size > width and line:
+            # Prefer word boundaries for English; CJK and long identifiers can
+            # still break at any character. Preserve the original whitespace.
+            boundary = line.rfind(" ") + 1
+            if 0 < boundary < len(line):
+                lines.append(line[:boundary])
+                line = line[boundary:]
+                used = _display_width(line)
+            else:
+                lines.append(line)
+                line, used = "", 0
+        line += char
+        used += size
+    return [*lines, line]
+
+
+def _compact_status(headings: tuple[str, ...], rows: list[tuple[str, ...]], width: int) -> str:
+    """Keep all fields readable when the terminal cannot fit the table headers."""
+    label_width = max(map(len, headings)) + 2
+    lines: list[str] = []
+    for row in rows:
+        if lines:
+            lines.append("")
+        for heading, value in zip(headings, row):
+            if width < label_width + 2:
+                lines.extend(_wrap_display(heading + ":", width))
+                lines.extend(_wrap_display(value, width))
+                continue
+            for index, part in enumerate(_wrap_display(value, width - label_width)):
+                label = (heading + ":").ljust(label_width) if index == 0 else " " * label_width
+                lines.append(label + part)
+    return "\n".join(lines)
+
+
+def format_status(rows: list[dict[str, object]], *, terminal_width: int | None = None) -> str:
     if not rows:
         return "No matching tasks."
     headings = ("ISSUE", "STATUS", "CURRENT TASK", "AGENT", "TOKENS", "COST", "TIME", "UPDATED")
@@ -91,10 +146,39 @@ def format_status(rows: list[dict[str, object]]) -> str:
         )
         for row in rows
     ]
-    widths = [max(len(headings[i]), *(len(row[i]) for row in values)) for i in range(len(headings))]
-    header = "  ".join(value.ljust(widths[i]) for i, value in enumerate(headings))
+    # Embedded tabs/newlines must not move subsequent columns out of alignment.
+    values = [tuple(" ".join(cell.split()) for cell in row) for row in values]
+    widths = [
+        max(_display_width(headings[i]), *(_display_width(row[i]) for row in values))
+        for i in range(len(headings))
+    ]
+    if terminal_width is None:
+        terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
+    terminal_width = max(2, terminal_width)
+    minimums = list(map(_display_width, headings))
+    gaps = 2 * (len(headings) - 1)
+    if sum(minimums) + gaps > terminal_width:
+        return _compact_status(headings, values, terminal_width)
+    fixed_width = sum(widths) - widths[2] + 2 * (len(headings) - 1)
+    widths[2] = min(widths[2], max(len(headings[2]), min(60, terminal_width - fixed_width)))
+    # Long agent names/statuses must not force the terminal to wrap the whole row.
+    while sum(widths) + gaps > terminal_width:
+        column = max(range(len(widths)), key=lambda i: widths[i] - minimums[i])
+        excess = sum(widths) + gaps - terminal_width
+        widths[column] -= min(excess, widths[column] - minimums[column])
+
+    def render(row: tuple[str, ...]) -> str:
+        return "  ".join(value + " " * (widths[i] - _display_width(value))
+                         for i, value in enumerate(row))
+
+    header = render(headings)
     separator = "  ".join("-" * width for width in widths)
-    body = ["  ".join(value.ljust(widths[i]) for i, value in enumerate(row)) for row in values]
+    body: list[str] = []
+    for row in values:
+        wrapped = [_wrap_display(cell, width) for cell, width in zip(row, widths)]
+        for index in range(max(map(len, wrapped))):
+            cells = [parts[index] if index < len(parts) else "" for parts in wrapped]
+            body.append(render(tuple(cells)))
     return "\n".join((header, separator, *body))
 
 

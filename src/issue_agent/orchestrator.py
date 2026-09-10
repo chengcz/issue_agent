@@ -134,6 +134,73 @@ def _repair_json(text: str) -> str:
     return "".join(out)
 
 
+def has_detailed_plan(body: str) -> bool:
+    """Recognize explicit plan sections with multiple concrete action items.
+
+    Ignore examples and template comments; ambiguous prose still needs planning.
+    Keep the original body intact when reusing it so context is never discarded.
+    """
+    text = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    heading = re.compile(
+        r"^(?:implementation plan|implementation steps|execution plan|"
+        r"proposed implementation|agent plan|plan|实施计划|实现计划|执行计划|"
+        r"实施步骤|实现步骤|实现方案|技术方案|开发计划|计划)$", re.IGNORECASE
+    )
+    action = re.compile(
+        r"\b(?:add|update|modify|create|implement|replace|remove|refactor|"
+        r"extend|write|test|verify|run|change|move|rename|delete|ensure)\b|"
+        r"新增|添加|修改|实现|替换|删除|重构|扩展|编写|测试|验证|运行|更新|调整",
+        re.IGNORECASE,
+    )
+    # Require a concrete implementation reference in addition to action words.
+    # A generic "implement the feature / add tests" checklist is not a plan.
+    reference = re.compile(
+        r"`[^`\n]+`|\b[\w-]+(?:/[\w.-]+)+|"
+        r"\b[\w-]+\.(?:py|js|ts|tsx|jsx|go|rs|java|sql|json|toml|yaml|yml|md)\b|"
+        r"\b[A-Za-z]\w*\(\)|\b[A-Za-z]+_[A-Za-z_]\w*\b"
+    )
+    sections: list[list[str]] = []
+    steps: list[str] | None = None
+    plan_level = 0
+    fence = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if fence:
+            if re.fullmatch(re.escape(fence[0]) + "{" + str(len(fence)) + ",}", stripped):
+                fence = ""
+            continue
+        opening = re.match(r"^(`{3,}|~{3,})", stripped)
+        if opening:
+            fence = opening.group(1)
+            continue
+        atx = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", stripped)
+        bold = re.fullmatch(r"\*\*(.+?)\*\*[:：]?", stripped)
+        title = atx.group(2) if atx else bold.group(1) if bold else stripped
+        title = title.strip("* ").rstrip(":：").strip()
+        if heading.fullmatch(title):
+            # Nested plan headings belong to the same parent section.
+            if steps is None or not atx or len(atx.group(1)) <= plan_level:
+                steps = []
+                sections.append(steps)
+                plan_level = len(atx.group(1)) if atx else 6
+            continue
+        if bold or (atx and len(atx.group(1)) <= plan_level):
+            steps = None
+        if atx or bold:
+            continue
+        item = re.match(r"(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)、]\s*)(.+)", stripped)
+        if steps is not None:
+            if item:
+                steps.append(item.group(1))
+            elif steps and line.startswith((" ", "\t")) and stripped:
+                steps[-1] += " " + stripped
+    for section in sections:
+        details = [step for step in section if len(step) >= 12 and action.search(step)]
+        if len(details) >= 2 and any(reference.search(step) for step in details):
+            return True
+    return False
+
+
 def parse_plan(stdout: str, max_tasks: int) -> list[PlanTask]:
     """Parse the planner's fenced JSON block into PlanTasks, validating bounds."""
     match = re.search(r"```json\s*(.*?)\s*```", stdout, re.DOTALL)
@@ -591,8 +658,11 @@ class Orchestrator:
         acquire_agent_limit: bool = False,
         issue_log: IssueLog | None = None,
     ) -> list[PlanTask]:
-        if not self.config.planner_agent:
+        existing_plan = bool(self.config.planner_agent) and has_detailed_plan(issue.body)
+        if not self.config.planner_agent or existing_plan:
             plan = [PlanTask(title=issue.title, description=issue.body)]
+            if existing_plan and issue_log is not None:
+                issue_log.event("planner_skipped", reason="issue_contains_detailed_plan")
         else:
             await self._reset_to_anchor(workspace, issue.number, 0)
             result = await self._execute_read_only(

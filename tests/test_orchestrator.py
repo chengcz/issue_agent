@@ -14,7 +14,7 @@ from issue_agent.agents import (
 )
 from issue_agent.codegraph import CodegraphConfig
 from issue_agent.models import Issue, PlanTask, TaskStatus
-from issue_agent.orchestrator import Orchestrator, parse_plan, review_verdict
+from issue_agent.orchestrator import Orchestrator, has_detailed_plan, parse_plan, review_verdict
 from issue_agent.process import CommandError, Result
 from issue_agent.state import StateStore
 
@@ -294,6 +294,109 @@ def test_parse_plan_error_includes_context_snippet():
     """An unrepairable plan should surface the offending text in the error message."""
     with pytest.raises(CommandError, match="near:"):
         parse_plan('```json\n[{"title": "A", "description: B"}]\n```', 8)
+
+
+DETAILED_PLAN = (
+    "## 实施计划\n"
+    "1. 修改 src/issue_agent/orchestrator.py，增加已有计划判断。\n"
+    "2. 添加 tests/test_orchestrator.py 测试，验证跳过 planner。\n"
+)
+
+NESTED_PLAN = (
+    "## Implementation Plan\n"
+    "### Parser\n"
+    "1. Add parse_issue_plan in src/parser.py to recognize numbered tasks.\n"
+    "### Tests\n"
+    "2. Add tests/test_parser.py covering malformed plans and empty bodies.\n"
+)
+
+VAGUE_PLAN = "## Plan\n1. Implement the feature.\n2. Add tests for it.\n"
+BOLD_REPRODUCTION = (
+    "**Plan:**\nTBD\n**Reproduction:**\n"
+    "1. Run src/app.py with an empty configuration.\n"
+    "2. Change the input value and observe the crash.\n"
+)
+
+
+@pytest.mark.parametrize("body", [
+    DETAILED_PLAN,
+    NESTED_PLAN,
+    (
+        "## 实施计划 ##\n1. 修改任务状态的持久化逻辑。\n"
+        "   在 `save_plan` 中保存原始正文。\n2. 添加测试，验证重试时复用已保存的计划。\n"
+    ),
+    (
+        "**Implementation Plan:**\n"
+        "- [ ] Add a parser in src/parser.py for plan sections.\n"
+        "- [ ] Test the parser with empty and detailed issue bodies."
+    ),
+])
+def test_has_detailed_plan(body):
+    assert has_detailed_plan(body)
+
+
+@pytest.mark.parametrize("body", [
+    VAGUE_PLAN, BOLD_REPRODUCTION,
+    "", "Please make a plan before coding.",
+    "## Plan\n- TBD\n- Implement\n",
+    "## Plan\n1. Add a parser in src/parser.py.\n",
+    "## Requirements\n- Add a parser in src/parser.py.\n- Test empty input values.\n",
+    "## Plan\n## Reproduction\n1. Run the application locally.\n2. Change the input value.\n",
+    f"<!--\n{DETAILED_PLAN}\n-->",
+    f"```markdown\n{DETAILED_PLAN}\n```",
+    f"```markdown\n{DETAILED_PLAN}",
+    f"````markdown\n```\n{DETAILED_PLAN}\n```\n````",
+    f"~~~markdown\n{DETAILED_PLAN}\n~~~",
+    (
+        "## Plan\n1. Add a parser in src/parser.py.\n"
+        "## Tests\n2. Add tests in tests/test_parser.py.\n"
+    ),
+    (
+        "## Plan\n1. Add a parser in src/parser.py.\n"
+        "## Plan\n1. Add tests in tests/test_parser.py.\n"
+    ),
+])
+def test_ambiguous_issue_still_needs_planning(body):
+    assert not has_detailed_plan(body)
+
+
+@pytest.mark.parametrize("body", [DETAILED_PLAN, NESTED_PLAN])
+def test_detailed_issue_skips_planner_and_completes(tmp_path, body):
+    app = make_orchestrator(tmp_path)
+    app.workspaces.changed.side_effect = [True, False]
+    issue = Issue(4, "Task", body)
+
+    run_process(app, issue)
+
+    app.agents["planner"].execute.assert_not_awaited()
+    assert app.state.load_plan(4) == [PlanTask("Task", body)]
+    assert app.state.plan_task_statuses(4) == [TaskStatus.DONE]
+    assert "planner_skipped" in (app.config.log_dir / "issue-4.jsonl").read_text()
+
+
+@pytest.mark.parametrize("body", [VAGUE_PLAN, BOLD_REPRODUCTION])
+def test_ambiguous_plan_invokes_planner(tmp_path, body):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Task", body)
+    assert app.state.claim_for_planning(issue, "planner")
+
+    asyncio.run(app.plan_only(issue))
+
+    app.agents["planner"].execute.assert_awaited_once()
+    assert app.state.load_plan(4) == [PlanTask("One", "D"), PlanTask("Two", "D")]
+
+
+def test_plan_only_reuses_detailed_issue_and_waits_for_ready(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Task", DETAILED_PLAN)
+    assert app.state.claim_for_planning(issue, "planner")
+
+    asyncio.run(app.plan_only(issue))
+
+    app.agents["planner"].execute.assert_not_awaited()
+    app.agents["worker"].execute.assert_not_awaited()
+    assert app.state.load_plan(4) == [PlanTask("Task", DETAILED_PLAN)]
+    assert app.state.rows()[0]["status"] == str(TaskStatus.PLANNED)
 
 
 def test_single_task_fallback_without_planner(tmp_path):
