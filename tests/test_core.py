@@ -594,6 +594,27 @@ def test_run_feeds_stdin_and_reads_output(tmp_path: Path):
     assert result.stdout.strip() == "HELLO ISSUE-AGENT"
 
 
+def test_serial_execution_stops_at_the_first_failure(tmp_path, monkeypatch):
+    """The serial path propagates the first check exception immediately instead
+    of running the remaining commands (parallel mode collects instead)."""
+    from issue_agent.checks import _execute
+
+    calls: list[str] = []
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        calls.append(command)
+        if command == "first":
+            raise CommandError("command timed out: first")
+        return Result(0, "", "")
+
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
+
+    with pytest.raises(CommandError, match="first"):
+        asyncio.run(_execute(tmp_path, ("first", "second"), timeout=10, parallel=False))
+
+    assert calls == ["first"]
+
+
 def test_cross_repo_blocker_parsing():
     from issue_agent.orchestrator import cross_repo_blockers, declared_blockers
 

@@ -29,6 +29,14 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("Stripe secret key", re.compile(r"\bsk_live_[A-Za-z0-9]{24,}\b")),
     ("OpenAI API key", re.compile(r"\bsk-proj-[A-Za-z0-9\-_]{20,}\b")),
     ("Hardcoded password assignment", re.compile(r"(?i)\bpassword\b\s*[=:]\s*['\"][^'\"]{6,}['\"]")),
+    # Unquoted assignments: the lookahead pair demands both letters and digits,
+    # so type annotations (``password: str``) and accessor calls
+    # (``password = getpass()``) stay quiet while ``password = hunter2secret``
+    # is caught.
+    ("Unquoted credential assignment", re.compile(
+        r"(?i)\b(password|passwd|secret|token|api[_-]?key)\b\s*[=:]\s*"
+        r"(?=[^\s'\"]*[0-9])(?=[^\s'\"]*[A-Za-z])[^\s'\"]{8,}"
+    )),
 ]
 
 # ---------------------------------------------------------------------------
@@ -36,7 +44,7 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 # ---------------------------------------------------------------------------
 
 _FORBIDDEN_FILE_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"(^|/)\.env(\.|$)"),
+    re.compile(r"(^|/)\.env(\.|$)", re.IGNORECASE),
     re.compile(r"(^|/)credentials(\.|$)", re.IGNORECASE),
     re.compile(r"(^|/)secrets?\.(json|ya?ml|toml|env)$", re.IGNORECASE),
     re.compile(r"\.pem$"),
