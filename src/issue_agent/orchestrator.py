@@ -565,6 +565,7 @@ class Orchestrator:
             # dependency that will never resolve, and leave the comment as the
             # only signal a human gets.
             await self._warn_self_dependency(issue)
+            self._audit(issue).event("dependency_blocked", blockers=[issue.number])
             return True
         if not issue.blocked_by:
             return False
@@ -579,7 +580,20 @@ class Orchestrator:
             if not blocker.closed
         ]
         await self._announce_blockers(issue, open_blockers)
+        if open_blockers:
+            self._audit(issue).event(
+                "dependency_blocked", blockers=[blocker.number for blocker in open_blockers]
+            )
         return bool(open_blockers)
+
+    def _audit(self, issue: Issue) -> IssueLog:
+        """An issue log for a check that runs before any run is in flight.
+
+        The gate, its warnings, and reply detection all fire during a poll
+        rather than inside a planning or coding attempt, so there is no caller
+        with a log to pass down.
+        """
+        return IssueLog(self.config.log_dir, issue.number)
 
     async def _announce_blockers(self, issue: Issue, open_blockers: list[Blocker]) -> None:
         """Post the one-shot comment saying what still blocks this issue.
@@ -611,6 +625,9 @@ class Orchestrator:
                 "✅ **Dependencies closed**\n\n"
                 "Every blocker is now closed; this issue resumes on the next poll."
             )
+            # Only the poll that empties a previously announced set logs this,
+            # so the log records the transition rather than every later poll.
+            self._audit(issue).event("dependency_cleared", blockers=previous or [])
         await self.github.comment(issue.number, body)
         notices["pending"] = current
         self.state.save_blocker_notices(issue.number, notices)
@@ -642,6 +659,9 @@ class Orchestrator:
             f"- Body names: {_refs(claimed)}\n"
             f"- Native blocked-by: {_refs(native)}\n\n"
             "Update the links (or the body) so the two agree.",
+        )
+        self._audit(issue).event(
+            "dependency_body_mismatch", declared=list(claimed), native=list(native)
         )
         notices["declared"] = list(claimed)
         notices["native"] = list(native)
@@ -806,6 +826,7 @@ class Orchestrator:
         issue_log.event("clarify_requested", rounds=rounds, questions=list(questions))
         listing = "\n".join(f"{index}. {question}" for index, question in enumerate(questions, 1))
         if rounds > self.config.max_clarify_rounds:
+            issue_log.event("clarify_exhausted", rounds=rounds)
             body = (
                 f"{CLARIFY_HEADING}\n\n{listing}\n\n"
                 f"Planning has already asked {rounds - 1} time(s), the configured limit of "
@@ -856,6 +877,7 @@ class Orchestrator:
             )
             if answered:
                 await self.github.labels(number, remove=(NEEDS_INFO_LABEL,))
+                IssueLog(self.config.log_dir, number).event("clarify_answered")
                 log.info("issue #%s: clarification answered; back in the planning queue", number)
 
     async def _my_login(self) -> str:
@@ -913,7 +935,7 @@ class Orchestrator:
             )
             recorded_split = self.state.load_split(issue.number)
             if recorded_split:
-                issue_log.event("split_resumed", children=len(recorded_split))
+                issue_log.event("split_reused", children=len(recorded_split))
                 await self._complete_split(issue, recorded_split, issue_log=issue_log)
                 outcome = str(TaskStatus.SPLIT)
                 return
@@ -1048,6 +1070,11 @@ class Orchestrator:
                 self.state.update_split_child(issue.number, index, linked=True)
         except CommandError as exc:
             done = [child for child in created if child.number]
+            issue_log.event(
+                "split_partial",
+                created=[child.number for child in done],
+                error=str(exc),
+            )
             if done:
                 # Partially created: the parent stays on the retry path rather
                 # than going to review, but the human still gets to see which

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -607,6 +608,64 @@ def test_dependency_gate_holds_an_issue_whose_body_blocks_on_itself(tmp_path):
     assert "itself" in comments(app)[0]
 
 
+def events(app: Orchestrator, number: int = 4) -> list[dict]:
+    path = app.config.log_dir / f"issue-{number}.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def names(app: Orchestrator, number: int = 4) -> list[str]:
+    return [record["event"] for record in events(app, number)]
+
+
+def test_dependency_gate_records_every_skipped_admission(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="B", blocked_by=(2, 3))
+    app.github.blocker_states = AsyncMock(
+        return_value={2: Blocker(2, "Ship the parser", True), 3: Blocker(3, "Add the API", False)}
+    )
+
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+
+    # The comment is deduplicated; the audit log must not be, or a poll that
+    # keeps skipping the issue would look like it never happened.
+    blocked = [record for record in events(app) if record["event"] == "dependency_blocked"]
+    assert [record["blockers"] for record in blocked] == [[3], [3]]
+
+
+def test_dependency_gate_records_the_all_clear_once(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="B", blocked_by=(2,))
+    app.github.blocker_states = AsyncMock(return_value={2: Blocker(2, "First", False)})
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+
+    app.github.blocker_states = AsyncMock(return_value={2: Blocker(2, "First", True)})
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is False
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is False
+
+    assert names(app).count("dependency_cleared") == 1
+
+
+def test_dependency_gate_records_a_self_dependency_it_holds(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="B", blocked_by=(4,))
+
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+
+    assert names(app).count("dependency_blocked") == 1
+
+
+def test_dependency_gate_records_a_body_mismatch(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="## 依赖与风险\n\n- Blocked by: #7\n")
+
+    asyncio.run(app._dependency_gate(issue, None, cache={}))
+
+    assert names(app) == ["dependency_body_mismatch"]
+
+
 def track_admissions(app: Orchestrator) -> list[int]:
     """Record what run_once admits, closing the worker so no task is left pending."""
     admitted: list[int] = []
@@ -863,6 +922,9 @@ def test_plan_only_stops_asking_once_the_round_budget_is_spent(tmp_path):
     assert added_labels(app) == ["agent-needs-info"]
     assert app.state.clarify_state(4)[0] == 2
     assert "issue-agent reset" in app.github.comment.await_args.args[1]
+    # The log has to say the orchestrator stopped watching, since nothing else
+    # in the issue records that this is now a manual handoff.
+    assert "clarify_exhausted" in names(app)
 
 
 def test_plan_only_replans_with_the_clarification_transcript(tmp_path):
@@ -987,6 +1049,7 @@ def test_split_failure_keeps_the_parent_retryable_and_reports_progress(tmp_path)
     assert added_labels(app) == []
     assert [child.number for child in app.state.load_split(4)] == [12, 0]
     assert "#12" in app.github.comment.await_args.args[1]
+    assert "split_partial" in names(app)
 
 
 def test_split_retry_creates_only_the_missing_children(tmp_path):
@@ -1011,6 +1074,8 @@ def test_split_retry_creates_only_the_missing_children(tmp_path):
     assert [call.args for call in app.github.link_parent.await_args_list] == [(13, 4)]
     assert [call.args for call in app.github.add_blocked_by.await_args_list] == [(13, 12)]
     assert app.state.rows()[0]["status"] == str(TaskStatus.SPLIT)
+    assert "split_reused" in names(app)
+    assert "split_created" in names(app)
 
 
 def test_split_without_a_usable_issue_number_fails_the_plan(tmp_path):
@@ -1071,6 +1136,7 @@ def test_run_once_releases_an_issue_a_human_has_answered(tmp_path):
 
     assert app.github.labels.await_args.args == (4,)
     assert app.github.labels.await_args.kwargs == {"remove": ("agent-needs-info",)}
+    assert "clarify_answered" in names(app)
 
 
 def test_run_once_ignores_discussion_from_before_the_question(tmp_path):
