@@ -11,7 +11,7 @@ from issue_agent.cli import format_report, format_status, parser
 from issue_agent.config import load_config
 from issue_agent.github import GitHub
 from issue_agent.issue_log import IssueLog
-from issue_agent.models import Issue, PlanTask, TaskStatus
+from issue_agent.models import Issue, PlanOutcome, PlanTask, SplitChild, TaskStatus
 from issue_agent.orchestrator import Orchestrator
 from issue_agent.process import CommandError, Result, shell
 from issue_agent.state import StateStore
@@ -662,6 +662,88 @@ repo = "a/b"
     )
     with pytest.raises(ValueError, match="max_workers"):
         load_config(config_file)
+
+
+def test_config_defaults_leave_new_workflow_features_off(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text('''
+[runtime]
+repo = "."
+[github]
+repo = "a/b"
+''')
+    config = load_config(config_file)
+    assert config.auto_ready_with_plan is False
+    assert config.allow_split is False
+    assert config.max_split_children == 5
+    assert config.max_clarify_rounds == 2
+    assert config.clarify_ignore_authors == ()
+
+
+def test_config_parses_new_workflow_features(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text('''
+[runtime]
+repo = "."
+auto_ready_with_plan = true
+allow_split = true
+max_split_children = 3
+max_clarify_rounds = 4
+clarify_ignore_authors = ["Dependabot[bot]", "ci-bot"]
+[github]
+repo = "a/b"
+''')
+    config = load_config(config_file)
+    assert config.auto_ready_with_plan is True
+    assert config.allow_split is True
+    assert config.max_split_children == 3
+    assert config.max_clarify_rounds == 4
+    assert config.clarify_ignore_authors == ("dependabot[bot]", "ci-bot")
+
+
+def test_config_rejects_nonpositive_new_limits(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    for key in ("max_split_children", "max_clarify_rounds"):
+        config_file.write_text(f'''
+[runtime]
+repo = "."
+{key} = 0
+[github]
+repo = "a/b"
+''')
+        with pytest.raises(ValueError, match=key):
+            load_config(config_file)
+
+
+def test_issue_defaults_have_no_blockers_or_parent():
+    issue = Issue(number=1, title="T", body="B")
+    assert issue.blocked_by == ()
+    assert issue.parent is None
+
+
+def test_split_child_carries_planner_proposed_sibling_dependencies():
+    assert SplitChild(title="First", body="Body", depends_on=(0, 2)).depends_on == (0, 2)
+    assert SplitChild(title="Second", body="Body").depends_on == ()
+
+
+def test_plan_outcome_represents_one_planner_shape_at_a_time():
+    planned = PlanOutcome(tasks=(PlanTask(title="t", description="d"),))
+    asked = PlanOutcome(questions=("Which module?",))
+    split = PlanOutcome(split=(SplitChild(title="c", body="b"),))
+
+    assert planned.tasks and not planned.questions and not planned.split
+    assert asked.questions and not asked.tasks and not asked.split
+    assert split.split and not split.tasks and not split.questions
+
+
+def test_split_status_is_not_claimable(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(number=7, title="Split parent", body="")
+    assert state.claim(issue, "codex") is True
+
+    state.update(7, TaskStatus.SPLIT)
+
+    assert state.claim(issue, "codex") is False
 
 
 def test_github_unassigned_issues_keeps_product_labels(tmp_path: Path):

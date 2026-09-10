@@ -50,6 +50,11 @@ class Config:
     max_tasks: int = 8
     auto_plan_unlabeled: bool = False
     auto_plan_limit: int = 20
+    auto_ready_with_plan: bool = False
+    allow_split: bool = False
+    max_split_children: int = 5
+    max_clarify_rounds: int = 2
+    clarify_ignore_authors: tuple[str, ...] = ()
     dry_run: bool = False
     agents: dict[str, AgentConfig] = field(default_factory=dict)
 
@@ -67,6 +72,8 @@ def validate_config(config: Config) -> None:
         "runtime.max_task_attempts": config.max_task_attempts,
         "runtime.max_tasks": config.max_tasks,
         "runtime.auto_plan_limit": config.auto_plan_limit,
+        "runtime.max_split_children": config.max_split_children,
+        "runtime.max_clarify_rounds": config.max_clarify_rounds,
         "checks.timeout_seconds": config.check_timeout_seconds,
         "checks.max_workers": config.max_check_workers,
         "checks.baseline_cache_max_entries": config.baseline_cache_max_entries,
@@ -181,6 +188,15 @@ def load_config(path: str | Path) -> Config:
         max_tasks=int(runtime.get("max_tasks", 8)),
         auto_plan_unlabeled=bool(runtime.get("auto_plan_unlabeled", False)),
         auto_plan_limit=int(runtime.get("auto_plan_limit", 20)),
+        auto_ready_with_plan=bool(runtime.get("auto_ready_with_plan", False)),
+        allow_split=bool(runtime.get("allow_split", False)),
+        max_split_children=int(runtime.get("max_split_children", 5)),
+        max_clarify_rounds=int(runtime.get("max_clarify_rounds", 2)),
+        # GitHub logins are case-insensitive; normalize once so the comment
+        # author comparison does not have to remember that.
+        clarify_ignore_authors=tuple(
+            str(author).lower() for author in runtime.get("clarify_ignore_authors", [])
+        ),
         dry_run=bool(runtime.get("dry_run", False)),
         agents=agents,
         schedule=load_schedule(raw.get("schedule", {})),

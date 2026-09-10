@@ -16,6 +16,22 @@ auto_plan_unlabeled = true
 auto_plan_limit = 20
 dry_run = false
 
+# Workflow gates. All default to off; enable per repository.
+# auto_ready_with_plan: when an issue body already carries a concrete plan,
+#   publish it and add the ready label instead of waiting for human approval.
+#   Only applies to the planner-skip path, so LLM-written plans still need review.
+auto_ready_with_plan = false
+# allow_split: let the planner split an oversized issue into independent child
+#   issues. Children never get the ready label automatically.
+allow_split = false
+max_split_children = 5
+# max_clarify_rounds: how many times the planner may ask for more information
+#   before the issue is parked for a human reset.
+max_clarify_rounds = 2
+# clarify_ignore_authors: extra comment authors (beyond this machine's login)
+#   that never count as a human answer to a planner question.
+clarify_ignore_authors = []
+
 # Optional weekly admission windows (uncomment to enable; restart after editing).
 # No allow rules means all times are allowed except deny rules; deny wins overlaps.
 # Omitted days means every day; overnight windows belong to their starting weekday.
