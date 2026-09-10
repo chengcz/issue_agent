@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from collections import OrderedDict
+from collections.abc import Iterable
 
 from .agents import (
     CliAgent,
@@ -21,7 +22,7 @@ from .config import Config
 from .formal_review import formal_review
 from .github import GitHub
 from .issue_log import IssueLog
-from .models import Issue, PlanOutcome, PlanTask, SplitChild, TaskStatus
+from .models import Blocker, Issue, PlanOutcome, PlanTask, SplitChild, TaskStatus
 from .process import CommandError, Result
 from .schedule import ScheduleConfig
 from .state import RUNNING_STATUSES, StateStore
@@ -202,6 +203,36 @@ def has_detailed_plan(body: str) -> bool:
         if len(details) >= 2 and any(reference.search(step) for step in details):
             return True
     return False
+
+
+_BLOCKER_DECLARATION = re.compile(
+    r"blocked\s+by|depends\s+on|dependenc(?:y|ies)|blockers?\s*[:：]|前置|依赖",
+    re.IGNORECASE,
+)
+_ISSUE_REFERENCE = re.compile(r"#(\d+)")
+
+
+def declared_blockers(body: str) -> tuple[int, ...]:
+    """Issue numbers the body claims to depend on, sorted and deduplicated.
+
+    Only a line that also names a dependency is a declaration: a bare ``#12`` in
+    prose, or a ``## 依赖与风险`` heading with nothing under it, is not. Native
+    ``blockedBy`` is the relation the gate acts on, so this reading is advisory
+    and deliberately loose — a false positive costs one comment, while a miss
+    would leave a human believing a body line gates the workflow when it does
+    not. Fenced examples are not special-cased for the same reason.
+    """
+    text = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    found: set[int] = set()
+    for line in text.splitlines():
+        if _BLOCKER_DECLARATION.search(line):
+            found.update(int(number) for number in _ISSUE_REFERENCE.findall(line))
+    return tuple(sorted(found))
+
+
+def _refs(numbers: Iterable[int]) -> str:
+    """Render issue numbers as ``#1, #2`` for a comment body."""
+    return ", ".join(f"#{number}" for number in numbers) or "none"
 
 
 def _planner_payload(stdout: str) -> object:
@@ -409,27 +440,124 @@ class Orchestrator:
             self._schedule_open = allowed
         return allowed
 
-    async def _dependency_gate(self, issue: Issue, row, *, cache: dict[int, bool]) -> bool:
+    async def _dependency_gate(self, issue: Issue, row, *, cache: dict[int, Blocker]) -> bool:
         """True when an issue must wait for its native blockers to close.
 
         Only first admission is gated. An issue already under way is exempt: a
         crashed run keeps its ``agent-running`` label precisely so it can be
-        resumed, and a blocker reopening must not strand that recovery. The
-        cache spans one poll so several candidates sharing a blocker cost one
-        lookup.
+        resumed, and a blocker reopening must not strand that recovery. Exempt
+        issues are left out of the comments below too, so recovery does not
+        reopen a conversation about a relation that no longer gates anything.
+        The cache spans one poll so several candidates sharing a blocker cost
+        one lookup.
         """
-        if not issue.blocked_by:
-            return False
         if "agent-running" in issue.labels:
             return False
         if row is not None and row["status"] in _RUNNING_STATUSES:
             return False
-        pending = [number for number in issue.blocked_by if number not in cache]
-        if pending:
-            cache.update(await self.github.blocker_states(pending))
+        declared = declared_blockers(issue.body)
+        await self._warn_dependency_mismatch(issue, declared)
+        if issue.number in issue.blocked_by or issue.number in declared:
+            # A self-link can never close; hold the issue rather than spin on a
+            # dependency that will never resolve, and leave the comment as the
+            # only signal a human gets.
+            await self._warn_self_dependency(issue)
+            return True
+        if not issue.blocked_by:
+            return False
+        missing = [number for number in issue.blocked_by if number not in cache]
+        if missing:
+            cache.update(await self.github.blocker_states(missing))
         # An unresolved blocker is treated as still open: blocking is the safe
         # direction, and the next poll resolves it.
-        return any(not cache.get(number, False) for number in issue.blocked_by)
+        open_blockers = [
+            blocker
+            for blocker in (cache.get(number) or Blocker(number) for number in issue.blocked_by)
+            if not blocker.closed
+        ]
+        await self._announce_blockers(issue, open_blockers)
+        return bool(open_blockers)
+
+    async def _announce_blockers(self, issue: Issue, open_blockers: list[Blocker]) -> None:
+        """Post the one-shot comment saying what still blocks this issue.
+
+        What was already announced lives in SQLite, so a poll that changes
+        nothing stays silent: a comment is sent only when the blocker set is new,
+        has grown, or has just emptied.
+        """
+        notices = self.state.load_blocker_notices(issue.number)
+        previous = notices.get("pending")
+        current = sorted(blocker.number for blocker in open_blockers)
+        # ``previous is None`` means nothing was ever announced, which is also
+        # the silent case when there is nothing to announce.
+        if current == previous or (previous is None and not current):
+            return
+        if current:
+            listing = "\n".join(
+                f"- #{blocker.number} {blocker.title}".rstrip() for blocker in open_blockers
+            )
+            body = (
+                "⏳ **Waiting on dependencies**\n\n"
+                "This issue is blocked by:\n\n"
+                f"{listing}\n\n"
+                "Planning and coding begin once every blocker is closed. If the "
+                "relation is wrong, edit this issue's native blocked-by links."
+            )
+        else:
+            body = (
+                "✅ **Dependencies closed**\n\n"
+                "Every blocker is now closed; this issue resumes on the next poll."
+            )
+        await self.github.comment(issue.number, body)
+        notices["pending"] = current
+        self.state.save_blocker_notices(issue.number, notices)
+
+    async def _warn_dependency_mismatch(self, issue: Issue, declared: tuple[int, ...]) -> None:
+        """Flag blockers the body claims that the native links do not have.
+
+        The gate acts only on native ``blockedBy``, so a body line naming an
+        issue the links omit silently does nothing. This runs for every
+        candidate — it is pure string work with no API cost — and comments once
+        per distinct (declared, native) pair. A body naming nothing is normal and
+        stays quiet; the native links may simply not have been written down.
+        """
+        claimed = tuple(number for number in declared if number != issue.number)
+        if not claimed:
+            return
+        native = tuple(sorted(issue.blocked_by))
+        if claimed == native:
+            return
+        notices = self.state.load_blocker_notices(issue.number)
+        if notices.get("declared") == list(claimed) and notices.get("native") == list(native):
+            return
+        await self.github.comment(
+            issue.number,
+            "⚠️ **Dependency mismatch**\n\n"
+            "The issue body names blockers that the native blocked-by links do "
+            "not have. Only the native links gate the workflow, so the body line "
+            "is currently ignored.\n\n"
+            f"- Body names: {_refs(claimed)}\n"
+            f"- Native blocked-by: {_refs(native)}\n\n"
+            "Update the links (or the body) so the two agree.",
+        )
+        notices["declared"] = list(claimed)
+        notices["native"] = list(native)
+        self.state.save_blocker_notices(issue.number, notices)
+
+    async def _warn_self_dependency(self, issue: Issue) -> None:
+        """Warn once that an issue lists itself as a blocker."""
+        notices = self.state.load_blocker_notices(issue.number)
+        if notices.get("self"):
+            return
+        await self.github.comment(
+            issue.number,
+            "⚠️ **Self-dependency**\n\n"
+            f"This issue is listed as blocked by itself (#{issue.number}), a "
+            "relation that can never close. Remove the self-link to let the "
+            "workflow proceed.",
+        )
+        notices["self"] = True
+        self.state.save_blocker_notices(issue.number, notices)
 
     def _eligible(self, row, *, planning: bool = False) -> bool:
         # Read-only prefilter prevents completed/parked candidates from repeatedly
@@ -454,7 +582,7 @@ class Orchestrator:
         else:
             runnable, planning = await runnable_call, []
         persisted = {int(row["issue_number"]): row for row in self.state.rows()}
-        blocker_cache: dict[int, bool] = {}
+        blocker_cache: dict[int, Blocker] = {}
         for issue in runnable:
             if issue.number in self.running:
                 continue

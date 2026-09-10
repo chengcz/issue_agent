@@ -11,7 +11,7 @@ from issue_agent.cli import format_report, format_status, parser
 from issue_agent.config import load_config
 from issue_agent.github import GitHub
 from issue_agent.issue_log import IssueLog
-from issue_agent.models import Issue, PlanOutcome, PlanTask, SplitChild, TaskStatus
+from issue_agent.models import Blocker, Issue, PlanOutcome, PlanTask, SplitChild, TaskStatus
 from issue_agent.orchestrator import Orchestrator
 from issue_agent.process import CommandError, Result, shell
 from issue_agent.state import StateStore
@@ -221,6 +221,43 @@ def test_state_reset_makes_parked_issue_claimable_again(tmp_path: Path):
 def test_state_reset_returns_none_for_unknown_issue(tmp_path: Path):
     state = StateStore(tmp_path / "state.db")
     assert state.reset(99) is None
+
+
+def test_state_blocker_notices_round_trip_without_a_task_row(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+
+    # The dependency gate records notices before the issue is ever claimed, so
+    # the record must not depend on a tasks row existing.
+    assert state.load_blocker_notices(4) == {}
+
+    state.save_blocker_notices(4, {"pending": [2, 3]})
+
+    assert state.load_blocker_notices(4) == {"pending": [2, 3]}
+    assert state.rows() == []
+
+
+def test_state_blocker_notices_read_malformed_or_foreign_values_as_empty(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.save_blocker_notices(4, {"pending": [2]})
+    state.save_blocker_notices(5, {"pending": [2]})
+    with state.connect() as db:
+        db.execute("UPDATE blocker_notices SET blockers_notified='{' WHERE issue_number=4")
+        db.execute("UPDATE blocker_notices SET blockers_notified='[2]' WHERE issue_number=5")
+
+    # A hand-edited database must not wedge the poll loop; the next comment
+    # simply rewrites the record.
+    assert state.load_blocker_notices(4) == {}
+    assert state.load_blocker_notices(5) == {}
+
+
+def test_state_reset_forgets_blocker_notices(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(4, "T", "B"), "codex")
+    state.save_blocker_notices(4, {"pending": [2]})
+
+    state.reset(4)
+
+    assert state.load_blocker_notices(4) == {}
 
 
 # ---------------------------------------------------------------------------
@@ -779,15 +816,25 @@ def test_open_issues_reads_native_blockers_and_parent(tmp_path: Path):
     assert issues[1].parent is None
 
 
-def test_blocker_states_reports_closed_blockers(tmp_path: Path):
+def test_blocker_states_reports_closed_blockers_and_their_titles(tmp_path: Path):
     github = GitHub("owner/repo", tmp_path)
     github._gh = AsyncMock(
-        side_effect=['{"number": 2, "state": "CLOSED"}', '{"number": 3, "state": "OPEN"}']
+        side_effect=[
+            '{"number": 2, "title": "First", "state": "CLOSED"}',
+            '{"number": 3, "title": "Second", "state": "OPEN"}',
+        ]
     )
 
     states = asyncio.run(github.blocker_states([3, 2]))
 
-    assert states == {2: True, 3: False}
+    assert states == {2: Blocker(2, "First", True), 3: Blocker(3, "Second", False)}
+    assert github._gh.await_args_list[0].args == (
+        "issue",
+        "view",
+        "2",
+        "--json",
+        "number,title,state",
+    )
     assert github._gh.await_count == 2
 
 

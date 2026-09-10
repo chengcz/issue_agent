@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .formal_review import redact_secrets
-from .models import Issue
+from .models import Blocker, Issue
 from .process import CommandError, run
 
 # Labels the orchestrator applies itself, with recommended colors and
@@ -77,21 +77,29 @@ class GitHub:
             for item in json.loads(output)
         ]
 
-    async def blocker_states(self, numbers: Iterable[int]) -> dict[int, bool]:
-        """Map each blocker issue number to whether it is closed.
+    async def blocker_states(self, numbers: Iterable[int]) -> dict[int, Blocker]:
+        """Map each blocker issue number to its title and whether it is closed.
 
         One ``gh issue view`` per blocker rather than a single GraphQL query:
         ``gh api`` takes no ``--repo`` flag, so batching would need its own repo
         plumbing, and blockers are rare enough that the extra calls only happen
-        for the handful of gated candidates. Callers must treat a missing entry
-        as still open.
+        for the handful of gated candidates. Titles come along because the gate
+        names its blockers in a comment. Callers must treat a missing entry as
+        still open.
         """
         wanted = sorted(set(numbers))
         outputs = await asyncio.gather(
-            *(self._gh("issue", "view", str(number), "--json", "number,state") for number in wanted)
+            *(
+                self._gh("issue", "view", str(number), "--json", "number,title,state")
+                for number in wanted
+            )
         )
         return {
-            int(item["number"]): item.get("state") == "CLOSED"
+            int(item["number"]): Blocker(
+                number=int(item["number"]),
+                title=str(item.get("title") or ""),
+                closed=item.get("state") == "CLOSED",
+            )
             for item in (json.loads(output) for output in outputs)
         }
 

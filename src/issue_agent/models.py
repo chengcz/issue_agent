@@ -61,6 +61,20 @@ class PlanTask:
 
 
 @dataclass(frozen=True)
+class Blocker:
+    """One native ``blockedBy`` entry, as far as the dependency gate needs it.
+
+    ``title`` is carried so the one-shot "waiting on" comment can name each
+    blocker instead of only numbering it. Defaults describe the pessimistic
+    reading a caller must take when a lookup came back with nothing: open.
+    """
+
+    number: int
+    title: str = ""
+    closed: bool = False
+
+
+@dataclass(frozen=True)
 class SplitChild:
     """One child issue the planner proposes when the request is too large.
 

@@ -13,9 +13,10 @@ from issue_agent.agents import (
     make_task_review_prompt,
 )
 from issue_agent.codegraph import CodegraphConfig
-from issue_agent.models import Issue, PlanTask, TaskStatus
+from issue_agent.models import Blocker, Issue, PlanTask, TaskStatus
 from issue_agent.orchestrator import (
     Orchestrator,
+    declared_blockers,
     has_detailed_plan,
     parse_plan,
     parse_plan_output,
@@ -390,14 +391,40 @@ def test_parse_plan_output_rejects_dependency_cycles():
         )
 
 
+def test_declared_blockers_reads_english_and_chinese_declarations():
+    body = (
+        "## 依赖与风险\n\n"
+        "- Blocked by: #12\n"
+        "- Depends on: #13, #14\n"
+        "- 前置 Issue：#15\n"
+        "- 依赖：#16\n"
+    )
+
+    assert declared_blockers(body) == (12, 13, 14, 15, 16)
+
+
+def test_declared_blockers_ignores_issue_references_outside_a_declaration():
+    body = "## Scope\n\nSee #12 for background; this supersedes #13.\n"
+
+    assert declared_blockers(body) == ()
+
+
+def test_declared_blockers_reports_each_reference_once():
+    assert declared_blockers("Depends on #12; also blocked by #12.\n") == (12,)
+
+
 def test_dependency_gate_blocks_until_every_blocker_closes(tmp_path):
     app = make_orchestrator(tmp_path)
     partly_open = Issue(number=4, title="T", body="B", blocked_by=(2, 3))
 
-    app.github.blocker_states = AsyncMock(return_value={2: True, 3: False})
+    app.github.blocker_states = AsyncMock(
+        return_value={2: Blocker(2, "First", True), 3: Blocker(3, "Second", False)}
+    )
     assert asyncio.run(app._dependency_gate(partly_open, None, cache={})) is True
 
-    app.github.blocker_states = AsyncMock(return_value={2: True, 3: True})
+    app.github.blocker_states = AsyncMock(
+        return_value={2: Blocker(2, "First", True), 3: Blocker(3, "Second", True)}
+    )
     assert asyncio.run(app._dependency_gate(partly_open, None, cache={})) is False
 
 
@@ -411,7 +438,7 @@ def test_dependency_gate_treats_unresolved_blockers_as_open(tmp_path):
 
 def test_dependency_gate_ignores_issues_that_are_already_under_way(tmp_path):
     app = make_orchestrator(tmp_path)
-    app.github.blocker_states = AsyncMock(return_value={2: False})
+    app.github.blocker_states = AsyncMock(return_value={2: Blocker(2, "First", False)})
 
     interrupted = Issue(number=4, title="T", body="B", labels=("agent-running",), blocked_by=(2,))
     resuming = Issue(number=5, title="T", body="B", blocked_by=(2,))
@@ -423,15 +450,110 @@ def test_dependency_gate_ignores_issues_that_are_already_under_way(tmp_path):
 
 def test_dependency_gate_reuses_the_blocker_cache_across_candidates(tmp_path):
     app = make_orchestrator(tmp_path)
-    app.github.blocker_states = AsyncMock(return_value={2: True})
+    app.github.blocker_states = AsyncMock(return_value={2: Blocker(2, "First", True)})
     first = Issue(number=4, title="T", body="B", blocked_by=(2,))
     second = Issue(number=5, title="T", body="B", blocked_by=(2,))
-    cache: dict[int, bool] = {}
+    cache: dict[int, Blocker] = {}
 
     assert asyncio.run(app._dependency_gate(first, None, cache=cache)) is False
     assert asyncio.run(app._dependency_gate(second, None, cache=cache)) is False
 
     assert app.github.blocker_states.await_count == 1
+
+
+def comments(app: Orchestrator) -> list[str]:
+    return [call.args[1] for call in app.github.comment.await_args_list]
+
+
+def test_dependency_gate_comments_once_about_the_open_blockers(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="B", blocked_by=(2, 3))
+    app.github.blocker_states = AsyncMock(
+        return_value={2: Blocker(2, "Ship the parser", True), 3: Blocker(3, "Add the API", False)}
+    )
+
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+
+    assert len(comments(app)) == 1
+    assert "#3" in comments(app)[0] and "Add the API" in comments(app)[0]
+    assert "#2" not in comments(app)[0]
+
+
+def test_dependency_gate_announces_the_all_clear_once(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="B", blocked_by=(2,))
+    app.github.blocker_states = AsyncMock(return_value={2: Blocker(2, "First", False)})
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+
+    app.github.blocker_states = AsyncMock(return_value={2: Blocker(2, "First", True)})
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is False
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is False
+
+    assert len(comments(app)) == 2
+    assert "closed" in comments(app)[1].lower()
+
+
+def test_dependency_gate_comments_again_when_a_new_blocker_appears(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="B", blocked_by=(2,))
+    app.github.blocker_states = AsyncMock(return_value={2: Blocker(2, "First", False)})
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+
+    grown = Issue(number=4, title="T", body="B", blocked_by=(2, 3))
+    app.github.blocker_states = AsyncMock(
+        return_value={2: Blocker(2, "First", False), 3: Blocker(3, "Second", False)}
+    )
+    assert asyncio.run(app._dependency_gate(grown, None, cache={})) is True
+
+    assert len(comments(app)) == 2
+    assert "#3" in comments(app)[1]
+
+
+def test_dependency_gate_warns_once_when_the_body_claims_unlinked_blockers(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="## 依赖与风险\n\n- Blocked by: #7\n")
+
+    # Native blocked-by is empty, so nothing gates the issue; the body line is
+    # still worth one comment because the human clearly meant it to.
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is False
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is False
+
+    assert len(comments(app)) == 1
+    assert "#7" in comments(app)[0]
+
+
+def test_dependency_gate_stays_quiet_when_body_and_native_agree(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="Depends on: #2\n", blocked_by=(2,))
+    app.github.blocker_states = AsyncMock(return_value={2: Blocker(2, "First", True)})
+
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is False
+
+    assert comments(app) == []
+
+
+def test_dependency_gate_warns_once_about_a_native_self_dependency(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="B", blocked_by=(4,))
+    app.github.blocker_states = AsyncMock(return_value={4: Blocker(4, "T", False)})
+
+    # A self-link can never close, so the issue stays held instead of spinning.
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+
+    self_warnings = [body for body in comments(app) if "itself" in body]
+    assert len(self_warnings) == 1
+
+
+def test_dependency_gate_holds_an_issue_whose_body_blocks_on_itself(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="Blocked by: #4\n")
+
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+
+    assert len(comments(app)) == 1
+    assert "itself" in comments(app)[0]
 
 
 def track_admissions(app: Orchestrator) -> list[int]:
@@ -450,7 +572,7 @@ def test_run_once_leaves_a_blocked_ready_issue_unclaimed(tmp_path):
     app = make_orchestrator(tmp_path)
     blocked = Issue(number=4, title="T", body="B", labels=("agent-ready",), blocked_by=(2,))
     app.github.runnable_issues = AsyncMock(return_value=[blocked])
-    app.github.blocker_states = AsyncMock(return_value={2: False})
+    app.github.blocker_states = AsyncMock(return_value={2: Blocker(2, "First", False)})
     admitted = track_admissions(app)
 
     asyncio.run(app.run_once())
@@ -463,7 +585,7 @@ def test_run_once_admits_a_ready_issue_once_its_blockers_close(tmp_path):
     app = make_orchestrator(tmp_path)
     ready = Issue(number=4, title="T", body="B", labels=("agent-ready",), blocked_by=(2,))
     app.github.runnable_issues = AsyncMock(return_value=[ready])
-    app.github.blocker_states = AsyncMock(return_value={2: True})
+    app.github.blocker_states = AsyncMock(return_value={2: Blocker(2, "First", True)})
     admitted = track_admissions(app)
 
     asyncio.run(app.run_once())

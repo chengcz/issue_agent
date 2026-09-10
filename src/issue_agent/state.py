@@ -141,6 +141,14 @@ class StateStore:
                 session_id TEXT NOT NULL, updated_at TEXT NOT NULL,
                 PRIMARY KEY(issue_number,agent,role)
             )""")
+            # A table rather than another ``tasks`` column: the dependency gate
+            # runs before an issue is ever claimed, so there is usually no tasks
+            # row to hang the record on yet.
+            db.execute("""CREATE TABLE IF NOT EXISTS blocker_notices (
+                issue_number INTEGER PRIMARY KEY,
+                blockers_notified TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )""")
             db.execute(
                 "CREATE INDEX IF NOT EXISTS issue_runs_by_issue ON issue_runs(issue_number,id)"
             )
@@ -701,6 +709,39 @@ class StateStore:
             )
             return planning.rowcount + resumed.rowcount + failed.rowcount
 
+    def load_blocker_notices(self, issue_number: int) -> dict[str, object]:
+        """Read back which dependency comments were already posted for an issue.
+
+        Keys are ``pending`` (the blocker set the last comment listed, or
+        ``null`` when none was posted yet), ``declared``/``native`` (the mismatch
+        a warning already described) and ``self`` (a self-dependency warning was
+        sent). Anything unreadable reads as "nothing sent yet" so a hand-edited
+        database cannot wedge the poll loop.
+        """
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT blockers_notified FROM blocker_notices WHERE issue_number=?",
+                (issue_number,),
+            ).fetchone()
+        if not row:
+            return {}
+        try:
+            notices = json.loads(row["blockers_notified"])
+        except json.JSONDecodeError:
+            return {}
+        return notices if isinstance(notices, dict) else {}
+
+    def save_blocker_notices(self, issue_number: int, notices: dict[str, object]) -> None:
+        now = datetime.now(UTC).isoformat()
+        payload = json.dumps(notices, ensure_ascii=False, sort_keys=True)
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO blocker_notices(issue_number,blockers_notified,updated_at)
+                VALUES(?,?,?) ON CONFLICT(issue_number) DO UPDATE SET
+                blockers_notified=excluded.blockers_notified,updated_at=excluded.updated_at""",
+                (issue_number, payload, now),
+            )
+
     def reset(self, issue_number: int) -> str | None:
         """Reset a task row back to a claimable state, returning its old status.
 
@@ -708,7 +749,9 @@ class StateStore:
         ``attempts`` marker and returns the row to PENDING so a parked
         FAILED/BLOCKED issue can be claimed again. Any existing plan is kept;
         DONE plan items stay DONE so execution resumes from the first unfinished
-        task. Returns None when no row exists for the issue.
+        task. The recorded dependency notices go too, so a human who resets an
+        issue gets told again about whatever still blocks it. Returns None when
+        no row exists for the issue.
         """
         now = datetime.now(UTC).isoformat()
         with self.connect() as db:
@@ -727,4 +770,5 @@ class StateStore:
                 (str(TaskStatus.PENDING), now, issue_number, str(TaskStatus.DONE)),
             )
             db.execute("DELETE FROM agent_sessions WHERE issue_number=?", (issue_number,))
+            db.execute("DELETE FROM blocker_notices WHERE issue_number=?", (issue_number,))
         return old_status
