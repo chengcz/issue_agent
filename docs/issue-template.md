@@ -43,9 +43,45 @@
 
 ## 依赖与风险
 
-- 前置 Issue/PR：无
+- 前置 Issue/PR：无（有前置任务时见下方「依赖与 blocked-by」）
 - 资源锁标签：无；涉及数据库 schema 时使用 `resource:database-schema`
 - 已知风险或待人工决策：无
+
+---
+
+## 依赖与 blocked-by
+
+有前置任务时**必须**在 GitHub 上建立原生 blocked-by 关系，二选一：
+
+- 网页端：打开本 Issue，右侧 **Relationships → Blocked by**，选择前置 Issue；
+- 命令行：`gh issue edit <本 Issue> --add-blocked-by <前置 Issue>`。
+
+前置 Issue 未关闭时本 Issue 不会被领取，被拦住的当轮评论一次「等待依赖」，依赖全部关闭后再评论
+一次「依赖已关闭」，期间不需要人工反复增删 `agent-ready`。只有原生关系会真正拦住领取；正文里
+写 `Depends on #12` 只作说明，与原生不一致时编排器会评论提醒（以原生为准），写成了自依赖也会被
+拦住并提示。已在进行中的任务不受新 blocker 影响，避免崩溃恢复被中途挡住。
+
+## 正文自带计划与 auto-ready
+
+如果 Issue 正文本身就是一份完整实现计划（有序、可执行、带验收标准），且该 Issue 不是拆分出来的
+子 Issue，那么规划阶段会直接采用它、评论 Plan 并自动添加 `agent-ready`，跳过人工审核 Plan 这一步，
+避免对同一份内容做第二次规划产生漂移。不需要这个行为时把 `auto_ready_with_plan` 设为 `false`。
+
+## 澄清提问与 agent-needs-info
+
+任务描述不足以拆出具体任务时，Planner 会直接在 Issue 里提问并添加 `agent-needs-info`，Issue 回到
+待领取状态但不消耗失败预算。人工在评论里回答后，下一轮轮询自动移除该标签并带着回答重新规划，
+不需要手动增删 `agent-ready`。追问轮数有上限；用尽后 `agent-needs-info` 会保留，评论会指示人工
+处理后执行 `issue-agent reset`。
+
+## 拆分与子 Issue
+
+任务过大时 Planner 可以拆分成多个子 Issue：编排器创建子 Issue 并建立 parent 与兄弟 blocked-by
+关系，子 Issue 继承父 Issue 的非 `agent-*` 标签，但**不会**自动添加 `agent-ready`——需要人工逐个
+判断后放行。父 Issue 停在 `split` + `human-review`，既不自动关闭也不自动重新规划；同意拆分就不必
+再动父 Issue，不同意则对父 Issue 执行 `issue-agent reset`（会清掉拆分记录，父 Issue 按单 Issue
+重新规划；已创建的子 Issue 不会自动关闭，需要人工处理）。拆分中途失败时父 Issue 留在重试路径，
+失败评论会列出已创建的子 Issue，重试只补建缺失的部分。
 
 ---
 
@@ -78,9 +114,9 @@
 
 - [ ] Issue 可以由一个独立 PR 完成。
 - [ ] 已审核 Issue Agent 发布的 Plan，或已写明足够明确的验收标准和测试要求。
-- [ ] 前置 Issue 已完成；否则暂时不要添加 `agent-ready`。
+- [ ] 前置 Issue 已完成；否则用原生 **Blocked by** 声明依赖，而不是靠不加 `agent-ready` 来回避。
 - [ ] 没有同时添加 `agent:codex` 和 `agent:claude`。
-- [ ] 没有手工添加 `agent-running`、`agent-failed` 或 `human-review`；这些标签由编排器维护。
+- [ ] 没有手工添加 `agent-running`、`agent-failed`、`human-review` 或 `agent-needs-info`；这些标签由编排器维护。
 
 需要暂停尚未领取的任务时，从 Issue 右侧 **Labels** 中移除 `agent-ready`。任务已出现
 `agent-running` 后不要靠修改标签强行停止，应先安全停止前台编排器并检查任务状态。

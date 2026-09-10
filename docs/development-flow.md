@@ -12,14 +12,44 @@ flowchart TD
     Preflight -->|是| Recover[恢复被中断的 SQLite 状态]
     Recover --> Poll[拉取 agent-ready、agent-running<br/>以及可选的无 agent-* Issue]
 
-    Poll --> Kind{Issue 类型}
+    Poll --> Mismatch{正文声明的 blocker<br/>与原生 blockedBy 一致}
+    Mismatch -->|不一致| MismatchNotice[记录 dependency_body_mismatch<br/>评论提示「以原生关系为准」]
+    MismatchNotice --> DepGate
+    Mismatch -->|一致或正文未声明| DepGate{依赖门禁：原生 blockedBy<br/>是否全部 closed}
+    DepGate -->|否，或自依赖| DepBlocked[记录 dependency_blocked<br/>blocker 集合变化时评论一次<br/>本轮跳过，不领取]
+    DepBlocked --> Poll
+    DepGate -->|是| DepCleared{上一轮通知过 blocker}
+    DepCleared -->|是| ClearedNotice[记录 dependency_cleared<br/>评论「依赖已关闭」]
+    ClearedNotice --> Kind
+    DepCleared -->|否| Kind{Issue 类型}
+
     Kind -->|无 agent-* 标签| PlanClaim[幂等领取 Plan-only]
     PlanClaim --> PlanWorkspace[创建或复用 worktree<br/>重置到 origin/base]
-    PlanWorkspace --> Planner[只读 Planner 生成 1..N 个任务]
+    PlanWorkspace --> Planner[只读 Planner 生成输出]
     Planner --> PlanGuard{工作区被修改?}
     PlanGuard -->|是| PlanRestore[恢复 HEAD 并记录失败]
-    PlanGuard -->|否| SavePlan[Plan 写入 SQLite 和 .agent/plan.md]
-    SavePlan --> PlanComment[评论 Plan，添加 agent-planned<br/>等待人工审核]
+    PlanGuard -->|否| PlanShape{Planner 输出形态}
+
+    PlanShape -->|questions| Clarify[评论问题、添加 agent-needs-info<br/>状态回 pending，不消耗失败预算]
+    Clarify --> HumanAnswer[人工在评论中回答]
+    HumanAnswer --> ClarifyRelease[后续轮询检测到回答<br/>移除 agent-needs-info]
+    ClarifyRelease --> Poll
+    Clarify -.->|追问轮数超上限| ClarifyPark[记录 clarify_exhausted<br/>保留标签，等待人工 reset]
+    ClarifyPark --> Reset
+
+    PlanShape -->|split| SplitRecord[拆分决策先落盘 SQLite<br/>记录 split_proposed]
+    SplitRecord --> SplitCreate[逐个子 Issue 创建<br/>继承非 agent-* 标签<br/>不加 agent-ready]
+    SplitCreate -->|创建或链接失败| SplitPartial[记录 split_partial<br/>失败评论列出已建子 Issue<br/>父 Issue 留在重试路径]
+    SplitPartial --> Failed
+    SplitCreate --> SplitLink[建立 parent 与兄弟 blockedBy 链接<br/>已 linked 的子 Issue 重试时跳过]
+    SplitLink --> SplitPark[记录 split_created<br/>父 Issue 置 split 并加 human-review]
+    SplitPark --> Reset
+
+    PlanShape -->|tasks| SavePlan[Plan 写入 SQLite 和 .agent/plan.md]
+    SavePlan --> AutoReady{auto_ready_with_plan 开启<br/>正文自带完整计划<br/>且不是拆分出的子 Issue}
+    AutoReady -->|是| AutoRelease[记录 auto_ready_applied<br/>评论 Plan 并直接添加 agent-ready]
+    AutoRelease --> Claim
+    AutoReady -->|否| PlanComment[评论 Plan，添加 agent-planned<br/>等待人工审核]
     PlanComment --> WaitReady[人工添加 agent-ready]
 
     Kind -->|agent-ready / agent-running| Claim[按 agent 标签路由并幂等领取]
@@ -93,6 +123,25 @@ flowchart TD
     Reset --> Poll
 ```
 
+## 依赖、自动就绪、澄清与拆分
+
+四条支路都发生在「领取」和「规划」两处，不改变后续的编码—审查—push 主线。
+
+- **依赖门禁**只认 GitHub 原生 `blockedBy`，判定时机是首次领取之前；已经带 `agent-running`（或
+  SQLite 里已是运行态）的 Issue 直接豁免，这样崩溃恢复不会被中途重开的 blocker 卡死。blocker 集合
+  变化时才评论一次，通知去重记录同样落在 SQLite，因此每轮轮询对 `gh` 的读取只有 blocker 状态一项，
+  且同一轮内多个候选共享同一个 blocker 只查一次。未取到状态的 blocker 按「未关闭」处理——多等一轮
+  是安全方向。正文里手写的 `Depends on #12` 只用于比对，不一致时评论提醒，不参与放行。
+- **自动就绪**只在正文自带完整计划、且该 Issue 不是本 orchestrator 拆分出来的子 Issue 时触发；它还
+  要求配置了 `planner_agent`，否则 Planner 对任何 Issue 都会回「正文即计划」，等于取消人工审核。
+- **澄清回环**由 Planner 显式返回 `{"questions": [...]}` 触发，不靠启发式判断描述是否简略。追问轮数
+  有上限，用尽后 `agent-needs-info` 保留、评论改为指示人工 `reset`。回答检测按「非自己、且时间戳
+  晚于本轮标记」的评论判定；检测不到自己的登录名时整条链路退化为人工移除标签，不会自问自答。
+- **拆分**的决策先落盘再创建，中途崩溃或部分失败都从 SQLite 里的记录续跑：已创建的子 Issue 按记录
+  里的编号跳过，链接按 `linked` 标记跳过。子 Issue 继承父 Issue 的非 `agent-*` 标签，但**不**加
+  `agent-ready`，需要人工判断后放行。父 Issue 停在 `split` + `human-review`，既不自动关闭也不自动
+  重规划，只有人工 `reset` 才会清掉拆分记录并按单 Issue 重新规划。
+
 ## 持久化顺序原则
 
 - 领取、规划、编码、测试、Review、push 和人审状态均先写入 SQLite，再执行对应的 GitHub Label
@@ -125,3 +174,5 @@ flowchart TD
   失败/超时调用也保留耗时。`report` 分别显示 wall/agent/check time 与 token/cost。
 - 相同 anchor/checks 的并发 baseline 使用 single-flight 和有界 LRU；`checks.task_commands` 可将中间
   task 限制为快速检查，最终 gate 始终执行完整 `checks.commands`。
+- 拆分子 Issue 的标题与正文由 Planner 生成，写入 GitHub 前同样过 `redact_secrets`，与本仓库其他
+  出站文本一致；子 Issue 只继承父 Issue 的非 `agent-*` 标签，不会继承 `agent-running` 之类的运行态。

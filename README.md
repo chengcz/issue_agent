@@ -10,10 +10,13 @@
 ## 工作流
 
 1. 开启 `auto_plan_unlabeled` 后，轮询尚未进入 Agent 工作流（没有 `agent-*` 标签）的新 GitHub Issue；普通业务标签如 `bug`、`enhancement` 不会阻止规划。
+   带**未关闭的原生 blocked-by** 的 Issue 在领取前被跳过，直到依赖全部关闭（见「依赖门禁」）。
 2. **Plan-only**：planner agent 只读探索代码库，把 Issue 拆成 1..N 个顺序任务，将 Plan 持久化到
    SQLite 和 `.agent/plan.md`，并评论到 GitHub Issue。orchestrator 会校验 planner 没有产生仓库改动，
    发现改动时立即恢复工作区并按失败处理。此阶段不 commit、不 push、不创建 PR。
-3. 人工审核 Plan、补充需求，然后手动添加 `agent-ready`。
+   planner 也可以不产出任务列表，而是**提问**（见「澄清回环」）或**建议拆分**（见「拆分」）。
+3. 人工审核 Plan、补充需求，然后手动添加 `agent-ready`；开启 `auto_ready_with_plan` 后，正文已带完整
+   实施计划的 Issue 会直接放行（见「auto-ready」）。
 4. 根据 `agent:<name>` 标签选择实现 Agent；未指定则使用默认 Agent。
 5. 从本地已创建的 Issue worktree 和持久化 Plan 继续执行；直接带 `agent-ready` 发布的 Issue 则在执行前生成 Plan。
 6. **逐任务执行**：每个任务写入 `.agent/task.md`。实现 Agent 完成后 orchestrator 独立执行检查，然后
@@ -45,6 +48,53 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
 - 按 `agent:<name>` 标签选实现 Agent，未指定用 `default_agent`。
 - 领取幂等：`pending`/`planned` 总可领；`failed`/`blocked` 只在失败预算内可领；
   `failures >= max_attempts` 后搁置，需人工 `reset`。
+
+### 依赖门禁
+
+- Issue 的原生 **blocked-by** 关系（GitHub 网页 Issue 侧栏的 "Blocked by"）决定它能否被领取：
+  只要还有 blocker 未关闭，就跳过该 Issue，既不规划也不编码。
+- 只门禁**首次领取**。已经带 `agent-running` 或处于运行状态的 Issue 不受影响：崩溃恢复不能因为
+  blocker 重新打开而搁置。
+- 首次因依赖被跳过时评论一次「Waiting on dependencies」并列出 blocker 编号与标题；blocker 全部关闭后
+  再评论一次「Dependencies closed」。重复轮询不重复评论（去重记录在 SQLite）。
+- Issue 正文里写的依赖（如 `Blocked by: #12`）只作说明，**不会**据此建立关系；两者不一致时会评论提示，
+  正文那一行不生效。
+- 自己阻塞自己按永久阻塞处理，并评论提示人工修正。
+
+### auto-ready
+
+- `runtime.auto_ready_with_plan = true` 时，**正文已包含完整实施计划**的 Issue 在 Plan-only 阶段直接发布
+  Plan 并加上 `agent-ready`，省掉一次人工放行：这类 Issue 本来就会跳过 planner，二次规划只会让结果漂移。
+- 两个前提：必须配置 `runtime.planner_agent`（没有 planner 时所有 Issue 都走「正文即计划」路径，
+  不加限制等于取消审批）；该 Issue 不能是拆分产生的子 Issue（子 Issue 永远等待人工放行）。
+- planner 现场生成的 Plan 不受影响，仍然等待人工添加 `agent-ready`。
+
+### 澄清回环
+
+- planner 判断 Issue 信息不足时不猜，返回 `{"questions": [...]}`；orchestrator 把问题评论到 Issue 上
+  并添加 `agent-needs-info`，本轮不产生 Plan。
+- 人工在 Issue 里评论回答后，下一轮轮询检测到「作者不是本机登录名、时间晚于提问、且不在
+  `clarify_ignore_authors` 里」的评论，就移除标签、回到规划队列；重新规划时把提问以来的评论作为
+  澄清记录传给 planner。
+- 轮数上限 `max_clarify_rounds`（默认 2）用尽后不再自动等待，评论提示人工回答后执行 `reset`。
+- 无法确定本机登录名（未认证、离线或 dry-run）时不检测回复，标签交由人工移除，避免把自己的提问
+  当成人工答复。
+
+### 拆分
+
+- planner 判断任务过大时返回 `{"split": [...]}`：每个子 Issue 带标题、正文，以及可选的
+  `depends_on`（同一批子 Issue 的序号），用来表达实施顺序。
+- 需要 `runtime.allow_split = true`；未启用时按规划失败处理并在评论里说明。子 Issue 数量上限为
+  `runtime.max_split_children`（默认 5），超限即规划失败。
+- orchestrator 逐个创建子 Issue：复制父 Issue 的非 `agent-*` 标签（`agent:<name>` 路由标签不复制，
+  让子 Issue 走默认 Agent），原生挂到父 Issue（`gh issue edit --parent`），并按 `depends_on`
+  建立兄弟间 blocked-by 关系。**子 Issue 不会被自动放行**，需要人工给要开始的子 Issue 加 `agent-ready`。
+- 父 Issue 置为 `split` 状态并加 `human-review`，移除 `agent-running`/`agent-planned`/`agent-ready`，
+  不再被规划或实现；评论列出全部子 Issue 编号。
+- 幂等：拆分决策先落盘（`tasks.split`），每建成一个子 Issue 立刻回填编号；重试只补缺失的子 Issue，
+  且**不再调用 planner**（LLM 重跑会给出不同标题，按标题判断会重复创建）。部分成功时父 Issue 保持
+  可重试（不进入 `human-review`），评论列出已创建的编号。
+- 不满意拆分结果时执行 `issue-agent reset <父 Issue>`：清空拆分记录并回到 `pending`，重新规划。
 
 ### 工作区与 Plan
 
@@ -176,6 +226,7 @@ labels=(
   "agent-ready|0e8a16|Ready for coding-agent implementation"
   "agent-running|1d76db|Implementation in progress"
   "agent-failed|d73a4a|Agent run failed"
+  "agent-needs-info|d4c5f9|Planner needs more information"
   "human-review|fbca04|Awaiting human review"
   "agent:codex|a219d8|Implement with Codex"
   "agent:claude|a219d8|Implement with Claude Code"
@@ -203,8 +254,8 @@ done
 各标签的用途见后文「标签规则」：没有 `agent-*` 标签是自动规划入口；`agent-ready` 是编码执行入口；
 `agent:<name>` 选择实现 Agent；
 `reviewer:<name>` 按 Issue 选择 Reviewer（当前 `reviewer_agent` 仍是全局配置，需要按 Issue 选择时扩展调度器）；
-`resource:database-schema` 对数据库 schema 任务全局串行；`agent-planned`、`agent-running`、`agent-failed`、`human-review`
-由编排器维护，不要手工使用。
+`resource:database-schema` 对数据库 schema 任务全局串行；`agent-planned`、`agent-running`、`agent-failed`、
+`agent-needs-info`、`human-review` 由编排器维护，不要手工使用。
 
 编辑 `issue-agent.toml`：
 
@@ -225,6 +276,15 @@ CLI 启动时会验证 Agent 名称、并发数、重试次数和 timeout；无�
   共用一次 fetch，避免重复网络请求和 Git 锁竞争。
 - `runtime.auto_plan_unlabeled`：是否自动为没有 `agent-*` 工作流标签的新 Issue 生成 Plan；名称为兼容旧配置保留，默认 `false`。
 - `runtime.auto_plan_limit`：每轮最多扫描多少个候选 Issue。
+- `runtime.auto_ready_with_plan`：正文已带完整实施计划的 Issue 是否跳过人工放行，直接加
+  `agent-ready`，默认 `false`（见「auto-ready」）。
+- `runtime.allow_split`：是否允许 planner 把过大的 Issue 拆成多个子 Issue，默认 `false`
+  （见「拆分」）。
+- `runtime.max_split_children`：单次拆分的子 Issue 数量上限，默认 5；超限按规划失败处理。
+- `runtime.max_clarify_rounds`：planner 就同一个 Issue 提问的次数上限，默认 2；用尽后不再自动等待
+  人工回复，需要 `reset`（见「澄清回环」）。
+- `runtime.clarify_ignore_authors`：除本机登录名外，永远不算作人工答复的评论作者（如 `dependabot`），
+  默认空。
 - `runtime.log_dir`：每个 Issue 的执行和 Review JSONL 日志目录。
 - `checks.commands`：目标项目真实的验收命令。
 - `checks.task_commands`：每个 plan task 后执行的快速检查；省略时兼容旧行为并执行全部
@@ -455,14 +515,18 @@ gh issue edit ISSUE_NUMBER \
 
 ## 标签规则
 
-- `agent-ready`：任务内容完整且允许领取；这是唯一的调度入口。
+- `agent-ready`：任务内容完整且允许领取；这是唯一的编码调度入口。开启 `auto_ready_with_plan` 时，
+  正文已带完整实施计划的 Issue 会被自动加上此标签。
 - `agent:codex`：由 Codex 实现。
 - `agent:claude`：由 Claude Code 实现。
 - `resource:database-schema`：涉及数据库 schema 时添加，同一进程内串行执行。
-- `agent-planned`、`agent-running`、`agent-failed`、`human-review`：由编排器维护，不要手工用于发布任务。
-- `bug`、`enhancement`、`documentation`：描述任务类型，可与 Agent 标签组合。
+- `agent-planned`、`agent-running`、`agent-failed`、`agent-needs-info`、`human-review`：由编排器维护，
+  不要手工用于发布任务。`agent-needs-info` 表示 planner 在等人工回答，回答后编排器会自行移除。
+- `bug`、`enhancement`、`documentation`：描述任务类型，可与 Agent 标签组合；拆分产生的子 Issue 会继承
+  这些标签。
 
-不要同时添加多个 `agent:<name>` 标签。一个 Issue 应对应一个可独立审查的 PR；大型需求应拆成有依赖关系的多个 Issue。
+不要同时添加多个 `agent:<name>` 标签。一个 Issue 应对应一个可独立审查的 PR；大型需求应拆成有依赖关系的多个 Issue
+（原生 blocked-by 决定顺序；也可以让 `allow_split` 下的 planner 代劳，但它只负责创建，是否放行仍由人决定）。
 
 ## Agent 与 Review
 
@@ -490,6 +554,21 @@ issue-42.reviews.jsonl  # 每次 task review（含形式审查）和 final revie
 input/output/cache token 与 cost 明细）。review 日志会保留
 `REQUEST_CHANGES` 的具体反馈，方便分析是否因 Issue 描述、计划、实现或测试不足而返修。日志可能包含
 Issue 内容和 Agent 输出，应按目标仓库的访问控制保护 `log_dir`，不要写入公开目录。
+
+工作流分支各自的事件：
+
+| 事件 | 时机 |
+|---|---|
+| `dependency_blocked` | 因未关闭的 blocker 跳过领取（每轮都记，评论不重复） |
+| `dependency_cleared` | blocker 全部解除、通知人工的那一轮 |
+| `dependency_body_mismatch` | 正文声明的 blocker 与原生关系不一致 |
+| `auto_ready_applied` | 正文自带计划的 Issue 被自动放行 |
+| `clarify_requested` | planner 提问，已发评论并加 `agent-needs-info` |
+| `clarify_answered` | 检测到人工回复，准备重新规划 |
+| `clarify_exhausted` | 追问轮数用尽，改为等待人工 `reset` |
+| `split_proposed` / `split_created` | planner 建议拆分 / 子 Issue 全部创建并链接完成 |
+| `split_reused` | 复用已落盘的拆分决策继续补建 |
+| `split_partial` | 部分子 Issue 创建失败，父 Issue 留在重试路径 |
 
 ### GitHub Issue 模板
 
@@ -703,16 +782,16 @@ gh issue list --repo OWNER/repo-a --label agent-running
 
 ### 11. 重置失败/阻塞任务
 
-`failed` 或 `blocked` 的任务在重试预算耗尽后会被搁置（不再自动恢复 `agent-ready`），需要人工重置后才能再次运行：
+`failed`、`blocked` 或被拆分搁置（`split`）的任务不会自动恢复 `agent-ready`，需要人工重置后才能再次运行：
 
 ```bash
 issue-agent --config issue-agent.toml reset 42            # 重置状态并重新入队
 issue-agent --config issue-agent.toml reset 42 --no-label # 只重置本地状态，稍后手动加 agent-ready
 ```
 
-- 重置会清空该 Issue 的失败计数（`failures`）和重试标记，把状态改回 `pending`，保留已存在的 Plan 并从第一个未完成任务断点续跑；已完成（`done`）的 plan 项不会被清掉。
-- 默认会重新添加 `agent-ready` 标签（并移除 `agent-failed`/`agent-running`），下一次轮询即重新领取；`--no-label` 跳过标签操作，适合需要先修改 Issue 描述或 Plan 再放行的情况。
-- 只允许重置 `pending`/`planned`/`failed`/`blocked` 状态；运行中或已进入 `human-review`/`done` 的任务会被拒绝，避免干扰进行中的 worker 或重复创建 PR。
+- 重置会清空该 Issue 的失败计数（`failures`）和重试标记，把状态改回 `pending`，保留已存在的 Plan 并从第一个未完成任务断点续跑；已完成（`done`）的 plan 项不会被清掉。依赖通知去重记录、澄清轮数与拆分记录也会清空，因此重置后该 Issue 会被重新提示依赖、可以再次向 planner 提问、并按单 Issue 重新规划。
+- 默认会重新添加 `agent-ready` 标签（并移除 `agent-failed`/`agent-running`/`human-review`），下一次轮询即重新领取；`--no-label` 跳过标签操作，适合需要先修改 Issue 描述或 Plan 再放行的情况。
+- 只允许重置 `pending`/`planned`/`failed`/`blocked`/`split` 状态；运行中或已进入 `human-review`/`done` 的任务会被拒绝，避免干扰进行中的 worker 或重复创建 PR。`split` 是拆分后被搁置的父 Issue，重置它等于否决这次拆分、要求按单 Issue 重新规划（已创建的子 Issue 不会自动关闭，需要人工处理）。
 
 
 ## 安全边界
@@ -729,6 +808,14 @@ issue-agent --config issue-agent.toml reset 42 --no-label # 只重置本地状�
 MVP 使用 `gh` CLI 和 SQLite，适合单机 1–5 个并发 worker。多机部署时再替换为 GitHub App + PostgreSQL/Redis 分布式锁，并增加心跳、取消、PR 创建后的 review 循环和指标监控。不要在单机版上直接启动多个 orchestrator 实例。
 
 Codex 的非交互自动化入口是 `codex exec`；官方也建议非交互运行使用 workspace-write sandbox。GitHub Actions 中可另行使用官方 Codex Action，但它不是本地常驻调度器的必需依赖。
+
+依赖门禁、自动就绪、澄清回环与拆分目前的能力边界：
+
+- 依赖判定只看 GitHub 原生 `blockedBy`（open/closed），不校验 blocked-by 的 Issue 是否属于本仓库的任务流；正文里声明的那一行仅用于提示不一致，不参与放行。
+- `dependency_mismatch` 只在正文声明与原生关系不一致时提醒人工，orchestrator 不会替人改写原生依赖，也不会因为正文写了 `Depends on #12` 就自动建立关系。
+- auto-ready 只在「正文自带实现计划」时使用，且不适用于拆分出来的子 Issue（子 Issue 需要人工判断后手动加 `agent-ready`）。
+- 澄清回环的追问轮数受 `max_clarify_rounds` 限制，用尽后 `agent-needs-info` 保留、编排器不再监听回复，必须人工处理并 `reset` 才会重新规划。
+- 拆分的父 Issue 创建完子 Issue 后停在 `split` + `human-review`，既不自动关闭也不自动放行；子 Issue 之间只建立同级依赖，拆分决策落盘的 `split` 记录在 `reset` 时清空。
 
 
 ### 任务执行时间窗口
