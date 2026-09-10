@@ -80,6 +80,8 @@ class StateStore:
                 ("started_at", "TEXT"),
                 ("finished_at", "TEXT"),
                 ("final_approved_commit", "TEXT"),
+                ("clarify_rounds", "INTEGER NOT NULL DEFAULT 0"),
+                ("clarify_marker", "TEXT"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
@@ -742,6 +744,55 @@ class StateStore:
                 (issue_number, payload, now),
             )
 
+    def clarify_state(self, issue_number: int) -> tuple[int, str]:
+        """Return ``(rounds asked, marker of the outstanding question)``.
+
+        An empty marker means no question is waiting, which is also what an
+        issue that has never needed one reports.
+        """
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT clarify_rounds, clarify_marker FROM tasks WHERE issue_number=?",
+                (issue_number,),
+            ).fetchone()
+        if not row:
+            return (0, "")
+        return (int(row["clarify_rounds"]), str(row["clarify_marker"] or ""))
+
+    def record_clarify_round(self, issue_number: int, marker: str) -> int:
+        """Note that the planner asked for information, returning the new round count.
+
+        The increment happens in SQL so the counter cannot drift from the marker
+        it belongs with. Callers compare the result against
+        ``max_clarify_rounds``; keeping the budget in this table is what makes it
+        survive a restart.
+        """
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as db:
+            db.execute(
+                "UPDATE tasks SET clarify_rounds=clarify_rounds+1, clarify_marker=?, updated_at=? "
+                "WHERE issue_number=?",
+                (marker, now, issue_number),
+            )
+            row = db.execute(
+                "SELECT clarify_rounds FROM tasks WHERE issue_number=?", (issue_number,)
+            ).fetchone()
+        return int(row["clarify_rounds"]) if row else 0
+
+    def clear_clarify(self, issue_number: int) -> None:
+        """Drop the outstanding question, leaving the round budget spent.
+
+        The budget bounds how often the planner may ask over the issue's life,
+        not how many answers it is allowed to receive, so consuming an answer
+        must not hand back another round.
+        """
+        now = datetime.now(UTC).isoformat()
+        with self.connect() as db:
+            db.execute(
+                "UPDATE tasks SET clarify_marker=NULL, updated_at=? WHERE issue_number=?",
+                (now, issue_number),
+            )
+
     def reset(self, issue_number: int) -> str | None:
         """Reset a task row back to a claimable state, returning its old status.
 
@@ -750,8 +801,9 @@ class StateStore:
         FAILED/BLOCKED issue can be claimed again. Any existing plan is kept;
         DONE plan items stay DONE so execution resumes from the first unfinished
         task. The recorded dependency notices go too, so a human who resets an
-        issue gets told again about whatever still blocks it. Returns None when
-        no row exists for the issue.
+        issue gets told again about whatever still blocks it, as does the
+        clarification budget, so a parked issue is worth asking about again.
+        Returns None when no row exists for the issue.
         """
         now = datetime.now(UTC).isoformat()
         with self.connect() as db:
@@ -761,7 +813,8 @@ class StateStore:
             old_status = str(row["status"])
             db.execute(
                 "UPDATE tasks SET status=?, failures=0, attempts=0, last_error='', "
-                "current_seq=-1, updated_at=? WHERE issue_number=?",
+                "current_seq=-1, clarify_rounds=0, clarify_marker=NULL, updated_at=? "
+                "WHERE issue_number=?",
                 (str(TaskStatus.PENDING), now, issue_number),
             )
             db.execute(

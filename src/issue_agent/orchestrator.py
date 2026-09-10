@@ -7,6 +7,7 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
+from datetime import UTC, datetime
 
 from .agents import (
     CliAgent,
@@ -22,7 +23,7 @@ from .config import Config
 from .formal_review import formal_review
 from .github import GitHub
 from .issue_log import IssueLog
-from .models import Blocker, Issue, PlanOutcome, PlanTask, SplitChild, TaskStatus
+from .models import Blocker, Comment, Issue, PlanOutcome, PlanTask, SplitChild, TaskStatus
 from .process import CommandError, Result
 from .schedule import ScheduleConfig
 from .state import RUNNING_STATUSES, StateStore
@@ -235,6 +236,48 @@ def _refs(numbers: Iterable[int]) -> str:
     return ", ".join(f"#{number}" for number in numbers) or "none"
 
 
+# Both the comment the orchestrator posts and the marker it later looks for, so
+# the two cannot drift apart.
+NEEDS_INFO_LABEL = "agent-needs-info"
+CLARIFY_HEADING = "❓ **More information needed**"
+
+
+def clarification_notes(comments: list[Comment], login: str) -> str:
+    """Render the questions asked and the answers given, oldest first.
+
+    The transcript starts at this machine's first question rather than at the
+    top of the thread, so ordinary discussion from before the issue needed
+    clarifying is left out while every later round is kept — including the
+    answers to the earlier questions, which keeping only the newest round would
+    silently drop. Each line is labelled with its author, the only way the model
+    can tell a question from an answer.
+    """
+    machine = login.lower()
+    notes: list[str] = []
+    for comment in comments:
+        if not notes:
+            if comment.author.lower() == machine and comment.body.strip().startswith(CLARIFY_HEADING):
+                notes.append(comment)
+            continue
+        notes.append(comment)
+    return "\n\n".join(
+        f"@{comment.author}: {comment.body.strip()}" for comment in notes
+    )
+
+
+def _timestamp(value: str) -> datetime:
+    """Parse the ISO timestamps GitHub and the state store produce.
+
+    Anything unreadable becomes the epoch, so a comment that cannot be dated
+    never counts as newer than a marker and reply detection stays conservative.
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return datetime.min.replace(tzinfo=UTC)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 def _planner_payload(stdout: str) -> object:
     """Extract and decode the planner's fenced JSON block."""
     match = re.search(r"```json\s*(.*?)\s*```", stdout, re.DOTALL)
@@ -384,6 +427,7 @@ class Orchestrator:
             tuple[str, tuple[str, ...]], asyncio.Task[dict[str, CheckBaseline]]
         ] = {}
         self._run_ids: dict[int, int] = {}
+        self._viewer_login: str | None = None
         self._wake = asyncio.Event()
         if guidance_block(config.repo, config.codegraph):
             log.info(
@@ -620,6 +664,8 @@ class Orchestrator:
                 continue
             self._track(issue.number, self._guarded_plan_only(issue, planner_name))
 
+        await self._release_answered_clarifications(persisted)
+
     def _track(self, issue_number: int, coroutine) -> None:
         task = asyncio.create_task(coroutine)
         self.running[issue_number] = task
@@ -675,6 +721,102 @@ class Orchestrator:
             ):
                 await self.plan_only(issue)
 
+    async def _clarification(self, issue_number: int) -> str:
+        """The question-and-answer transcript to re-plan from, or "".
+
+        Read only for issues that have actually been asked something, so an
+        ordinary planning run pays no extra API call for the feature.
+        """
+        if not self.state.clarify_state(issue_number)[0]:
+            return ""
+        return clarification_notes(
+            await self.github.comments(issue_number), await self._my_login()
+        )
+
+    async def _request_clarification(
+        self, issue: Issue, questions: tuple[str, ...], *, marker: str, issue_log: IssueLog
+    ) -> None:
+        """Publish the planner's questions and hold the issue for a human answer.
+
+        The round budget bounds how many times the planner may ask over the
+        issue's life. Once it is spent the label stays on and the comment says
+        what a human has to do instead, because the orchestrator has stopped
+        watching for a reply.
+        """
+        rounds = self.state.record_clarify_round(issue.number, marker)
+        issue_log.event("clarify_requested", rounds=rounds, questions=list(questions))
+        listing = "\n".join(f"{index}. {question}" for index, question in enumerate(questions, 1))
+        if rounds > self.config.max_clarify_rounds:
+            body = (
+                f"{CLARIFY_HEADING}\n\n{listing}\n\n"
+                f"Planning has already asked {rounds - 1} time(s), the configured limit of "
+                f"{self.config.max_clarify_rounds}. Answer in a comment and then run "
+                "`issue-agent reset` for this Issue to plan again."
+            )
+        else:
+            body = (
+                f"{CLARIFY_HEADING}\n\n"
+                "Planning could not name concrete tasks from this Issue as it stands. "
+                f"Please answer in a comment:\n\n{listing}\n\n"
+                "A later poll picks the answer up and plans again; no label needs removing."
+            )
+        await self.github.comment(issue.number, body)
+        await self.github.labels(issue.number, add=(NEEDS_INFO_LABEL,))
+
+    async def _release_answered_clarifications(self, persisted: dict[int, dict]) -> None:
+        """Drop ``agent-needs-info`` from issues a human has since answered.
+
+        Driven by SQLite rather than GitHub: the rows carrying a marker are
+        exactly the issues waiting on an answer, so finding them costs no extra
+        query, and rows whose round budget is spent fall out of the scan on their
+        own — their reply must not re-queue them. Removing the label is the whole
+        handoff, because that label is what keeps the issue out of the planning
+        pool. The marker stays until a plan is produced: it is also the offset the
+        clarification transcript is read from.
+        """
+        login = (await self._my_login()).lower()
+        if not login:
+            return
+        ignored = {author.lower() for author in self.config.clarify_ignore_authors} | {login}
+        for row in persisted.values():
+            number = int(row["issue_number"])
+            marker = str(row.get("clarify_marker") or "")
+            if not marker or int(row.get("clarify_rounds") or 0) > self.config.max_clarify_rounds:
+                continue
+            if number in self.running:
+                continue
+            try:
+                comments = await self.github.comments(number)
+            except CommandError as exc:
+                log.warning("issue #%s: cannot read comments: %s", number, exc)
+                continue
+            answered = any(
+                comment.author.lower() not in ignored
+                and _timestamp(comment.created_at) > _timestamp(marker)
+                for comment in comments
+            )
+            if answered:
+                await self.github.labels(number, remove=(NEEDS_INFO_LABEL,))
+                log.info("issue #%s: clarification answered; back in the planning queue", number)
+
+    async def _my_login(self) -> str:
+        """This machine's GitHub login, looked up once per process.
+
+        "" means unknown, and every caller must read it as "I cannot tell my own
+        comments apart" and skip reply detection. An orchestrator that guessed
+        here would count its own question as the human's answer and talk to
+        itself, which is worse than leaving the label for a human to remove.
+        """
+        if self._viewer_login is None:
+            try:
+                self._viewer_login = await self.github.viewer_login()
+            except CommandError as exc:
+                log.warning(
+                    "cannot determine the GitHub login; clarification replies stay manual: %s", exc
+                )
+                self._viewer_login = ""
+        return self._viewer_login
+
     def _auto_ready_applies(self, issue: Issue) -> bool:
         """True when an issue may skip human approval of its own plan.
 
@@ -712,17 +854,35 @@ class Orchestrator:
             )
             plan = self.state.load_plan(issue.number)
             if plan is None:
-                plan = require_tasks(
-                    await self._plan(
-                        workspace,
+                planned = await self._plan(
+                    workspace,
+                    issue,
+                    acquire_agent_limit=bool(self.config.planner_agent),
+                    issue_log=issue_log,
+                    clarification=await self._clarification(issue.number),
+                )
+                if planned.questions:
+                    # The marker has to predate the comment, so that any reply
+                    # that follows is necessarily newer than it.
+                    await self._request_clarification(
                         issue,
-                        acquire_agent_limit=bool(self.config.planner_agent),
+                        planned.questions,
+                        marker=datetime.now(UTC).isoformat(),
                         issue_log=issue_log,
                     )
-                )
+                    # PENDING with no plan is what makes the issue claimable
+                    # again; waiting for a human is not a failure, so it must
+                    # not burn the retry budget either.
+                    self.state.update(issue.number, TaskStatus.PENDING)
+                    outcome = str(TaskStatus.PENDING)
+                    return
+                plan = require_tasks(planned)
                 issue_log.event("plan_generated", tasks=[task.to_dict() for task in plan])
             else:
                 issue_log.event("plan_reused", tasks=[task.to_dict() for task in plan])
+            # A plan that exists means the outstanding question has been dealt
+            # with, so stop looking for a reply to it.
+            self.state.clear_clarify(issue.number)
             self.workspaces.write_plan_file(workspace, plan)
             self.state.update(issue.number, TaskStatus.PLANNED, current_seq=0)
             outcome = str(TaskStatus.PLANNED)
@@ -947,6 +1107,7 @@ class Orchestrator:
         *,
         acquire_agent_limit: bool = False,
         issue_log: IssueLog | None = None,
+        clarification: str = "",
     ) -> PlanOutcome:
         existing_plan = bool(self.config.planner_agent) and has_detailed_plan(issue.body)
         if not self.config.planner_agent or existing_plan:
@@ -958,7 +1119,12 @@ class Orchestrator:
             result = await self._execute_read_only(
                 self.config.planner_agent,
                 workspace,
-                make_plan_prompt(issue, self.config.max_tasks, guidance=self._codegraph_guidance()),
+                make_plan_prompt(
+                    issue,
+                    self.config.max_tasks,
+                    guidance=self._codegraph_guidance(),
+                    clarification=clarification,
+                ),
                 role="planner",
                 acquire_agent_limit=acquire_agent_limit,
                 issue_log=issue_log,

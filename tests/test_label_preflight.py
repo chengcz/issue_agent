@@ -29,6 +29,7 @@ ORCHESTRATOR_LABELS = (
     "agent-running",
     "agent-planned",
     "agent-failed",
+    "agent-needs-info",
     "human-review",
 )
 
@@ -75,7 +76,8 @@ def test_ready_label_collision_keeps_orchestrator_spec():
     from issue_agent import github
 
     specs = github.required_label_specs("agent-running", [])
-    assert len(specs) == 4
+    # One spec per orchestrator label, collapsed onto the colliding ready label.
+    assert len(specs) == len(ORCHESTRATOR_LABELS)
     assert specs["agent-running"] == github.ORCHESTRATOR_LABELS["agent-running"]
 
 

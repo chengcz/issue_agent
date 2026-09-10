@@ -11,7 +11,15 @@ from issue_agent.cli import format_report, format_status, parser
 from issue_agent.config import load_config
 from issue_agent.github import GitHub
 from issue_agent.issue_log import IssueLog
-from issue_agent.models import Blocker, Issue, PlanOutcome, PlanTask, SplitChild, TaskStatus
+from issue_agent.models import (
+    Blocker,
+    Comment,
+    Issue,
+    PlanOutcome,
+    PlanTask,
+    SplitChild,
+    TaskStatus,
+)
 from issue_agent.orchestrator import Orchestrator
 from issue_agent.process import CommandError, Result, shell
 from issue_agent.state import StateStore
@@ -258,6 +266,40 @@ def test_state_reset_forgets_blocker_notices(tmp_path: Path):
     state.reset(4)
 
     assert state.load_blocker_notices(4) == {}
+
+
+def test_state_clarify_round_counts_up_and_moves_the_marker(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(4, "T", "B"), "planner")
+
+    assert state.clarify_state(4) == (0, "")
+
+    assert state.record_clarify_round(4, "2026-09-10T00:00:00+00:00") == 1
+    assert state.record_clarify_round(4, "2026-09-10T01:00:00+00:00") == 2
+
+    assert state.clarify_state(4) == (2, "2026-09-10T01:00:00+00:00")
+
+
+def test_state_clear_clarify_keeps_the_round_budget(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(4, "T", "B"), "planner")
+    state.record_clarify_round(4, "2026-09-10T00:00:00+00:00")
+
+    state.clear_clarify(4)
+
+    # The budget bounds how often the planner may ask over the issue's life, not
+    # how many answers it is allowed to receive.
+    assert state.clarify_state(4) == (1, "")
+
+
+def test_state_reset_restores_the_whole_clarify_budget(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(4, "T", "B"), "planner")
+    state.record_clarify_round(4, "2026-09-10T00:00:00+00:00")
+
+    state.reset(4)
+
+    assert state.clarify_state(4) == (0, "")
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +878,66 @@ def test_blocker_states_reports_closed_blockers_and_their_titles(tmp_path: Path)
         "number,title,state",
     )
     assert github._gh.await_count == 2
+
+
+def test_gh_omits_the_repo_flag_when_told_to(tmp_path: Path, monkeypatch):
+    github = GitHub("owner/repo", tmp_path)
+    commands: list[list[str]] = []
+
+    async def fake_run(command, *, cwd, check=True):
+        commands.append(list(command))
+        return Result(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("issue_agent.github.run", fake_run)
+
+    asyncio.run(github._gh("label", "list", "--json", "name"))
+    # `gh api` accepts no --repo, so extracting the login needs the flag off.
+    asyncio.run(github._gh("api", "user", "--jq", ".login", repo=False))
+
+    assert commands[0] == ["gh", "label", "list", "--json", "name", "--repo", "owner/repo"]
+    assert commands[1] == ["gh", "api", "user", "--jq", ".login"]
+
+
+def test_viewer_login_reads_the_authenticated_user(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(return_value="octocat\n")
+
+    assert asyncio.run(github.viewer_login()) == "octocat"
+    assert github._gh.await_args.args == ("api", "user", "--jq", ".login")
+    assert github._gh.await_args.kwargs == {"repo": False}
+
+
+def test_viewer_login_stays_offline_in_dry_run(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path, dry_run=True)
+    github._gh = AsyncMock()
+
+    assert asyncio.run(github.viewer_login()) == ""
+    github._gh.assert_not_awaited()
+
+
+def test_comments_reads_author_timestamp_and_body(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(
+        return_value=json.dumps(
+            {
+                "comments": [
+                    {
+                        "author": {"login": "octocat"},
+                        "createdAt": "2026-09-10T01:00:00Z",
+                        "body": "Use the parser module.",
+                    },
+                    {"author": None, "createdAt": "2026-09-10T02:00:00Z", "body": "Ghost"},
+                ]
+            }
+        )
+    )
+
+    comments = asyncio.run(github.comments(4))
+
+    assert comments == [
+        Comment("octocat", "2026-09-10T01:00:00Z", "Use the parser module."),
+        Comment("", "2026-09-10T02:00:00Z", "Ghost"),
+    ]
 
 
 def test_github_unassigned_issues_keeps_product_labels(tmp_path: Path):

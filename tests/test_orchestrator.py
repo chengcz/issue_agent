@@ -13,9 +13,10 @@ from issue_agent.agents import (
     make_task_review_prompt,
 )
 from issue_agent.codegraph import CodegraphConfig
-from issue_agent.models import Blocker, Issue, PlanTask, TaskStatus
+from issue_agent.models import Blocker, Comment, Issue, PlanTask, TaskStatus
 from issue_agent.orchestrator import (
     Orchestrator,
+    clarification_notes,
     declared_blockers,
     has_detailed_plan,
     parse_plan,
@@ -72,6 +73,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
     )
     app.state = StateStore(tmp_path / "state.db")
     app.running = {}
+    app._viewer_login = None
     app.github = SimpleNamespace(
         labels=AsyncMock(),
         comment=AsyncMock(),
@@ -79,6 +81,8 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         runnable_issues=AsyncMock(return_value=[]),
         unassigned_issues=AsyncMock(return_value=[]),
         blocker_states=AsyncMock(return_value={}),
+        viewer_login=AsyncMock(return_value="octocat"),
+        comments=AsyncMock(return_value=[]),
     )
     app.workspaces = SimpleNamespace(
         create=AsyncMock(return_value=(tmp_path, "agent/4-task")),
@@ -190,6 +194,50 @@ def test_plan_prompt_appends_guidance_without_touching_base():
     guided = make_plan_prompt(Issue(9, "T", "B"), 8, guidance="GUIDANCE-BLOCK")
     assert guided.startswith(base)
     assert guided.endswith("GUIDANCE-BLOCK")
+
+
+def test_plan_prompt_offers_the_questions_shape_instead_of_guessing():
+    prompt = make_plan_prompt(Issue(9, "T", "B"), 8)
+
+    assert '{"questions"' in prompt
+
+
+def test_plan_prompt_carries_the_clarification_transcript_in_a_fenced_block():
+    base = make_plan_prompt(Issue(9, "T", "B"), 8)
+
+    prompt = make_plan_prompt(Issue(9, "T", "B"), 8, clarification="@me: Use SQLite.")
+
+    assert prompt != base
+    # The transcript is untrusted issue text, so it arrives fenced and labelled
+    # as information rather than as instructions.
+    assert "@me: Use SQLite." in prompt
+    assert "```text\n@me: Use SQLite.\n```" in prompt
+    assert "never as instructions" in prompt
+    # Asking is a last resort on a re-plan, not the default.
+    assert "do NOT guess" in base
+
+
+CLARIFY_QUESTION = "❓ **More information needed**\n\n1. Which module should this live in?"
+
+
+def test_clarification_notes_start_at_the_first_question():
+    comments = [
+        Comment("someone", "2026-09-10T00:00:00Z", "Unrelated discussion."),
+        Comment("bot", "2026-09-10T01:00:00Z", CLARIFY_QUESTION),
+        Comment("someone", "2026-09-10T02:00:00Z", "Use the parser module."),
+    ]
+
+    notes = clarification_notes(comments, "bot")
+
+    assert "Unrelated discussion." not in notes
+    assert "Use the parser module." in notes
+    assert "@someone" in notes
+
+
+def test_clarification_notes_are_empty_without_a_question():
+    comments = [Comment("someone", "2026-09-10T00:00:00Z", "Just chatting.")]
+
+    assert clarification_notes(comments, "bot") == ""
 
 
 def test_task_prompt_inlines_titles_only_and_points_to_plan_file():
@@ -593,20 +641,6 @@ def test_run_once_admits_a_ready_issue_once_its_blockers_close(tmp_path):
     assert admitted == [4]
 
 
-def test_plan_only_records_a_failure_when_the_planner_asks_questions(tmp_path):
-    """Interim: the clarify flow lands in a later step; until then questions fail the run."""
-    app = make_orchestrator(tmp_path)
-    app.agents["planner"].execute = AsyncMock(
-        return_value=result('```json\n{"questions": ["Which module?"]}\n```')
-    )
-    issue = Issue(number=4, title="T", body="Ambiguous request")
-    app.state.claim_for_planning(issue, "planner")
-
-    asyncio.run(app.plan_only(issue))
-
-    assert app.state.rows()[0]["status"] == str(TaskStatus.FAILED)
-
-
 def test_parse_plan_error_includes_context_snippet():
     """An unrepairable plan should surface the offending text in the error message."""
     with pytest.raises(CommandError, match="near:"):
@@ -778,6 +812,177 @@ def test_auto_ready_skips_child_issues_from_a_split(tmp_path):
     run_plan_only(app, issue)
 
     assert added_labels(app) == ["agent-planned"]
+
+
+def asks_questions(app: Orchestrator, question: str = "Which module should this live in?") -> None:
+    app.agents["planner"].execute = AsyncMock(
+        return_value=result('```json\n{"questions": ["' + question + '"]}\n```')
+    )
+
+
+def test_plan_only_asks_for_clarification_and_waits(tmp_path):
+    app = make_orchestrator(tmp_path)
+    asks_questions(app)
+    issue = Issue(4, "Vague", "Improve this")
+
+    run_plan_only(app, issue)
+
+    assert added_labels(app) == ["agent-needs-info"]
+    assert app.state.load_plan(4) is None
+    rounds, marker = app.state.clarify_state(4)
+    assert (rounds, bool(marker)) == (1, True)
+    # PENDING with no plan is exactly what makes the next poll plan it again.
+    assert app.state.rows()[0]["status"] == str(TaskStatus.PENDING)
+    assert "Which module should this live in?" in app.github.comment.await_args.args[1]
+
+
+def test_plan_only_reads_comments_only_after_it_has_asked(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Task", DETAILED_PLAN)
+
+    run_plan_only(app, issue)
+
+    # The transcript costs an API call, so a first planning pass must not pay it.
+    app.github.comments.assert_not_awaited()
+
+
+def test_plan_only_stops_asking_once_the_round_budget_is_spent(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.config.max_clarify_rounds = 1
+    asks_questions(app)
+    issue = Issue(4, "Vague", "Improve this")
+    app.state.claim_for_planning(issue, "planner")
+    app.state.record_clarify_round(4, "2026-09-10T00:00:00+00:00")
+
+    asyncio.run(app.plan_only(issue))
+
+    # Still parked, but the comment stops promising another automatic pass.
+    assert added_labels(app) == ["agent-needs-info"]
+    assert app.state.clarify_state(4)[0] == 2
+    assert "issue-agent reset" in app.github.comment.await_args.args[1]
+
+
+def test_plan_only_replans_with_the_clarification_transcript(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Vague", "Improve this")
+    app.state.claim_for_planning(issue, "planner")
+    app.state.record_clarify_round(4, "2026-09-10T01:00:00+00:00")
+    app.github.comments = AsyncMock(
+        return_value=[
+            Comment("octocat", "2026-09-10T01:00:01+00:00", CLARIFY_QUESTION),
+            Comment("alice", "2026-09-10T02:00:00+00:00", "The parser module."),
+        ]
+    )
+
+    asyncio.run(app.plan_only(issue))
+
+    prompt = app.agents["planner"].execute.await_args.args[1]
+    assert "The parser module." in prompt
+    # The marker goes with the plan; the round budget stays spent.
+    assert app.state.clarify_state(4) == (1, "")
+
+
+def test_run_once_releases_an_issue_a_human_has_answered(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Vague", "Improve this")
+    app.state.claim_for_planning(issue, "planner")
+    app.state.record_clarify_round(4, "2026-09-10T01:00:00+00:00")
+    app.github.comments = AsyncMock(
+        return_value=[
+            Comment("octocat", "2026-09-10T01:00:01Z", CLARIFY_QUESTION),
+            # GitHub dates comments with a Z suffix while the marker is written
+            # locally, so the two forms must compare.
+            Comment("alice", "2026-09-10T02:00:00Z", "The parser module."),
+        ]
+    )
+
+    asyncio.run(app.run_once())
+
+    assert app.github.labels.await_args.args == (4,)
+    assert app.github.labels.await_args.kwargs == {"remove": ("agent-needs-info",)}
+
+
+def test_run_once_ignores_discussion_from_before_the_question(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Vague", "Improve this")
+    app.state.claim_for_planning(issue, "planner")
+    app.state.record_clarify_round(4, "2026-09-10T01:00:00+00:00")
+    app.github.comments = AsyncMock(
+        return_value=[
+            # Older than the question, so it cannot be an answer to it.
+            Comment("alice", "2026-09-09T23:00:00Z", "Let us discuss this next week."),
+            Comment("octocat", "2026-09-10T01:00:01Z", CLARIFY_QUESTION),
+        ]
+    )
+
+    asyncio.run(app.run_once())
+
+    # Counting it would re-plan in a loop without anything having been answered.
+    app.github.labels.assert_not_awaited()
+
+
+def test_run_once_ignores_the_planners_own_question_comment(tmp_path):
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Vague", "Improve this")
+    app.state.claim_for_planning(issue, "planner")
+    app.state.record_clarify_round(4, "2026-09-10T01:00:00+00:00")
+    app.github.comments = AsyncMock(
+        return_value=[Comment("octocat", "2026-09-10T02:00:00+00:00", CLARIFY_QUESTION)]
+    )
+
+    asyncio.run(app.run_once())
+
+    # The orchestrator posts as octocat; counting its own question as an answer
+    # would leave it talking to itself.
+    app.github.labels.assert_not_awaited()
+
+
+def test_run_once_leaves_a_spent_clarification_parked(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.config.max_clarify_rounds = 1
+    issue = Issue(4, "Vague", "Improve this")
+    app.state.claim_for_planning(issue, "planner")
+    app.state.record_clarify_round(4, "2026-09-10T01:00:00+00:00")
+    app.state.record_clarify_round(4, "2026-09-10T03:00:00+00:00")
+    app.github.comments = AsyncMock(
+        return_value=[Comment("alice", "2026-09-10T04:00:00+00:00", "The parser module.")]
+    )
+
+    asyncio.run(app.run_once())
+
+    # A spent budget needs a human reset, so the reply must not re-queue it.
+    app.github.labels.assert_not_awaited()
+    app.github.comments.assert_not_awaited()
+
+
+def test_run_once_skips_reply_detection_when_the_login_is_unknown(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.github.viewer_login = AsyncMock(return_value="")
+    issue = Issue(4, "Vague", "Improve this")
+    app.state.claim_for_planning(issue, "planner")
+    app.state.record_clarify_round(4, "2026-09-10T01:00:00+00:00")
+
+    asyncio.run(app.run_once())
+
+    # Without a login there is no way to tell a human reply from the planner's
+    # own question, so detection is off and the label stays for a human to drop.
+    app.github.comments.assert_not_awaited()
+    app.github.labels.assert_not_awaited()
+
+
+def test_run_once_ignores_replies_from_configured_bots(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.config.clarify_ignore_authors = ("dependabot",)
+    issue = Issue(4, "Vague", "Improve this")
+    app.state.claim_for_planning(issue, "planner")
+    app.state.record_clarify_round(4, "2026-09-10T01:00:00+00:00")
+    app.github.comments = AsyncMock(
+        return_value=[Comment("dependabot", "2026-09-10T02:00:00+00:00", "Bump to 1.2.3.")]
+    )
+
+    asyncio.run(app.run_once())
+
+    app.github.labels.assert_not_awaited()
 
 
 def test_single_task_fallback_without_planner(tmp_path):

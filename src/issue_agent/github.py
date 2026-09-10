@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .formal_review import redact_secrets
-from .models import Blocker, Issue
+from .models import Blocker, Comment, Issue
 from .process import CommandError, run
 
 # Labels the orchestrator applies itself, with recommended colors and
@@ -16,6 +16,7 @@ ORCHESTRATOR_LABELS: dict[str, tuple[str, str]] = {
     "agent-running": ("1d76db", "Implementation in progress"),
     "agent-planned": ("7057ff", "Plan published; awaiting human approval"),
     "agent-failed": ("d73a4a", "Agent run failed"),
+    "agent-needs-info": ("d4c5f9", "Planner needs more information"),
     "human-review": ("fbca04", "Awaiting human review"),
 }
 _READY_LABEL_SPEC = ("0e8a16", "Ready for coding-agent implementation")
@@ -46,9 +47,9 @@ class GitHub:
         self.cwd = cwd
         self.dry_run = dry_run
 
-    async def _gh(self, *args: str, check: bool = True) -> str:
+    async def _gh(self, *args: str, check: bool = True, repo: bool = True) -> str:
         command = ["gh", *args]
-        if self.repo and "--repo" not in args:
+        if repo and self.repo and "--repo" not in args:
             command.extend(("--repo", self.repo))
         result = await run(command, cwd=self.cwd, check=check)
         return result.stdout
@@ -102,6 +103,31 @@ class GitHub:
             )
             for item in (json.loads(output) for output in outputs)
         }
+
+    async def viewer_login(self) -> str:
+        """This machine's GitHub login, or "" when it cannot be asked.
+
+        ``gh api`` accepts no ``--repo``, hence the flag off. Dry-run returns ""
+        without a request, matching ``labels`` and ``create_pr``; callers must
+        read "" as "cannot tell my comments from a human's" and switch reply
+        detection off rather than guess.
+        """
+        if self.dry_run:
+            return ""
+        return (await self._gh("api", "user", "--jq", ".login", repo=False)).strip()
+
+    async def comments(self, number: int) -> list[Comment]:
+        """Every comment on an issue, oldest first, for reply detection."""
+        output = await self._gh("issue", "view", str(number), "--json", "comments")
+        items = json.loads(output).get("comments") or []
+        return [
+            Comment(
+                author=str((item.get("author") or {}).get("login") or ""),
+                created_at=str(item.get("createdAt") or ""),
+                body=str(item.get("body") or ""),
+            )
+            for item in items
+        ]
 
     async def ready_issues(self, label: str, limit: int = 20) -> list[Issue]:
         return await self.open_issues(limit, label=label)

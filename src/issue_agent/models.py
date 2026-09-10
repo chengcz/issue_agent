@@ -61,6 +61,20 @@ class PlanTask:
 
 
 @dataclass(frozen=True)
+class Comment:
+    """One issue comment, as far as reply detection needs it.
+
+    ``created_at`` stays the raw GitHub timestamp: callers comparing it against a
+    locally taken marker own that policy, and a string that cannot be parsed must
+    be rejected where the comparison happens rather than silently here.
+    """
+
+    author: str
+    created_at: str
+    body: str
+
+
+@dataclass(frozen=True)
 class Blocker:
     """One native ``blockedBy`` entry, as far as the dependency gate needs it.
 
