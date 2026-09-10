@@ -2456,6 +2456,40 @@ def test_failed_resumed_call_clears_session_so_next_attempt_starts_fresh(tmp_pat
     assert app.state.load_session(4, "worker", "worker") == ""
 
 
+def test_failed_call_with_result_session_id_stays_cleared(tmp_path):
+    """agents.py unwraps failed output too, so a CommandError can carry a Result
+    whose usage already has a session_id (Codex emits thread.started before the
+    turn fails). Logging the failed call must not save that poisoned id right
+    back over the clear_session the failure path just performed."""
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    poisoned = Result(1, "", "boom", usage={"session_id": "thread-4"})
+    execute = AsyncMock(
+        side_effect=[
+            Result(0, "ok", "", usage={"session_id": "thread-4"}),
+            CommandError("resume failed: session not found", result=poisoned),
+            Result(0, "ok", ""),
+        ]
+    )
+    app.agents["worker"] = SimpleNamespace(
+        config=SimpleNamespace(
+            resume_command=("worker", "resume", "{session_id}"),
+            review_resume_command=None,
+        ),
+        execute=execute,
+    )
+
+    asyncio.run(app._execute_agent("worker", tmp_path, "first", issue_number=4))
+    with pytest.raises(CommandError):
+        asyncio.run(app._execute_agent("worker", tmp_path, "second", issue_number=4))
+    asyncio.run(app._execute_agent("worker", tmp_path, "third", issue_number=4))
+
+    assert execute.await_args_list[1].kwargs["session_id"] == "thread-4"
+    assert "session_id" not in execute.await_args_list[2].kwargs
+    assert app.state.load_session(4, "worker", "worker") == ""
+
+
 def test_failed_resumed_review_call_clears_reviewer_session(tmp_path):
     app = make_orchestrator(tmp_path)
     issue = Issue(4, "Task", "Body")

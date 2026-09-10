@@ -1516,7 +1516,12 @@ class Orchestrator:
                 error=error,
             )
             session_id = str((result.usage or {}).get("session_id") or "")
-            if session_id:
+            # A failed call can still carry a session id (Codex emits
+            # thread.started before a turn fails; Claude result envelopes always
+            # include one). Saving it would immediately re-insert the session
+            # the CommandError handler just cleared, so every retry would resume
+            # the same poisoned session until the attempt budget ran out.
+            if session_id and success:
                 self.state.save_session(
                     issue_number,
                     agent_name,
