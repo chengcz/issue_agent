@@ -1147,6 +1147,26 @@ def test_plan_only_creates_the_children_and_parks_the_parent(tmp_path):
     assert "add the `agent-ready` label — or run" not in body
 
 
+def test_dry_run_split_completes_with_placeholder_children(tmp_path):
+    """Dry-run must be able to exercise the whole split flow (spec §6.2):
+    create_issue hands out distinct fake numbers, the no-op link and comment
+    calls let the flow finish, and the parent lands on SPLIT."""
+    from issue_agent.github import GitHub
+
+    app = split_app(tmp_path)
+    app.config.dry_run = True
+    app.github = GitHub("", tmp_path, dry_run=True)
+    proposes_split(app)
+    issue = Issue(4, "Too big", "Do everything")
+
+    run_plan_only(app, issue)
+
+    numbers = [child.number for child in app.state.load_split(4)]
+    assert len(numbers) == 2 and len(set(numbers)) == 2
+    assert all(number > 1_000_000_000 for number in numbers)
+    assert app.state.rows()[0]["status"] == str(TaskStatus.SPLIT)
+
+
 def test_split_children_never_inherit_workflow_labels(tmp_path):
     app = split_app(tmp_path)
     proposes_split(app)

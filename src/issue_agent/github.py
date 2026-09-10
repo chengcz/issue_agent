@@ -24,6 +24,9 @@ ORCHESTRATOR_LABELS: dict[str, tuple[str, str]] = {
 }
 _READY_LABEL_SPEC = ("0e8a16", "Ready for coding-agent implementation")
 _AGENT_ROUTE_COLOR = "a219d8"
+# Dry-run issue numbers come from a range GitHub can never hand out, so a
+# recorded fake child can never collide with a real one.
+_DRY_RUN_ISSUE_BASE = 1_000_000_000
 
 
 def _issue_number(url: str) -> int:
@@ -55,6 +58,7 @@ class GitHub:
         self.repo = repo
         self.cwd = cwd
         self.dry_run = dry_run
+        self._dry_run_issue_counter = 0
 
     async def _gh(self, *args: str, check: bool = True, repo: bool = True) -> str:
         command = ["gh", *args]
@@ -195,15 +199,17 @@ class GitHub:
         """Create an issue and return ``(number, url)``.
 
         ``gh issue create`` prints only the URL, so the number is parsed out of
-        its last path segment. Dry-run returns ``(0, "")`` and makes no request:
-        the caller records 0 as "not created yet", which is exactly what it
-        means, whereas an invented number would make a later attempt skip a
-        child issue that never existed.
+        its last path segment. Dry-run makes no request and returns distinct
+        fake numbers from a range GitHub can never hand out, so a dry-run can
+        exercise the whole split flow — recording the placeholder is safe
+        because a dry-run never creates anything a later real run would skip.
         """
         title = redact_secrets(title)
         body = redact_secrets(body)
         if self.dry_run:
-            return (0, "")
+            self._dry_run_issue_counter += 1
+            number = _DRY_RUN_ISSUE_BASE + self._dry_run_issue_counter
+            return (number, f"dry-run://issue/{number}")
         args = ["issue", "create", "--title", title, "--body", body]
         for label in labels:
             args.extend(("--label", label))

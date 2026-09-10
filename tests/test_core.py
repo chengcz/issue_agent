@@ -1131,7 +1131,13 @@ def test_create_issue_makes_no_request_in_dry_run(tmp_path: Path):
     github = GitHub("owner/repo", tmp_path, dry_run=True)
     github._gh = AsyncMock()
 
-    assert asyncio.run(github.create_issue("Child", "Body")) == (0, "")
+    number, url = asyncio.run(github.create_issue("Child", "Body"))
+    second, _ = asyncio.run(github.create_issue("Child two", "Body two"))
+
+    # Fake numbers from a range GitHub can never hand out, distinct per child,
+    # so a dry-run can exercise the whole split flow (spec §6.2).
+    assert number > 1_000_000_000 and second == number + 1
+    assert url.endswith(f"/{number}")
     github._gh.assert_not_awaited()
 
 

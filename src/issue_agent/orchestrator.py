@@ -1102,9 +1102,11 @@ class Orchestrator:
                     child.title, child.body, labels=_inheritable_labels(issue.labels)
                 )
                 if not number:
-                    # gh reported success without an issue number, which is also
-                    # what dry-run reports. Recording a placeholder would make a
-                    # later attempt skip a child that was never created.
+                    # gh reported success without a parseable issue number.
+                    # Recording a placeholder would make a later attempt skip a
+                    # child that was never created. (Dry-run never lands here:
+                    # it returns distinct fake numbers so the flow is
+                    # exercisable end to end.)
                     raise CommandError(
                         f"created child issue {index + 1} but gh reported no issue number"
                     )
