@@ -63,6 +63,31 @@ def _expand(value: str) -> str:
     return os.path.expandvars(os.path.expanduser(value))
 
 
+def _parse_bool(key: str, value: object) -> bool:
+    """Strict boolean parsing for a config key.
+
+    TOML booleans arrive as bool; a quoted ``"false"`` must fail loudly instead
+    of silently meaning True — ``bool("false")`` is truthy, which left an agent
+    enabled and ``dry_run`` off when the user meant exactly the opposite.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ValueError(f"{key} must be true or false, got {value!r}")
+
+
+def _string_list(key: str, value: object) -> tuple[str, ...]:
+    """A config key that must be a list of shell command strings.
+
+    A bare ``commands = "pytest -q"`` would ``tuple()`` into single characters,
+    each of which would then run as its own shell command.
+    """
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"{key} must be a list of strings, got {value!r}")
+    return tuple(value)
+
+
 def validate_config(config: Config) -> None:
     """Reject invalid execution limits and named Agent references early."""
     positive = {
@@ -102,6 +127,12 @@ def validate_config(config: Config) -> None:
                 )
     if config.agents and config.default_agent not in config.agents:
         raise ValueError(f"unknown or disabled default_agent: {config.default_agent}")
+    if not config.agents:
+        # Without agents every ready issue is silently rejected by select_agent
+        # forever — the orchestrator would spin with no failure signal at all.
+        raise ValueError(
+            "no agents configured: define at least one [agents.<name>] with a command"
+        )
     for role, name in (
         ("planner_agent", config.planner_agent),
         ("reviewer_agent", config.reviewer_agent),
@@ -121,8 +152,12 @@ def load_config(path: str | Path) -> Config:
     root = config_path.parent
     runtime = raw.get("runtime", {})
     github = raw.get("github", {})
-    agents = {
-        name: AgentConfig(
+    checks_section = raw.get("checks", {})
+    agents: dict[str, AgentConfig] = {}
+    for name, item in raw.get("agents", {}).items():
+        if not _parse_bool(f"agents.{name}.enabled", item.get("enabled", True)):
+            continue
+        agents[name] = AgentConfig(
             command=tuple(shlex.split(item["command"])),
             max_workers=int(item.get("max_workers", 1)),
             timeout_seconds=int(item.get("timeout_seconds", 3600)),
@@ -142,9 +177,6 @@ def load_config(path: str | Path) -> Config:
                 else None
             ),
         )
-        for name, item in raw.get("agents", {}).items()
-        if item.get("enabled", True)
-    }
 
     def resolve(value: str) -> Path:
         candidate = Path(_expand(value))
@@ -163,33 +195,39 @@ def load_config(path: str | Path) -> Config:
         max_workers=int(runtime.get("max_workers", 3)),
         max_attempts=int(runtime.get("max_attempts", 3)),
         max_task_attempts=int(runtime.get("max_task_attempts", 2)),
-        checks=tuple(raw.get("checks", {}).get("commands", ["pytest -q"])),
+        checks=_string_list("checks.commands", checks_section.get("commands", ["pytest -q"])),
         task_checks=(
-            tuple(raw.get("checks", {}).get("task_commands", []))
-            if "task_commands" in raw.get("checks", {})
+            _string_list("checks.task_commands", checks_section["task_commands"])
+            if "task_commands" in checks_section
             else None
         ),
-        check_timeout_seconds=int(raw.get("checks", {}).get("timeout_seconds", 1800)),
+        check_timeout_seconds=int(checks_section.get("timeout_seconds", 1800)),
         max_check_workers=int(
-            raw.get("checks", {}).get("max_workers", runtime.get("max_workers", 3))
+            checks_section.get("max_workers", runtime.get("max_workers", 3))
         ),
-        baseline_cache_ttl_seconds=int(raw.get("checks", {}).get("baseline_cache_ttl_seconds", 300)),
+        baseline_cache_ttl_seconds=int(checks_section.get("baseline_cache_ttl_seconds", 300)),
         baseline_cache_max_entries=int(
-            raw.get("checks", {}).get("baseline_cache_max_entries", 32)
+            checks_section.get("baseline_cache_max_entries", 32)
         ),
-        checks_parallel=bool(raw.get("checks", {}).get("parallel", True)),
+        checks_parallel=_parse_bool("checks.parallel", checks_section.get("parallel", True)),
         review_task_mode=str(raw.get("review", {}).get("task_mode", "formal")),
         codegraph=CodegraphConfig(
-            enabled=bool(raw.get("codegraph", {}).get("enabled", True))
+            enabled=_parse_bool(
+                "codegraph.enabled", raw.get("codegraph", {}).get("enabled", True)
+            )
         ),
         default_agent=runtime.get("default_agent", "codex"),
         reviewer_agent=runtime.get("reviewer_agent", ""),
         planner_agent=runtime.get("planner_agent", ""),
         max_tasks=int(runtime.get("max_tasks", 8)),
-        auto_plan_unlabeled=bool(runtime.get("auto_plan_unlabeled", False)),
+        auto_plan_unlabeled=_parse_bool(
+            "runtime.auto_plan_unlabeled", runtime.get("auto_plan_unlabeled", False)
+        ),
         auto_plan_limit=int(runtime.get("auto_plan_limit", 20)),
-        auto_ready_with_plan=bool(runtime.get("auto_ready_with_plan", False)),
-        allow_split=bool(runtime.get("allow_split", False)),
+        auto_ready_with_plan=_parse_bool(
+            "runtime.auto_ready_with_plan", runtime.get("auto_ready_with_plan", False)
+        ),
+        allow_split=_parse_bool("runtime.allow_split", runtime.get("allow_split", False)),
         max_split_children=int(runtime.get("max_split_children", 5)),
         max_clarify_rounds=int(runtime.get("max_clarify_rounds", 2)),
         # GitHub logins are case-insensitive; normalize once so the comment
@@ -197,7 +235,7 @@ def load_config(path: str | Path) -> Config:
         clarify_ignore_authors=tuple(
             str(author).lower() for author in runtime.get("clarify_ignore_authors", [])
         ),
-        dry_run=bool(runtime.get("dry_run", False)),
+        dry_run=_parse_bool("runtime.dry_run", runtime.get("dry_run", False)),
         agents=agents,
         schedule=load_schedule(raw.get("schedule", {})),
     )

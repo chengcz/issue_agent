@@ -30,6 +30,8 @@ log_dir = "logs"
 dry_run = true
 [github]
 repo = "a/b"
+[agents.codex]
+command = "codex exec -"
 [checks]
 commands = {json.dumps(checks)}
 parallel = {str(parallel).lower()}

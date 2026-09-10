@@ -460,6 +460,8 @@ log_dir = "logs"
 dry_run = true
 [github]
 repo = "a/b"
+[agents.codex]
+command = "codex exec -"
 """
     )
     config = load_config(config_file)
@@ -677,6 +679,8 @@ state_db = "state.db"
 dry_run = true
 [github]
 repo = "a/b"
+[agents.codex]
+command = "codex exec -"
 [checks]
 commands = ["pytest -q"]
 parallel = false
@@ -738,6 +742,8 @@ def test_config_defaults_to_codegraph_enabled_and_parallel_checks(tmp_path: Path
 repo = "."
 [github]
 repo = "a/b"
+[agents.codex]
+command = "codex exec -"
 ''')
     config = load_config(config_file)
     assert config.checks_parallel is True
@@ -752,6 +758,8 @@ def test_config_parses_review_task_mode(tmp_path: Path):
 repo = "."
 [github]
 repo = "a/b"
+[agents.codex]
+command = "codex exec -"
 [review]
 task_mode = "full"
 ''')
@@ -766,6 +774,8 @@ def test_config_rejects_invalid_review_task_mode(tmp_path: Path):
 repo = "."
 [github]
 repo = "a/b"
+[agents.codex]
+command = "codex exec -"
 [review]
 task_mode = "invalid"
 ''')
@@ -809,6 +819,8 @@ def test_config_defaults_leave_new_workflow_features_off(tmp_path: Path):
 repo = "."
 [github]
 repo = "a/b"
+[agents.codex]
+command = "codex exec -"
 ''')
     config = load_config(config_file)
     assert config.auto_ready_with_plan is False
@@ -830,6 +842,8 @@ max_clarify_rounds = 4
 clarify_ignore_authors = ["Dependabot[bot]", "ci-bot"]
 [github]
 repo = "a/b"
+[agents.codex]
+command = "codex exec -"
 ''')
     config = load_config(config_file)
     assert config.auto_ready_with_plan is True
@@ -851,6 +865,81 @@ repo = "a/b"
 ''')
         with pytest.raises(ValueError, match=key):
             load_config(config_file)
+
+
+def test_config_parses_quoted_boolean_flags_as_written(tmp_path: Path):
+    """bool("false") is True: before strict parsing a quoted "false" left
+    dry_run ON when the user meant OFF (and kept a "disabled" agent enabled).
+    Quoted forms now parse to the value they spell; garbage strings fail."""
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text(
+        """
+[runtime]
+repo = "."
+dry_run = "false"
+auto_plan_unlabeled = "true"
+[github]
+repo = "a/b"
+[agents.codex]
+command = "codex exec -"
+enabled = "true"
+"""
+    )
+    config = load_config(config_file)
+    assert config.dry_run is False
+    assert config.auto_plan_unlabeled is True
+    assert "codex" in config.agents
+
+
+def test_config_rejects_a_non_boolean_flag_value(tmp_path: Path):
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text(
+        """
+[runtime]
+repo = "."
+dry_run = "nope"
+[github]
+repo = "a/b"
+[agents.codex]
+command = "codex exec -"
+"""
+    )
+    with pytest.raises(ValueError, match="dry_run"):
+        load_config(config_file)
+
+
+def test_config_rejects_a_scalar_command_string(tmp_path: Path):
+    """tuple("pytest -q") would split the command into single characters, each
+    then run as its own shell command."""
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text(
+        """
+[runtime]
+repo = "."
+[agents.codex]
+command = "codex exec -"
+[checks]
+commands = "pytest -q"
+"""
+    )
+    with pytest.raises(ValueError, match="checks.commands"):
+        load_config(config_file)
+
+
+def test_config_rejects_an_empty_agent_table(tmp_path: Path):
+    """Without agents every ready issue is silently rejected forever — the
+    orchestrator spins with no failure signal. Fail fast at load time."""
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text(
+        """
+[runtime]
+repo = "."
+[github]
+repo = "a/b"
+"""
+    )
+    with pytest.raises(ValueError, match="no agents configured"):
+        load_config(config_file)
 
 
 def test_issue_defaults_have_no_blockers_or_parent():
@@ -1403,6 +1492,8 @@ log_dir = "logs"
 dry_run = true
 [github]
 repo = "a/b"
+[agents.codex]
+command = "codex exec -"
 [checks]
 commands = {json.dumps(checks)}
 """

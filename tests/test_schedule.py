@@ -76,7 +76,8 @@ def test_invalid_schedule(raw):
 def test_config_load(tmp_path):
     config = tmp_path / "config.toml"
     config.write_text('[schedule]\ntimezone = "Asia/Shanghai"\n'
-                      '[[schedule.deny]]\nstart = "09:00"\nend = "18:00"\n')
+                      '[[schedule.deny]]\nstart = "09:00"\nend = "18:00"\n'
+                      '[agents.codex]\ncommand = "codex exec -"\n')
     assert not load_config(config).schedule.allows(datetime.fromisoformat("2026-09-07T12:00+08:00"))
     config.write_text('schedule = "invalid"')
     with pytest.raises(ValueError, match="schedule"):
@@ -92,7 +93,7 @@ def test_once_outside_window_skips_preflight(tmp_path, monkeypatch, caplog):
     from issue_agent import cli
 
     path = tmp_path / "config.toml"
-    path.write_text("")
+    path.write_text('[agents.codex]\ncommand = "codex exec -"\n')
     config = replace(load_config(path), schedule=load_schedule({
         "deny": [rule("00:00", "24:00")]
     }))
