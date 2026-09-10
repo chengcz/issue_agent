@@ -199,7 +199,8 @@ class StateStore:
             db.execute(
                 """INSERT INTO tasks(issue_number,title,status,agent,updated_at)
                 VALUES(?,?,?,?,?) ON CONFLICT(issue_number) DO UPDATE SET
-                status=excluded.status,agent=excluded.agent,updated_at=excluded.updated_at""",
+                title=excluded.title,status=excluded.status,agent=excluded.agent,
+                updated_at=excluded.updated_at""",
                 (issue.number, issue.title, TaskStatus.CLAIMED, agent, now),
             )
         return True
@@ -248,12 +249,22 @@ class StateStore:
         """Record a whole-issue failure, incrementing the retry-budget counter.
 
         Returns the new failure count so callers can decide whether the issue is
-        still re-claimable (``failures < max_attempts``) or parked.
+        still re-claimable (``failures < max_attempts``) or parked. An unknown
+        issue gets a fresh row (its title is not known here) instead of silently
+        dropping the failure: the return value must always reflect what the
+        database now holds.
         """
         now = datetime.now(UTC).isoformat()
         with self.connect() as db:
             row = db.execute("SELECT failures FROM tasks WHERE issue_number=?", (issue_number,)).fetchone()
-            failures = int(row["failures"]) + 1 if row else 1
+            if row is None:
+                db.execute(
+                    """INSERT INTO tasks(issue_number,title,status,failures,last_error,updated_at)
+                    VALUES(?,'',?,1,?,?)""",
+                    (issue_number, str(status), last_error, now),
+                )
+                return 1
+            failures = int(row["failures"]) + 1
             db.execute(
                 "UPDATE tasks SET status=?, failures=?, last_error=?, updated_at=? WHERE issue_number=?",
                 (str(status), failures, last_error, now, issue_number),
@@ -273,6 +284,12 @@ class StateStore:
         payload = json.dumps([task.to_dict() for task in plan], ensure_ascii=False)
         with self.connect() as db:
             db.execute("UPDATE tasks SET plan=?, updated_at=? WHERE issue_number=?", (payload, now, issue_number))
+            # A shorter replacement plan must not leave ghost rows behind: they
+            # would mis-index plan_task_statuses and haunt the CLI report.
+            db.execute(
+                "DELETE FROM plan_tasks WHERE issue_number=? AND seq >= ?",
+                (issue_number, len(plan)),
+            )
             db.executemany(
                 """INSERT INTO plan_tasks(issue_number,seq,title,description,status,updated_at)
                 VALUES(?,?,?,?,?,?) ON CONFLICT(issue_number,seq) DO UPDATE SET
@@ -286,15 +303,29 @@ class StateStore:
             row = db.execute("SELECT plan FROM tasks WHERE issue_number=?", (issue_number,)).fetchone()
         if not row or not row["plan"]:
             return None
-        items = json.loads(row["plan"])
-        return [PlanTask.from_dict(item) for item in items]
+        try:
+            items = json.loads(row["plan"])
+            return [PlanTask.from_dict(item) for item in items]
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+            # Same posture as load_split: a corrupted or hand-edited payload
+            # falls back to "no plan" — fresh planning overwrites it — instead
+            # of wedging the poll loop with an unparseable column.
+            return None
 
     def plan_task_statuses(self, issue_number: int) -> list[TaskStatus]:
         with self.connect() as db:
             rows = db.execute(
                 "SELECT seq,status FROM plan_tasks WHERE issue_number=? ORDER BY seq", (issue_number,)
             ).fetchall()
-        return [TaskStatus(row["status"]) for row in rows]
+        statuses: list[TaskStatus] = []
+        for row in rows:
+            try:
+                statuses.append(TaskStatus(row["status"]))
+            except ValueError:
+                # An unknown status string in a hand-edited database reads as
+                # "not done yet", keeping the list length aligned with the plan.
+                statuses.append(TaskStatus.PENDING)
+        return statuses
 
     def update_plan_task(self, issue_number: int, seq: int, **values: object) -> None:
         fields = {
@@ -714,9 +745,13 @@ class StateStore:
                 ),
             )
             failed = db.execute(
-                f"UPDATE tasks SET failures=failures+1, status=?, last_error=?, updated_at=? "
-                f"WHERE status IN ({placeholders}) AND (plan IS NULL OR plan = '')",
-                (str(TaskStatus.FAILED), "orchestrator restarted while task was active", now, *active),
+                f"UPDATE tasks SET failures=failures+1, updated_at=?, last_error=?,"
+                f" status=CASE WHEN failures+1>=? THEN ? ELSE ? END"
+                f" WHERE status IN ({placeholders}) AND (plan IS NULL OR plan = '')",
+                (
+                    now, "orchestrator restarted while task was active", max_attempts,
+                    str(TaskStatus.FAILED), str(TaskStatus.PENDING), *active,
+                ),
             )
             db.execute(
                 f"UPDATE plan_tasks SET status=?, last_error=?, updated_at=? WHERE status IN ({placeholders})",
@@ -842,15 +877,23 @@ class StateStore:
         The increment happens in SQL so the counter cannot drift from the marker
         it belongs with. Callers compare the result against
         ``max_clarify_rounds``; keeping the budget in this table is what makes it
-        survive a restart.
+        survive a restart. An unknown issue gets a fresh row (its title is not
+        known here) instead of returning a count nothing backed.
         """
         now = datetime.now(UTC).isoformat()
         with self.connect() as db:
-            db.execute(
+            cursor = db.execute(
                 "UPDATE tasks SET clarify_rounds=clarify_rounds+1, clarify_marker=?, updated_at=? "
                 "WHERE issue_number=?",
                 (marker, now, issue_number),
             )
+            if cursor.rowcount == 0:
+                db.execute(
+                    """INSERT INTO tasks(issue_number,title,status,clarify_rounds,clarify_marker,updated_at)
+                    VALUES(?,'',?,1,?,?)""",
+                    (issue_number, str(TaskStatus.PENDING), marker, now),
+                )
+                return 1
             row = db.execute(
                 "SELECT clarify_rounds FROM tasks WHERE issue_number=?", (issue_number,)
             ).fetchone()

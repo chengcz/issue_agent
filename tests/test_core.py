@@ -222,6 +222,85 @@ def test_claim_allows_blocked_under_attempt_budget(tmp_path: Path):
     assert state.claim(issue, "codex", max_attempts=2) is False
 
 
+def test_record_failure_creates_a_row_for_an_unknown_issue(tmp_path: Path):
+    """The returned count must always reflect the database: a caller firing
+    before any claim still gets a persisted failure, never a phantom count."""
+    state = StateStore(tmp_path / "state.db")
+    assert state.record_failure(42, TaskStatus.FAILED, "preflight blew up") == 1
+    row = state.rows()[0]
+    assert row["status"] == str(TaskStatus.FAILED)
+    assert row["failures"] == 1
+    assert row["last_error"] == "preflight blew up"
+
+
+def test_record_clarify_round_creates_a_row_for_an_unknown_issue(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    marker = "2026-09-10T00:00:00+00:00"
+    assert state.record_clarify_round(42, marker) == 1
+    assert state.clarify_state(42) == (1, marker)
+
+
+def test_load_plan_survives_a_corrupted_payload(tmp_path: Path):
+    """Same posture as load_split: a hand-edited database falls back to 'no
+    plan' (fresh planning overwrites it) instead of wedging the poll loop."""
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(4, "T", "B"), "planner")
+    state.save_plan(4, [PlanTask("One", "D")])
+    import sqlite3
+
+    db = sqlite3.connect(state.path)
+    db.execute("UPDATE tasks SET plan='{not json' WHERE issue_number=4")
+    db.commit()
+    db.close()
+
+    assert state.load_plan(4) is None
+
+
+def test_plan_task_statuses_read_unknown_status_as_pending(tmp_path: Path):
+    import sqlite3
+
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(4, "T", "B"), "planner")
+    state.save_plan(4, [PlanTask("One", "D")])
+    db = sqlite3.connect(state.path)
+    db.execute("UPDATE plan_tasks SET status='frobnicated' WHERE issue_number=4")
+    db.commit()
+    db.close()
+
+    assert state.plan_task_statuses(4) == [TaskStatus.PENDING]
+
+
+def test_claim_refreshes_an_issue_title(tmp_path: Path):
+    """Retitled issues must not keep their stale name in status/report output:
+    every re-claim (e.g. a retry after a failure) carries the current title."""
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(4, "Old title", "B"), "worker")
+    state.record_failure(4, TaskStatus.FAILED, "boom")
+    state.claim(Issue(4, "New title", "B"), "worker", max_attempts=3)
+
+    assert state.rows()[0]["title"] == "New title"
+
+
+def test_save_plan_prunes_ghost_rows_from_a_shorter_plan(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    state.claim(Issue(4, "T", "B"), "planner")
+    state.save_plan(4, [PlanTask("One", "D"), PlanTask("Two", "D"), PlanTask("Three", "D")])
+    state.save_plan(4, [PlanTask("Only", "D")])
+
+    assert state.plan_task_statuses(4) == [TaskStatus.PENDING]
+
+
+def test_issue_log_structural_keys_cannot_be_shadowed(tmp_path: Path):
+    import json as json_module
+
+    log = IssueLog(tmp_path, 4)
+    log.event("plan_failed", event="sneaky", issue_number=999, error="boom")
+    record = json_module.loads(log.execution_path.read_text(encoding="utf-8").splitlines()[0])
+    assert record["event"] == "plan_failed"
+    assert record["issue_number"] == 4
+    assert record["error"] == "boom"
+
+
 def test_record_failure_increments_failures_and_sets_status(tmp_path: Path):
     state = StateStore(tmp_path / "state.db")
     state.claim(Issue(1, "Task", "Body"), "codex")

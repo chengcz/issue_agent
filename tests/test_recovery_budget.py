@@ -32,7 +32,23 @@ def test_recover_counts_no_plan_interruption_too(tmp_path):
     assert state.recover_interrupted(3) == 1
     row = state.rows()[0]
     assert row["failures"] == 1
+    # Under budget the row returns to PENDING, exactly like the planning
+    # branch — no interruption path skips the retry budget.
+    assert row["status"] == str(TaskStatus.PENDING)
+
+
+def test_recover_parks_a_no_plan_interruption_when_budget_exhausted(tmp_path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(9, "Task", "Body")
+    state.claim(issue, "worker")
+    state.record_failure(9, TaskStatus.FAILED, "earlier failure")
+    state.update(9, TaskStatus.TESTING)
+
+    assert state.recover_interrupted(2) == 1
+    row = state.rows()[0]
+    assert row["failures"] == 2
     assert row["status"] == str(TaskStatus.FAILED)
+    assert state.claim(issue, "worker", max_attempts=2) is False
 
 
 def test_recover_parks_task_interruption_when_budget_exhausted(tmp_path):

@@ -2023,11 +2023,18 @@ def test_recovery_replans_planning_and_resumes_planned(tmp_path):
 
 
 def test_recovery_marks_inflight_without_plan_failed(tmp_path):
+    """An active row with no plan goes back to PENDING under budget — no
+    interruption path skips the retry budget — and parks as FAILED only once
+    the budget is exhausted."""
     state = StateStore(tmp_path / "state.db")
     state.claim(Issue(3, "C", ""), "codex")
     state.update(3, TaskStatus.TESTING)
 
-    assert state.recover_interrupted() == 1
+    assert state.recover_interrupted(max_attempts=3) == 1
+    assert state.rows()[0]["status"] == str(TaskStatus.PENDING)
+
+    state.update(3, TaskStatus.TESTING)
+    assert state.recover_interrupted(max_attempts=1) == 1
     assert state.rows()[0]["status"] == str(TaskStatus.FAILED)
 
 

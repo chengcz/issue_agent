@@ -30,11 +30,14 @@ class IssueLog:
 
     def _append(self, path: Path, name: str, data: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Structural keys go last so caller data can never shadow them: an
+        # ``event=`` or ``issue_number=`` kwarg must not corrupt the JSONL
+        # schema the report tooling depends on.
         record = {
+            **data,
             "timestamp": datetime.now(UTC).isoformat(),
             "issue_number": self.issue_number,
             "event": name,
-            **data,
         }
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
