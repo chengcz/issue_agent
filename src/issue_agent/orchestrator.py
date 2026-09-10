@@ -675,6 +675,24 @@ class Orchestrator:
             ):
                 await self.plan_only(issue)
 
+    def _auto_ready_applies(self, issue: Issue) -> bool:
+        """True when an issue may skip human approval of its own plan.
+
+        Every condition matters. Without a configured ``planner_agent`` the
+        planner returns "the body is the plan" for *every* issue, so auto-ready
+        would release the whole queue — that guard is what keeps this feature
+        from deleting the approval step. ``has_detailed_plan`` restricts the
+        shortcut to plans a human wrote out in full, so an LLM-authored plan
+        still waits for review, and ``parent`` excludes the child issues the
+        orchestrator itself created from a split.
+        """
+        return (
+            self.config.auto_ready_with_plan
+            and bool(self.config.planner_agent)
+            and has_detailed_plan(issue.body)
+            and issue.parent is None
+        )
+
     async def plan_only(self, issue: Issue) -> None:
         """Create and publish a plan, then wait for the configured ready label."""
         started = time.monotonic()
@@ -708,18 +726,32 @@ class Orchestrator:
             self.workspaces.write_plan_file(workspace, plan)
             self.state.update(issue.number, TaskStatus.PLANNED, current_seq=0)
             outcome = str(TaskStatus.PLANNED)
-            issue_log.event("awaiting_human_approval", plan_tasks=len(plan))
-            approval_label = f"`{self.config.ready_label}`"
-            await self.github.comment(
-                issue.number,
-                "## Issue Agent Plan\n\n"
-                + format_plan(plan)
-                + "\n\n## Human approval required\n\n"
-                + f"Review or update this Issue and the plan above. Add the {approval_label} "
-                "label when implementation may begin. Until then, Issue Agent will not "
-                "modify code, push a branch, or create a pull request.",
-            )
-            await self.github.labels(issue.number, add=("agent-planned",))
+            if self._auto_ready_applies(issue):
+                issue_log.event("auto_ready_applied", plan_tasks=len(plan))
+                await self.github.comment(
+                    issue.number,
+                    "## Issue Agent Plan\n\n"
+                    + format_plan(plan)
+                    + "\n\n## Auto-approved\n\n"
+                    "The issue body already carried a complete implementation plan, so "
+                    "`auto_ready_with_plan` published it as-is and added the "
+                    f"`{self.config.ready_label}` label. Implementation starts on the "
+                    "next poll without a second planning pass.",
+                )
+                await self.github.labels(issue.number, add=(self.config.ready_label,))
+            else:
+                issue_log.event("awaiting_human_approval", plan_tasks=len(plan))
+                approval_label = f"`{self.config.ready_label}`"
+                await self.github.comment(
+                    issue.number,
+                    "## Issue Agent Plan\n\n"
+                    + format_plan(plan)
+                    + "\n\n## Human approval required\n\n"
+                    + f"Review or update this Issue and the plan above. Add the {approval_label} "
+                    "label when implementation may begin. Until then, Issue Agent will not "
+                    "modify code, push a branch, or create a pull request.",
+                )
+                await self.github.labels(issue.number, add=("agent-planned",))
         except CommandError as exc:
             log.error("issue #%s planning failed: %s", issue.number, exc)
             failures = self.state.record_failure(issue.number, TaskStatus.FAILED, str(exc))

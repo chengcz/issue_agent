@@ -703,6 +703,18 @@ def test_ambiguous_plan_invokes_planner(tmp_path, body):
     assert app.state.load_plan(4) == [PlanTask("One", "D"), PlanTask("Two", "D")]
 
 
+def run_plan_only(app: Orchestrator, issue: Issue) -> None:
+    app.state.claim_for_planning(issue, app.config.planner_agent or "planner")
+    asyncio.run(app.plan_only(issue))
+
+
+def added_labels(app: Orchestrator) -> list[str]:
+    labels: list[str] = []
+    for call in app.github.labels.await_args_list:
+        labels.extend(call.kwargs.get("add", ()))
+    return labels
+
+
 def test_plan_only_reuses_detailed_issue_and_waits_for_ready(tmp_path):
     app = make_orchestrator(tmp_path)
     issue = Issue(4, "Task", DETAILED_PLAN)
@@ -714,6 +726,58 @@ def test_plan_only_reuses_detailed_issue_and_waits_for_ready(tmp_path):
     app.agents["worker"].execute.assert_not_awaited()
     assert app.state.load_plan(4) == [PlanTask("Task", DETAILED_PLAN)]
     assert app.state.rows()[0]["status"] == str(TaskStatus.PLANNED)
+    # auto_ready_with_plan defaults to off, so this still needs a human.
+    assert added_labels(app) == ["agent-planned"]
+
+
+def test_auto_ready_releases_an_issue_whose_body_carries_the_plan(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.config.auto_ready_with_plan = True
+    issue = Issue(4, "Task", DETAILED_PLAN)
+
+    run_plan_only(app, issue)
+
+    # agent-planned means "plan published, awaiting approval"; nothing is
+    # waiting here, so adding it would mislead.
+    assert added_labels(app) == ["agent-ready"]
+    app.agents["planner"].execute.assert_not_awaited()
+    assert app.state.load_plan(4) == [PlanTask("Task", DETAILED_PLAN)]
+    assert app.state.rows()[0]["status"] == str(TaskStatus.PLANNED)
+    assert "auto_ready_with_plan" in app.github.comment.await_args.args[1]
+
+
+def test_auto_ready_leaves_a_planner_written_plan_for_human_review(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.config.auto_ready_with_plan = True
+    issue = Issue(4, "Task", "Ambiguous request")
+
+    run_plan_only(app, issue)
+
+    app.agents["planner"].execute.assert_awaited_once()
+    assert added_labels(app) == ["agent-planned"]
+
+
+def test_auto_ready_requires_a_planner_agent(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.config.auto_ready_with_plan = True
+    app.config.planner_agent = ""
+    issue = Issue(4, "Task", DETAILED_PLAN)
+
+    run_plan_only(app, issue)
+
+    # With no planner configured every issue takes the "body is the plan" path,
+    # so without this guard auto-ready would release the whole queue.
+    assert added_labels(app) == ["agent-planned"]
+
+
+def test_auto_ready_skips_child_issues_from_a_split(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.config.auto_ready_with_plan = True
+    issue = Issue(4, "Task", DETAILED_PLAN, parent=1)
+
+    run_plan_only(app, issue)
+
+    assert added_labels(app) == ["agent-planned"]
 
 
 def test_single_task_fallback_without_planner(tmp_path):
