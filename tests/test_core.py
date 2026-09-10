@@ -17,6 +17,7 @@ from issue_agent.models import (
     Issue,
     PlanOutcome,
     PlanTask,
+    RecordedChild,
     SplitChild,
     TaskStatus,
 )
@@ -24,6 +25,8 @@ from issue_agent.orchestrator import Orchestrator
 from issue_agent.process import CommandError, Result, shell
 from issue_agent.state import StateStore
 from issue_agent.workspace import WorkspaceManager, slugify
+
+AWS_KEY = "AKIAABCDEFGHIJKLMNOP"
 
 
 def test_slugify_is_branch_safe():
@@ -825,6 +828,81 @@ def test_split_status_is_not_claimable(tmp_path: Path):
     assert state.claim(issue, "codex") is False
 
 
+def test_recorded_child_starts_uncreated_and_unlinked():
+    child = RecordedChild.from_child(SplitChild(title="First", body="Body", depends_on=(0,)))
+
+    assert child.title == "First"
+    assert child.depends_on == (0,)
+    # 0 marks "not created yet", which is what makes a retry create only the
+    # children a previous attempt failed to create.
+    assert child.number == 0
+    assert child.linked is False
+
+
+def test_recorded_child_survives_a_json_round_trip():
+    child = RecordedChild(
+        title="First", body="Body", depends_on=(0, 2), number=12, url="u12", linked=True
+    )
+
+    assert RecordedChild.from_dict(child.to_dict()) == child
+
+
+def test_state_split_round_trips_the_created_children(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(number=7, title="Split parent", body="")
+    state.claim_for_planning(issue, "planner")
+
+    state.save_split(
+        7,
+        [RecordedChild(title="First", body="B1"), RecordedChild(title="Second", body="B2")],
+    )
+    state.update_split_child(7, 1, number=22, url="u22")
+
+    children = state.load_split(7)
+    assert [child.title for child in children] == ["First", "Second"]
+    # The first child is still uncreated; a retry has to create exactly that one.
+    assert [(child.number, child.url) for child in children] == [(0, ""), (22, "u22")]
+
+
+def test_state_split_reads_missing_or_malformed_records_as_empty(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(number=7, title="Split parent", body="")
+    state.claim_for_planning(issue, "planner")
+
+    assert state.load_split(7) == []
+
+    with state.connect() as db:
+        db.execute("UPDATE tasks SET split=? WHERE issue_number=?", ("{not json", 7))
+    assert state.load_split(7) == []
+
+
+def test_state_split_child_update_refuses_an_unknown_child(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(number=7, title="Split parent", body="")
+    state.claim_for_planning(issue, "planner")
+    state.save_split(7, [RecordedChild(title="First", body="B1")])
+
+    # Silently dropping the number would orphan an issue that really exists on
+    # GitHub, so an out-of-range index has to be loud.
+    with pytest.raises(ValueError, match="index 3"):
+        state.update_split_child(7, 3, number=22)
+
+
+def test_state_reset_forgets_a_split(tmp_path: Path):
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(number=7, title="Split parent", body="")
+    state.claim_for_planning(issue, "planner")
+    state.save_split(7, [RecordedChild(title="First", body="B1")])
+    state.update(7, TaskStatus.SPLIT)
+
+    assert state.reset(7) == str(TaskStatus.SPLIT)
+
+    # A human resetting a split parent wants it planned again as one unit, so
+    # the record must not survive and resume the old proposal.
+    assert state.load_split(7) == []
+    assert state.rows()[0]["status"] == str(TaskStatus.PENDING)
+
+
 def test_open_issues_reads_native_blockers_and_parent(tmp_path: Path):
     github = GitHub("owner/repo", tmp_path)
     github._gh = AsyncMock(
@@ -938,6 +1016,73 @@ def test_comments_reads_author_timestamp_and_body(tmp_path: Path):
         Comment("octocat", "2026-09-10T01:00:00Z", "Use the parser module."),
         Comment("", "2026-09-10T02:00:00Z", "Ghost"),
     ]
+
+
+def test_create_issue_reads_the_number_out_of_the_returned_url(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(return_value="https://github.com/owner/repo/issues/42\n")
+
+    number, url = asyncio.run(github.create_issue("Child", "Body", labels=("enhancement",)))
+
+    assert (number, url) == (42, "https://github.com/owner/repo/issues/42")
+    assert github._gh.await_args.args == (
+        "issue",
+        "create",
+        "--title",
+        "Child",
+        "--body",
+        "Body",
+        "--label",
+        "enhancement",
+    )
+
+
+def test_create_issue_redacts_secrets_before_posting(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(return_value="https://github.com/owner/repo/issues/42")
+
+    asyncio.run(github.create_issue("Child", f"key {AWS_KEY}"))
+
+    assert AWS_KEY not in github._gh.await_args.args[-1]
+
+
+def test_create_issue_fails_loudly_when_gh_returns_no_url(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(return_value="  \n")
+
+    # Without a number the caller cannot record what it created, and inventing
+    # one would make the next attempt skip a child that never existed.
+    with pytest.raises(CommandError, match="issue number"):
+        asyncio.run(github.create_issue("Child", "Body"))
+
+
+def test_create_issue_makes_no_request_in_dry_run(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path, dry_run=True)
+    github._gh = AsyncMock()
+
+    assert asyncio.run(github.create_issue("Child", "Body")) == (0, "")
+    github._gh.assert_not_awaited()
+
+
+def test_child_links_use_the_native_parent_and_blocked_by_flags(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(return_value="")
+
+    asyncio.run(github.link_parent(12, 7))
+    asyncio.run(github.add_blocked_by(13, 12))
+
+    assert github._gh.await_args_list[0].args == ("issue", "edit", "12", "--parent", "7")
+    assert github._gh.await_args_list[1].args == ("issue", "edit", "13", "--add-blocked-by", "12")
+
+
+def test_child_links_are_skipped_in_dry_run(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path, dry_run=True)
+    github._gh = AsyncMock()
+
+    asyncio.run(github.link_parent(12, 7))
+    asyncio.run(github.add_blocked_by(13, 12))
+
+    github._gh.assert_not_awaited()
 
 
 def test_github_unassigned_issues_keeps_product_labels(tmp_path: Path):

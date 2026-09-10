@@ -13,7 +13,7 @@ from issue_agent.agents import (
     make_task_review_prompt,
 )
 from issue_agent.codegraph import CodegraphConfig
-from issue_agent.models import Blocker, Comment, Issue, PlanTask, TaskStatus
+from issue_agent.models import Blocker, Comment, Issue, PlanTask, RecordedChild, TaskStatus
 from issue_agent.orchestrator import (
     Orchestrator,
     clarification_notes,
@@ -83,6 +83,9 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         blocker_states=AsyncMock(return_value={}),
         viewer_login=AsyncMock(return_value="octocat"),
         comments=AsyncMock(return_value=[]),
+        create_issue=AsyncMock(return_value=(0, "")),
+        link_parent=AsyncMock(),
+        add_blocked_by=AsyncMock(),
     )
     app.workspaces = SimpleNamespace(
         create=AsyncMock(return_value=(tmp_path, "agent/4-task")),
@@ -880,6 +883,174 @@ def test_plan_only_replans_with_the_clarification_transcript(tmp_path):
     assert "The parser module." in prompt
     # The marker goes with the plan; the round budget stays spent.
     assert app.state.clarify_state(4) == (1, "")
+
+
+SPLIT_PAYLOAD = (
+    '{"split": ['
+    '{"title": "Add the parser", "body": "Body one"}, '
+    '{"title": "Add the API", "body": "Body two", "depends_on": [0]}'
+    ']}'
+)
+
+
+def proposes_split(app: Orchestrator, payload: str = SPLIT_PAYLOAD) -> None:
+    app.agents["planner"].execute = AsyncMock(
+        return_value=result(f"```json\n{payload}\n```")
+    )
+
+
+def split_app(tmp_path: Path, *, children: list[tuple[int, str]] | None = None) -> Orchestrator:
+    app = make_orchestrator(tmp_path)
+    app.config.allow_split = True
+    app.github.create_issue = AsyncMock(side_effect=children or [(12, "u12"), (13, "u13")])
+    return app
+
+
+def test_plan_only_creates_the_children_and_parks_the_parent(tmp_path):
+    app = split_app(tmp_path)
+    proposes_split(app)
+    issue = Issue(4, "Too big", "Do everything")
+
+    run_plan_only(app, issue)
+
+    assert [call.args[0] for call in app.github.create_issue.await_args_list] == [
+        "Add the parser",
+        "Add the API",
+    ]
+    assert [child.number for child in app.state.load_split(4)] == [12, 13]
+    # SPLIT is not claimable, so the parent is parked without a plan of its own.
+    assert app.state.rows()[0]["status"] == str(TaskStatus.SPLIT)
+    assert app.state.load_plan(4) is None
+    assert added_labels(app) == ["human-review"]
+    removed = [
+        name
+        for call in app.github.labels.await_args_list
+        for name in call.kwargs.get("remove", ())
+    ]
+    # A parent that is no longer being worked on must not keep advertising that
+    # it is running or awaiting approval of a plan it will never have.
+    assert removed == ["agent-running", "agent-planned", "agent-ready"]
+    body = app.github.comment.await_args.args[1]
+    assert "#12" in body and "#13" in body
+    assert "agent-ready" in body
+
+
+def test_split_children_never_inherit_workflow_labels(tmp_path):
+    app = split_app(tmp_path)
+    proposes_split(app)
+    issue = Issue(4, "Too big", "Do everything", labels=("enhancement", "agent-ready", "agent:codex"))
+
+    run_plan_only(app, issue)
+
+    # `agent-ready` on a child would start something a human never released,
+    # and the parent's agent route is a preference the human re-applies.
+    assert app.github.create_issue.await_args_list[0].kwargs["labels"] == ("enhancement",)
+
+
+def test_split_links_the_children_to_the_parent_and_to_each_other(tmp_path):
+    app = split_app(tmp_path)
+    proposes_split(app)
+    issue = Issue(4, "Too big", "Do everything")
+
+    run_plan_only(app, issue)
+
+    assert [call.args for call in app.github.link_parent.await_args_list] == [(12, 4), (13, 4)]
+    assert [call.args for call in app.github.add_blocked_by.await_args_list] == [(13, 12)]
+    # linked=True is what stops a retry from re-issuing links it already made.
+    assert [child.linked for child in app.state.load_split(4)] == [True, True]
+
+
+def test_split_writes_the_decision_down_before_creating_anything(tmp_path):
+    app = split_app(tmp_path)
+    proposes_split(app)
+    app.github.create_issue = AsyncMock(side_effect=CommandError("gh: HTTP 500"))
+    issue = Issue(4, "Too big", "Do everything")
+
+    run_plan_only(app, issue)
+
+    # The record survives the failure, so the retry resumes this proposal
+    # instead of asking the planner for a second, differently-worded one.
+    assert [child.title for child in app.state.load_split(4)] == ["Add the parser", "Add the API"]
+    assert app.state.rows()[0]["status"] == str(TaskStatus.FAILED)
+    assert added_labels(app) == []
+
+
+def test_split_failure_keeps_the_parent_retryable_and_reports_progress(tmp_path):
+    app = split_app(tmp_path, children=[(12, "u12"), CommandError("gh: HTTP 500")])
+    proposes_split(app)
+    issue = Issue(4, "Too big", "Do everything")
+
+    run_plan_only(app, issue)
+
+    # A half-finished split is a failure to retry, not a result to review.
+    assert app.state.rows()[0]["status"] == str(TaskStatus.FAILED)
+    assert added_labels(app) == []
+    assert [child.number for child in app.state.load_split(4)] == [12, 0]
+    assert "#12" in app.github.comment.await_args.args[1]
+
+
+def test_split_retry_creates_only_the_missing_children(tmp_path):
+    app = split_app(tmp_path, children=[(13, "u13")])
+    issue = Issue(4, "Too big", "Do everything")
+    app.state.claim_for_planning(issue, "planner")
+    app.state.save_split(
+        4,
+        [
+            RecordedChild(title="Add the parser", body="Body one", number=12, url="u12", linked=True),
+            RecordedChild(title="Add the API", body="Body two", depends_on=(0,)),
+        ],
+    )
+    proposes_split(app, '{"split": [{"title": "Different wording", "body": "B"}]}')
+
+    asyncio.run(app.plan_only(issue))
+
+    # Titles come from an LLM and change between runs, so the retry must go by
+    # the recorded proposal, not by asking again.
+    app.agents["planner"].execute.assert_not_awaited()
+    assert [call.args[0] for call in app.github.create_issue.await_args_list] == ["Add the API"]
+    assert [call.args for call in app.github.link_parent.await_args_list] == [(13, 4)]
+    assert [call.args for call in app.github.add_blocked_by.await_args_list] == [(13, 12)]
+    assert app.state.rows()[0]["status"] == str(TaskStatus.SPLIT)
+
+
+def test_split_without_a_usable_issue_number_fails_the_plan(tmp_path):
+    app = split_app(tmp_path, children=[(0, "")])
+    proposes_split(app)
+    issue = Issue(4, "Too big", "Do everything")
+
+    run_plan_only(app, issue)
+
+    # 0 is what dry-run reports, and recording it as created would make the next
+    # attempt skip a child that never existed.
+    assert app.state.rows()[0]["status"] == str(TaskStatus.FAILED)
+    assert [child.number for child in app.state.load_split(4)] == [0, 0]
+    assert added_labels(app) == []
+
+
+def test_plan_only_refuses_a_split_when_splitting_is_disabled(tmp_path):
+    app = make_orchestrator(tmp_path)
+    proposes_split(app)
+    issue = Issue(4, "Too big", "Do everything")
+
+    run_plan_only(app, issue)
+
+    assert app.state.rows()[0]["status"] == str(TaskStatus.FAILED)
+    assert "allow_split" in app.github.comment.await_args.args[1]
+    app.github.create_issue.assert_not_awaited()
+
+
+def test_run_once_leaves_a_split_parent_alone(tmp_path):
+    app = split_app(tmp_path)
+    issue = Issue(4, "Too big", "Do everything", labels=("human-review",))
+    app.state.claim_for_planning(issue, "planner")
+    app.state.update(4, TaskStatus.SPLIT)
+    app.github.unassigned_issues = AsyncMock(return_value=[issue])
+    admitted = track_admissions(app)
+
+    asyncio.run(app.run_once())
+
+    assert admitted == []
+    app.github.labels.assert_not_awaited()
 
 
 def test_run_once_releases_an_issue_a_human_has_answered(tmp_path):

@@ -17,8 +17,10 @@ from .state import StateStore
 
 # Task statuses that are safe to reset. Running statuses are excluded so an
 # active worker is never disturbed mid-cycle; DONE/HUMAN_REVIEW are excluded
-# because re-running would re-push the branch and create a duplicate PR.
-_RESETTABLE = frozenset({"pending", "planned", "failed", "blocked"})
+# because re-running would re-push the branch and create a duplicate PR. A SPLIT
+# parent is included: resetting it is how a human overrules the split and asks
+# for the issue to be planned again as a single unit.
+_RESETTABLE = frozenset({"pending", "planned", "failed", "blocked", "split"})
 
 
 def parser() -> argparse.ArgumentParser:
@@ -233,8 +235,9 @@ async def reset_issue(config, issue_number: int, *, no_label: bool) -> int:
     Clears the whole-issue retry budget and returns the row to PENDING. Unless
     ``no_label`` is set, also re-adds the configured ready label (and removes the
     orchestrator-maintained ``agent-failed``/``agent-running`` labels) so the
-    issue is picked up on the next scheduler poll. Prints a summary; returns a
-    process exit code.
+    issue is picked up on the next scheduler poll. ``human-review`` goes with
+    them, so a reset SPLIT parent does not keep advertising a review that is
+    over. Prints a summary; returns a process exit code.
     """
     state = StateStore(config.state_db)
     row = next((r for r in state.rows() if int(r["issue_number"]) == issue_number), None)
@@ -257,7 +260,7 @@ async def reset_issue(config, issue_number: int, *, no_label: bool) -> int:
         await github.labels(
             issue_number,
             add=(config.ready_label,),
-            remove=("agent-failed", "agent-running"),
+            remove=("agent-failed", "agent-running", "human-review"),
         )
         summary += f"; re-added {config.ready_label}, will be picked up on the next poll"
     else:

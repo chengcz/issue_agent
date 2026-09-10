@@ -7,6 +7,7 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from .agents import (
@@ -23,7 +24,16 @@ from .config import Config
 from .formal_review import formal_review
 from .github import GitHub
 from .issue_log import IssueLog
-from .models import Blocker, Comment, Issue, PlanOutcome, PlanTask, SplitChild, TaskStatus
+from .models import (
+    Blocker,
+    Comment,
+    Issue,
+    PlanOutcome,
+    PlanTask,
+    RecordedChild,
+    SplitChild,
+    TaskStatus,
+)
 from .process import CommandError, Result
 from .schedule import ScheduleConfig
 from .state import RUNNING_STATUSES, StateStore
@@ -236,6 +246,45 @@ def _refs(numbers: Iterable[int]) -> str:
     return ", ".join(f"#{number}" for number in numbers) or "none"
 
 
+def _inheritable_labels(labels: Iterable[str]) -> tuple[str, ...]:
+    """The labels a child issue may inherit from its parent, in parent order.
+
+    Never the orchestrator's own: ``agent-*`` is workflow state, so copying
+    ``agent-ready`` would start a child nobody released, and ``agent:<name>`` is
+    the parent's routing preference, which the human re-applies when releasing
+    the child. Product labels such as ``enhancement`` come along because the
+    child is the same kind of request.
+    """
+    return tuple(label for label in labels if not label.startswith(("agent-", "agent:")))
+
+
+def _child_lines(children: Iterable[RecordedChild]) -> str:
+    """Bullet each created child as ``- #12 title``, for an issue comment."""
+    return "\n".join(f"- #{child.number} {child.title}" for child in children)
+
+
+def _split_comment(issue: Issue, children: list[RecordedChild], ready_label: str) -> str:
+    """The parent's report: what was created and what happens next.
+
+    Written for a human deciding what to do with the children, so it names the
+    label that releases one and the reset that undoes the whole split.
+    """
+    return (
+        "## Issue Agent Split\n\n"
+        "This issue was too large for a single branch, so the planner split it into "
+        f"{len(children)} child issues:\n\n{_child_lines(children)}\n\n"
+        "## What happens next\n\n"
+        "Each child is a separate issue that plans and implements on its own. They are "
+        f"**not** released automatically: add the `{ready_label}` label to the ones that "
+        "should start. Blocked-by links between the children keep them in order, so "
+        "releasing the first is enough.\n\n"
+        "This issue is parked for human review and is neither planned nor implemented while "
+        f"it stays that way. To have it run as one unit instead, add the `{ready_label}` "
+        f"label — or run `issue-agent reset {issue.number}` — and close the children you do "
+        "not want."
+    )
+
+
 # Both the comment the orchestrator posts and the marker it later looks for, so
 # the two cannot drift apart.
 NEEDS_INFO_LABEL = "agent-needs-info"
@@ -356,11 +405,16 @@ def parse_plan(stdout: str, max_tasks: int) -> list[PlanTask]:
     return _plan_tasks(payload, max_tasks)
 
 
-def parse_plan_output(stdout: str, max_tasks: int, max_children: int) -> PlanOutcome:
+def parse_plan_output(
+    stdout: str, max_tasks: int, max_children: int, *, allow_split: bool = True
+) -> PlanOutcome:
     """Parse whichever of the planner's three output shapes came back.
 
     A bare array keeps the historical task list. An object carries either the
     questions that block planning or a proposal to split the issue instead.
+    ``allow_split`` stays a caller-supplied gate rather than a prompt change:
+    the planner may propose a split regardless, and a proposal the configuration
+    forbids has to fail loudly instead of being read as an empty plan.
     """
     payload = _planner_payload(stdout)
     if isinstance(payload, list):
@@ -382,6 +436,11 @@ def parse_plan_output(stdout: str, max_tasks: int, max_children: int) -> PlanOut
     children = payload["split"]
     if not isinstance(children, list) or not children:
         raise CommandError("'split' must be a non-empty list of child issues")
+    if not allow_split:
+        raise CommandError(
+            "the planner proposed splitting this issue but splitting is not enabled; "
+            "set allow_split = true in issue-agent.toml to let it create the child issues"
+        )
     return PlanOutcome(split=tuple(_split_children(children, max_children)))
 
 
@@ -852,6 +911,12 @@ class Orchestrator:
             self.state.update(
                 issue.number, TaskStatus.PLANNING, branch=branch, worktree=str(workspace)
             )
+            recorded_split = self.state.load_split(issue.number)
+            if recorded_split:
+                issue_log.event("split_resumed", children=len(recorded_split))
+                await self._complete_split(issue, recorded_split, issue_log=issue_log)
+                outcome = str(TaskStatus.SPLIT)
+                return
             plan = self.state.load_plan(issue.number)
             if plan is None:
                 planned = await self._plan(
@@ -861,6 +926,18 @@ class Orchestrator:
                     issue_log=issue_log,
                     clarification=await self._clarification(issue.number),
                 )
+                if planned.split:
+                    # The decision lands before the first creation, so a crash
+                    # mid-split resumes from the record rather than asking the
+                    # planner for a second, differently-worded proposal.
+                    recorded = [RecordedChild.from_child(child) for child in planned.split]
+                    self.state.save_split(issue.number, recorded)
+                    issue_log.event(
+                        "split_proposed", children=[child.title for child in recorded]
+                    )
+                    await self._complete_split(issue, recorded, issue_log=issue_log)
+                    outcome = str(TaskStatus.SPLIT)
+                    return
                 if planned.questions:
                     # The marker has to predate the comment, so that any reply
                     # that follows is necessarily newer than it.
@@ -932,6 +1009,66 @@ class Orchestrator:
                 wall_duration_ms=int((time.monotonic() - started) * 1000),
             )
             run_ids.pop(issue.number, None)
+
+    async def _complete_split(
+        self, issue: Issue, children: list[RecordedChild], *, issue_log: IssueLog
+    ) -> None:
+        """Create and link the child issues, then park the parent for review.
+
+        Creation is idempotent by issue number, never by title: the proposal
+        comes from an LLM whose wording changes between runs, so only the number
+        an earlier attempt wrote back identifies a child that already exists.
+        Each creation is persisted the moment it succeeds, and linking waits
+        until every child exists — a sibling link needs both ends to be real.
+        """
+        created = list(children)
+        try:
+            for index, child in enumerate(created):
+                if child.number:
+                    continue
+                number, url = await self.github.create_issue(
+                    child.title, child.body, labels=_inheritable_labels(issue.labels)
+                )
+                if not number:
+                    # gh reported success without an issue number, which is also
+                    # what dry-run reports. Recording a placeholder would make a
+                    # later attempt skip a child that was never created.
+                    raise CommandError(
+                        f"created child issue {index + 1} but gh reported no issue number"
+                    )
+                created[index] = replace(child, number=number, url=url)
+                self.state.update_split_child(issue.number, index, number=number, url=url)
+            for index, child in enumerate(created):
+                if not child.number or child.linked:
+                    continue
+                await self.github.link_parent(child.number, issue.number)
+                for dependency in child.depends_on:
+                    await self.github.add_blocked_by(child.number, created[dependency].number)
+                created[index] = replace(child, linked=True)
+                self.state.update_split_child(issue.number, index, linked=True)
+        except CommandError as exc:
+            done = [child for child in created if child.number]
+            if done:
+                # Partially created: the parent stays on the retry path rather
+                # than going to review, but the human still gets to see which
+                # children already exist.
+                raise CommandError(
+                    f"{exc}\n\nChild issues created so far:\n{_child_lines(done)}"
+                ) from exc
+            raise
+        issue_log.event(
+            "split_created",
+            children=[{"number": child.number, "title": child.title} for child in created],
+        )
+        self.state.update(issue.number, TaskStatus.SPLIT)
+        await self.github.labels(
+            issue.number,
+            add=("human-review",),
+            remove=("agent-running", "agent-planned", self.config.ready_label),
+        )
+        await self.github.comment(
+            issue.number, _split_comment(issue, created, self.config.ready_label)
+        )
 
     async def _comment_planning_failure(self, issue: Issue, failures: int, error: str) -> None:
         retry = (
@@ -1131,7 +1268,10 @@ class Orchestrator:
                 issue_number=issue.number,
             )
             outcome = parse_plan_output(
-                result.stdout, self.config.max_tasks, self.config.max_split_children
+                result.stdout,
+                self.config.max_tasks,
+                self.config.max_split_children,
+                allow_split=self.config.allow_split,
             )
         if outcome.tasks:
             self.state.save_plan(issue.number, list(outcome.tasks))

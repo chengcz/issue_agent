@@ -103,6 +103,51 @@ class SplitChild:
 
 
 @dataclass(frozen=True)
+class RecordedChild:
+    """One child issue of a split, as persisted between attempts.
+
+    ``number`` stays 0 until ``gh issue create`` returns one, and is what makes a
+    retry create only the children still missing: titles come from an LLM and
+    change between runs, so the number is the only stable identity a child has.
+    ``depends_on`` indexes this list. ``linked`` records that the native parent
+    and sibling links are in place, so a crash during linking does not re-issue
+    links that were already made.
+    """
+
+    title: str
+    body: str
+    depends_on: tuple[int, ...] = ()
+    number: int = 0
+    url: str = ""
+    linked: bool = False
+
+    @classmethod
+    def from_child(cls, child: SplitChild) -> RecordedChild:
+        return cls(title=child.title, body=child.body, depends_on=child.depends_on)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "title": self.title,
+            "body": self.body,
+            "depends_on": list(self.depends_on),
+            "number": self.number,
+            "url": self.url,
+            "linked": self.linked,
+        }
+
+    @classmethod
+    def from_dict(cls, item: dict[str, object]) -> RecordedChild:
+        return cls(
+            title=str(item.get("title") or ""),
+            body=str(item.get("body") or ""),
+            depends_on=tuple(int(index) for index in item.get("depends_on") or ()),
+            number=int(item.get("number") or 0),
+            url=str(item.get("url") or ""),
+            linked=bool(item.get("linked")),
+        )
+
+
+@dataclass(frozen=True)
 class PlanOutcome:
     """Exactly one of the planner's three output shapes.
 

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .models import Issue, PlanTask, TaskStatus
+from .models import Issue, PlanTask, RecordedChild, TaskStatus
 
 _ACTIVE = (
     TaskStatus.CLAIMED,
@@ -82,6 +83,7 @@ class StateStore:
                 ("final_approved_commit", "TEXT"),
                 ("clarify_rounds", "INTEGER NOT NULL DEFAULT 0"),
                 ("clarify_marker", "TEXT"),
+                ("split", "TEXT"),
             ):
                 if name not in columns:
                     db.execute(f"ALTER TABLE tasks ADD COLUMN {name} {definition}")
@@ -744,6 +746,70 @@ class StateStore:
                 (issue_number, payload, now),
             )
 
+    def save_split(self, issue_number: int, children: list[RecordedChild]) -> None:
+        """Persist a split decision before any child issue is created.
+
+        Writing the whole proposal first is what makes a crashed or failed
+        attempt resumable: the orchestrator can re-read what it intended to
+        create instead of asking the planner for a second, differently-worded
+        proposal.
+        """
+        now = datetime.now(UTC).isoformat()
+        payload = json.dumps(
+            {"children": [child.to_dict() for child in children]}, ensure_ascii=False
+        )
+        with self.connect() as db:
+            db.execute(
+                "UPDATE tasks SET split=?, updated_at=? WHERE issue_number=?",
+                (payload, now, issue_number),
+            )
+
+    def load_split(self, issue_number: int) -> list[RecordedChild]:
+        """Read back the recorded split, or ``[]`` when there is none.
+
+        A missing row and an unreadable payload both read as "no split", so a
+        hand-edited database falls back to planning rather than wedging.
+        """
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT split FROM tasks WHERE issue_number=?", (issue_number,)
+            ).fetchone()
+        if not row or not row["split"]:
+            return []
+        try:
+            payload = json.loads(row["split"])
+        except json.JSONDecodeError:
+            return []
+        items = payload.get("children") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [RecordedChild.from_dict(item) for item in items if isinstance(item, dict)]
+
+    def update_split_child(self, issue_number: int, index: int, **fields: object) -> None:
+        """Merge ``fields`` into one recorded child, identified by position.
+
+        Raises ``ValueError`` when the record or the index is gone: the caller
+        has usually just created a real issue on GitHub, and silently dropping
+        its number would make the next attempt create a duplicate.
+        """
+        children = self.load_split(issue_number)
+        if not 0 <= index < len(children):
+            raise ValueError(
+                f"cannot record child index {index} for issue #{issue_number}: "
+                f"the split record holds {len(children)} children"
+            )
+        child = replace(children[index], **fields)
+        children[index] = child
+        now = datetime.now(UTC).isoformat()
+        payload = json.dumps(
+            {"children": [item.to_dict() for item in children]}, ensure_ascii=False
+        )
+        with self.connect() as db:
+            db.execute(
+                "UPDATE tasks SET split=?, updated_at=? WHERE issue_number=?",
+                (payload, now, issue_number),
+            )
+
     def clarify_state(self, issue_number: int) -> tuple[int, str]:
         """Return ``(rounds asked, marker of the outstanding question)``.
 
@@ -803,6 +869,8 @@ class StateStore:
         task. The recorded dependency notices go too, so a human who resets an
         issue gets told again about whatever still blocks it, as does the
         clarification budget, so a parked issue is worth asking about again.
+        A recorded split is dropped for the same reason: resetting a split
+        parent is how a human asks for it to be planned again as one unit.
         Returns None when no row exists for the issue.
         """
         now = datetime.now(UTC).isoformat()
@@ -813,7 +881,7 @@ class StateStore:
             old_status = str(row["status"])
             db.execute(
                 "UPDATE tasks SET status=?, failures=0, attempts=0, last_error='', "
-                "current_seq=-1, clarify_rounds=0, clarify_marker=NULL, updated_at=? "
+                "current_seq=-1, clarify_rounds=0, clarify_marker=NULL, split=NULL, updated_at=? "
                 "WHERE issue_number=?",
                 (str(TaskStatus.PENDING), now, issue_number),
             )

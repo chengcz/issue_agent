@@ -23,12 +23,18 @@ _READY_LABEL_SPEC = ("0e8a16", "Ready for coding-agent implementation")
 _AGENT_ROUTE_COLOR = "a219d8"
 
 
+def _issue_number(url: str) -> int:
+    """The issue number in a GitHub issue URL, or 0 when the URL has none."""
+    tail = url.rstrip("/").rsplit("/", 1)[-1]
+    return int(tail) if tail.isdigit() else 0
+
+
 def required_label_specs(
     ready_label: str, agent_names: Iterable[str]
 ) -> dict[str, tuple[str, str]]:
     """Every label the orchestrator applies, mapped to a suggested (color, description).
 
-    Covers the configured ready label, the four orchestrator-maintained workflow
+    Covers the configured ready label, the orchestrator-maintained workflow
     labels, and one ``agent:<name>`` routing label per enabled agent. User-side
     hint labels (e.g. ``resource:database-schema``) are optional and not listed.
     """
@@ -169,6 +175,42 @@ class GitHub:
         if not all(isinstance(name, str) for name in names):
             raise ValueError("unexpected 'gh label list' payload: label entries missing 'name'")
         return set(names)
+
+    async def create_issue(
+        self, title: str, body: str, *, labels: tuple[str, ...] = ()
+    ) -> tuple[int, str]:
+        """Create an issue and return ``(number, url)``.
+
+        ``gh issue create`` prints only the URL, so the number is parsed out of
+        its last path segment. Dry-run returns ``(0, "")`` and makes no request:
+        the caller records 0 as "not created yet", which is exactly what it
+        means, whereas an invented number would make a later attempt skip a
+        child issue that never existed.
+        """
+        title = redact_secrets(title)
+        body = redact_secrets(body)
+        if self.dry_run:
+            return (0, "")
+        args = ["issue", "create", "--title", title, "--body", body]
+        for label in labels:
+            args.extend(("--label", label))
+        url = (await self._gh(*args)).strip()
+        number = _issue_number(url)
+        if not number:
+            raise CommandError(f"gh issue create returned no issue number: {url!r}")
+        return (number, url)
+
+    async def link_parent(self, child: int, parent: int) -> None:
+        """Make ``child`` a sub-issue of ``parent`` so GitHub tracks progress."""
+        if self.dry_run:
+            return
+        await self._gh("issue", "edit", str(child), "--parent", str(parent))
+
+    async def add_blocked_by(self, child: int, blocker: int) -> None:
+        """Declare that ``child`` is blocked by ``blocker``, natively."""
+        if self.dry_run:
+            return
+        await self._gh("issue", "edit", str(child), "--add-blocked-by", str(blocker))
 
     async def labels(self, number: int, *, add: tuple[str, ...] = (), remove: tuple[str, ...] = ()) -> None:
         if self.dry_run:
