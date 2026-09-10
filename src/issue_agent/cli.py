@@ -343,10 +343,35 @@ async def async_main(args: argparse.Namespace) -> int:
         finally:
             await app.shutdown()
     elif args.command == "once":
+        return await wait_for_once_workers(app)
+    return 0
+
+
+async def wait_for_once_workers(app: Orchestrator) -> int:
+    """Wait for the workers one ``once`` poll started; 1 when any worker raised.
+
+    Siblings must never be abandoned: a bare ``gather`` would surface the first
+    exception and leave the remaining workers un-awaited with rows stuck on
+    CLAIMED until the next restart's recovery charges them a failure unit.
+    ``shutdown()`` runs even when the poll itself fails, mirroring ``serve``.
+    """
+    outcomes: list[BaseException | object] = []
+    try:
         await app.run_once()
         if app.running:
-            await asyncio.gather(*app.running.values())
-    return 0
+            outcomes = list(
+                await asyncio.gather(*app.running.values(), return_exceptions=True)
+            )
+    finally:
+        await app.shutdown()
+    exit_code = 0
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException) and not isinstance(
+            outcome, asyncio.CancelledError
+        ):
+            logging.getLogger(__name__).error("once-mode worker failed: %r", outcome)
+            exit_code = 1
+    return exit_code
 
 
 def main() -> None:

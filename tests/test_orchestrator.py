@@ -576,6 +576,43 @@ def test_plan_only_republishes_a_recovered_plan_without_the_planner(tmp_path):
     assert any("Issue Agent Plan" in body for body in comments(app))
 
 
+def test_once_mode_waits_for_sibling_workers_when_one_raises(tmp_path):
+    """A failing worker must not abandon its siblings: gather collects every
+    outcome, the sibling still runs to completion, and the exit code is 1."""
+    from issue_agent.cli import wait_for_once_workers
+
+    app = make_orchestrator(tmp_path)
+    completed: list[int] = []
+
+    async def failing() -> None:
+        raise CommandError("worker exploded")
+
+    async def succeeding() -> None:
+        completed.append(5)
+
+    async def scenario() -> int:
+        app.running = {
+            4: asyncio.create_task(failing()),
+            5: asyncio.create_task(succeeding()),
+        }
+        return await wait_for_once_workers(app)
+
+    assert asyncio.run(scenario()) == 1
+    assert completed == [5]
+
+
+def test_once_mode_returns_zero_when_every_worker_succeeds(tmp_path):
+    from issue_agent.cli import wait_for_once_workers
+
+    app = make_orchestrator(tmp_path)
+
+    async def scenario() -> int:
+        app.running = {4: asyncio.create_task(asyncio.sleep(0))}
+        return await wait_for_once_workers(app)
+
+    assert asyncio.run(scenario()) == 0
+
+
 def comments(app: Orchestrator) -> list[str]:
     return [call.args[1] for call in app.github.comment.await_args_list]
 
