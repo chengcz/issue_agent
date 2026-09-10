@@ -82,5 +82,62 @@ def test_reset_still_clears_the_labels_a_plain_failure_left(tmp_path, monkeypatc
 
     assert code == 0
     edit = next(call for call in calls if call[1:3] == ["issue", "edit"])
-    for name in ("go-agent", "agent-running", "agent-failed", "human-review"):
+    for name in ("go-agent", "agent-running", "agent-failed", "agent-needs-info", "human-review"):
         assert name in edit
+
+
+def test_reset_also_drops_a_stale_needs_info_label(tmp_path, monkeypatch):
+    """A reset of an issue parked by the clarify flow must not leave
+    agent-needs-info behind contradicting the ready label just added."""
+    config = load_config(write_config(tmp_path))
+    state = StateStore(config.state_db)
+    state.claim_for_planning(Issue(number=8, title="Vague", body=""), "planner")
+    state.record_clarify_round(8, "2026-09-10T01:00:00+00:00")
+    state.record_failure(8, TaskStatus.FAILED, "planner gave up")
+
+    code, calls = reset(tmp_path, 8, monkeypatch)
+
+    assert code == 0
+    edit = next(call for call in calls if call[1:3] == ["issue", "edit"])
+    assert "agent-needs-info" in edit
+
+
+def test_reset_refuses_human_review_without_touching_github(tmp_path, monkeypatch, capsys):
+    config = load_config(write_config(tmp_path))
+    state = StateStore(config.state_db)
+    state.claim(Issue(number=6, title="PR up", body=""), "codex")
+    state.update(6, TaskStatus.HUMAN_REVIEW)
+
+    code, calls = reset(tmp_path, 6, monkeypatch)
+
+    assert code == 1
+    assert "cannot reset" in capsys.readouterr().err
+    assert not any(call[1:3] == ["issue", "edit"] for call in calls)
+    assert StateStore(config.state_db).rows()[0]["status"] == str(TaskStatus.HUMAN_REVIEW)
+
+
+def test_reset_survives_a_failing_label_update(tmp_path, monkeypatch, capsys):
+    """The DB reset is durable even when gh fails; the human gets the exact
+    manual command instead of a traceback."""
+    from issue_agent import cli
+    from issue_agent.process import CommandError
+
+    config_file = write_config(tmp_path)
+    monkeypatch.setattr("issue_agent.cli.load_config", lambda path: load_config(config_file))
+
+    async def failing_run(command, **kwargs):
+        raise CommandError("gh: HTTP 502")
+
+    monkeypatch.setattr("issue_agent.github.run", failing_run)
+    state = StateStore(load_config(config_file).state_db)
+    state.claim(Issue(number=7, title="Broken", body=""), "codex")
+    state.record_failure(7, TaskStatus.FAILED, "boom")
+
+    args = Namespace(command="reset", issue=7, no_label=False, config=str(config_file), verbose=False)
+    code = asyncio.run(cli.async_main(args))
+
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "label update failed" in err and "gh issue edit 7" in err
+    row = StateStore(load_config(config_file).state_db).rows()[0]
+    assert row["status"] == str(TaskStatus.PENDING)

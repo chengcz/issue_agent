@@ -244,24 +244,35 @@ async def reset_issue(config, issue_number: int, *, no_label: bool) -> int:
     if row is None:
         print(f"issue #{issue_number} has no task row in state DB; nothing to reset", file=sys.stderr)
         return 1
-    status = str(row["status"])
-    if status not in _RESETTABLE:
-        print(
-            f"cannot reset issue #{issue_number} in status {status}; only "
-            f"{', '.join(sorted(_RESETTABLE))} tasks can be reset",
-            file=sys.stderr,
-        )
+    try:
+        # The status check runs again on the reset connection itself: a serve
+        # process claiming the issue after the snapshot above makes the reset
+        # fail loudly instead of clobbering a live run's row.
+        state.reset(issue_number, allowed=_RESETTABLE)
+    except ValueError as exc:
+        print(f"cannot reset issue #{issue_number}: {exc}", file=sys.stderr)
         return 1
-
-    state.reset(issue_number)
-    summary = f"reset issue #{issue_number}: {status} (failures={row['failures']}) -> pending"
+    summary = f"reset issue #{issue_number}: {row['status']} (failures={row['failures']}) -> pending"
     if not no_label:
         github = GitHub(config.github_repo, config.repo, dry_run=config.dry_run)
-        await github.labels(
-            issue_number,
-            add=(config.ready_label,),
-            remove=("agent-failed", "agent-running", "human-review"),
-        )
+        try:
+            await github.labels(
+                issue_number,
+                add=(config.ready_label,),
+                # agent-needs-info goes too: a reset must not leave the issue
+                # advertising a question nobody is waiting to answer.
+                remove=("agent-failed", "agent-running", "agent-needs-info", "human-review"),
+            )
+        except CommandError as exc:
+            # The DB reset is durable; only the label handoff failed. Tell the
+            # human exactly what is left to do instead of raising a traceback.
+            print(
+                f"warning: the task row was reset, but the GitHub label update failed: {exc}\n"
+                f"re-add the {config.ready_label} label manually, e.g.:\n"
+                f"  gh issue edit {issue_number} --add-label {config.ready_label}",
+                file=sys.stderr,
+            )
+            return 1
         summary += f"; re-added {config.ready_label}, will be picked up on the next poll"
     else:
         summary += f"; add the {config.ready_label} label to rerun"

@@ -870,7 +870,12 @@ class StateStore:
                 (now, issue_number),
             )
 
-    def reset(self, issue_number: int) -> str | None:
+    def reset(
+        self,
+        issue_number: int,
+        *,
+        allowed: tuple[str, ...] | frozenset[str] | None = None,
+    ) -> str | None:
         """Reset a task row back to a claimable state, returning its old status.
 
         Clears the whole-issue retry budget (``failures``) and the in-cycle
@@ -884,7 +889,11 @@ class StateStore:
         is read from it, and a re-plan after a reset must still see the answers
         the human already gave. A recorded split is dropped: resetting a split
         parent is how a human asks for it to be planned again as one unit.
-        Returns None when no row exists for the issue.
+
+        When *allowed* is given, the status check and the reset run against the
+        same connection back to back: a serve process claiming the issue between
+        the caller's snapshot and this call makes the reset raise ``ValueError``
+        instead of clobbering a live run's row. Returns None when no row exists.
         """
         now = datetime.now(UTC).isoformat()
         with self.connect() as db:
@@ -892,6 +901,11 @@ class StateStore:
             if not row:
                 return None
             old_status = str(row["status"])
+            if allowed is not None and old_status not in allowed:
+                raise ValueError(
+                    f"status {old_status} cannot be reset; resettable statuses: "
+                    f"{', '.join(sorted(allowed))}"
+                )
             db.execute(
                 "UPDATE tasks SET status=?, failures=0, attempts=0, last_error='', "
                 "current_seq=-1, clarify_rounds=0, split=NULL, updated_at=? "
