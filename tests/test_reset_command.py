@@ -102,7 +102,10 @@ def test_reset_also_drops_a_stale_needs_info_label(tmp_path, monkeypatch):
     assert "agent-needs-info" in edit
 
 
-def test_reset_refuses_human_review_without_touching_github(tmp_path, monkeypatch, capsys):
+def test_reset_reopens_a_human_review_issue(tmp_path, monkeypatch, capsys):
+    """A reviewer closing the PR unmerged has no other way back: reset reopens
+    the issue, and a re-run reuses the branch's existing PR instead of
+    duplicating it."""
     config = load_config(write_config(tmp_path))
     state = StateStore(config.state_db)
     state.claim(Issue(number=6, title="PR up", body=""), "codex")
@@ -110,10 +113,12 @@ def test_reset_refuses_human_review_without_touching_github(tmp_path, monkeypatc
 
     code, calls = reset(tmp_path, 6, monkeypatch)
 
-    assert code == 1
-    assert "cannot reset" in capsys.readouterr().err
-    assert not any(call[1:3] == ["issue", "edit"] for call in calls)
-    assert StateStore(config.state_db).rows()[0]["status"] == str(TaskStatus.HUMAN_REVIEW)
+    assert code == 0
+    assert "human_review" in capsys.readouterr().out
+    edit = next(call for call in calls if call[1:3] == ["issue", "edit"])
+    assert "--remove-label" in edit and "human-review" in edit
+    row = StateStore(config.state_db).rows()[0]
+    assert row["status"] == str(TaskStatus.PENDING)
 
 
 def test_reset_survives_a_failing_label_update(tmp_path, monkeypatch, capsys):

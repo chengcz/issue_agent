@@ -753,6 +753,21 @@ def test_dependency_gate_warns_once_about_a_native_self_dependency(tmp_path):
     assert names(app).count("dependency_blocked") == 2
 
 
+def test_dependency_gate_holds_an_issue_with_cross_repo_blockers(tmp_path):
+    """Native blocked-by links are same-repo only, so a body-declared
+    owner/repo#N can never close here: hold the issue, say so once."""
+    app = make_orchestrator(tmp_path)
+    issue = Issue(number=4, title="T", body="Depends on vendor/lib#12\n")
+
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+
+    cross_notes = [body for body in comments(app) if "cross-repository" in body]
+    assert len(cross_notes) == 1
+    assert "vendor/lib#12" in cross_notes[0]
+    assert names(app).count("dependency_blocked") == 1
+
+
 def test_dependency_gate_holds_an_issue_whose_body_blocks_on_itself(tmp_path):
     app = make_orchestrator(tmp_path)
     issue = Issue(number=4, title="T", body="Blocked by: #4\n")

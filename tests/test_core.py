@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +24,7 @@ from issue_agent.models import (
     TaskStatus,
 )
 from issue_agent.orchestrator import Orchestrator
-from issue_agent.process import CommandError, Result, shell
+from issue_agent.process import CommandError, Result, run, shell
 from issue_agent.state import StateStore
 from issue_agent.workspace import WorkspaceManager, slugify
 
@@ -564,6 +565,71 @@ def test_run_measures_duration(tmp_path: Path):
     result = asyncio.run(shell("sleep 0.05", cwd=tmp_path))
     assert result.duration_ms is not None
     assert result.duration_ms >= 40  # allow small timing slack
+
+
+def test_run_caps_captured_output_for_runaway_commands(tmp_path: Path):
+    """A command streaming ~11 MiB is truncated at the capture cap with an
+    explicit marker instead of buffering gigabytes in memory."""
+
+    big = tmp_path / "big.txt"
+    big.write_text("x" * (10 * 1024 * 1024 + 1_000_000))
+    result = asyncio.run(run(["cat", str(big)], cwd=tmp_path, check=False, timeout=120))
+
+    assert result.returncode == 0
+    assert len(result.stdout) < 11 * 1024 * 1024
+    assert "output truncated" in result.stdout
+
+
+def test_run_feeds_stdin_and_reads_output(tmp_path: Path):
+    """The bounded-capture rewrite still pumps stdin and collects stdout."""
+    result = asyncio.run(
+        run(
+            ["/bin/sh", "-c", "tr a-z A-Z"],
+            cwd=tmp_path,
+            stdin="hello issue-agent",
+            timeout=30,
+        )
+    )
+
+    assert result.stdout.strip() == "HELLO ISSUE-AGENT"
+
+
+def test_cross_repo_blocker_parsing():
+    from issue_agent.orchestrator import cross_repo_blockers, declared_blockers
+
+    body = "Blocked by: other/repo#12 and #13, plus org/other-repo#14.\n"
+    assert cross_repo_blockers(body) == ("org/other-repo#14", "other/repo#12")
+    # Plain #N stays a same-repo declaration; owner/repo#N does not leak into it.
+    assert declared_blockers(body) == (13,)
+
+
+def test_instance_lock_blocks_a_second_instance(tmp_path):
+    """The lock refuses a second live instance but breaks its own stale file."""
+    state_db = tmp_path / "state.sqlite3"
+    first = Orchestrator.__new__(Orchestrator)
+    first.config = SimpleNamespace(state_db=state_db)
+    second = Orchestrator.__new__(Orchestrator)
+    second.config = SimpleNamespace(state_db=state_db)
+
+    assert first.acquire_instance_lock() is True
+    assert second.acquire_instance_lock() is False
+    assert second._lock_held_by == os.getpid()
+
+    first.release_instance_lock()
+    assert second.acquire_instance_lock() is True
+    second.release_instance_lock()
+
+
+def test_instance_lock_breaks_a_stale_lock_file(tmp_path):
+    state_db = tmp_path / "state.sqlite3"
+    lock = tmp_path / "state.sqlite3.lock"
+    lock.write_text("999999999")  # a pid that cannot exist
+
+    app = Orchestrator.__new__(Orchestrator)
+    app.config = SimpleNamespace(state_db=state_db)
+
+    assert app.acquire_instance_lock() is True
+    app.release_instance_lock()
 
 
 def test_run_duration_present_on_failure(tmp_path: Path):

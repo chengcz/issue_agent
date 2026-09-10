@@ -17,11 +17,13 @@ from .process import CommandError
 from .state import StateStore
 
 # Task statuses that are safe to reset. Running statuses are excluded so an
-# active worker is never disturbed mid-cycle; DONE/HUMAN_REVIEW are excluded
-# because re-running would re-push the branch and create a duplicate PR. A SPLIT
-# parent is included: resetting it is how a human overrules the split and asks
-# for the issue to be planned again as a single unit.
-_RESETTABLE = frozenset({"pending", "planned", "failed", "blocked", "split"})
+# active worker is never disturbed mid-cycle, and DONE because the work is
+# finished. HUMAN_REVIEW is included: a reviewer who closed the PR unmerged has
+# no other way back, and re-running is safe — create_pr reuses the branch's
+# existing PR and an approved final state is reused instead of re-reviewed. A
+# SPLIT parent is included for the same reason: resetting it is how a human
+# overrules the split and asks for the issue to be planned again as one unit.
+_RESETTABLE = frozenset({"pending", "planned", "failed", "blocked", "split", "human_review"})
 
 
 def parser() -> argparse.ArgumentParser:
@@ -380,17 +382,27 @@ async def async_main(args: argparse.Namespace) -> int:
         return exit_code
 
     app = Orchestrator(config)
-    recovered = app.recover()
-    if recovered:
-        logging.getLogger(__name__).warning("recovered %s interrupted task(s)", recovered)
-    if args.command == "serve":
-        try:
-            await app.serve()
-        finally:
-            await app.shutdown()
-    elif args.command == "once":
-        return await wait_for_once_workers(app)
-    return 0
+    if not app.acquire_instance_lock():
+        print(
+            f"error: another issue-agent instance (pid {app._lock_held_by}) is already "
+            f"running against {config.state_db}; two instances would corrupt the shared state",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        recovered = app.recover()
+        if recovered:
+            logging.getLogger(__name__).warning("recovered %s interrupted task(s)", recovered)
+        if args.command == "serve":
+            try:
+                await app.serve()
+            finally:
+                await app.shutdown()
+        elif args.command == "once":
+            return await wait_for_once_workers(app)
+        return 0
+    finally:
+        app.release_instance_lock()
 
 
 async def wait_for_once_workers(app: Orchestrator) -> int:

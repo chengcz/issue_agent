@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from collections import OrderedDict
@@ -44,6 +45,20 @@ _REVIEW_ATTEMPTS = 2
 
 
 _RUNNING_STATUSES = frozenset(str(status) for status in RUNNING_STATUSES)
+
+
+def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        # os.kill(pid, 0) is not a safe probe on Windows; assume alive so two
+        # instances never fight over one DB.
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # alive, owned by someone else
+    return True
 
 
 class ReviewRejected(CommandError):
@@ -220,7 +235,27 @@ _BLOCKER_DECLARATION = re.compile(
     r"blocked\s+by|depends\s+on|dependenc(?:y|ies)|blockers?\s*[:：]|前置|依赖",
     re.IGNORECASE,
 )
-_ISSUE_REFERENCE = re.compile(r"#(\d+)")
+# A ``#N`` preceded by repo-ish characters belongs to an ``owner/repo#N``
+# cross-repository reference, which native same-repo links cannot represent.
+_ISSUE_REFERENCE = re.compile(r"(?<![\w./-])#(\d+)")
+_CROSS_REPO_REFERENCE = re.compile(r"\b([A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*)#(\d+)")
+
+
+def cross_repo_blockers(body: str) -> tuple[str, ...]:
+    """Cross-repository dependencies the body declares, as ``owner/repo#N``.
+
+    Native ``blockedBy`` links are same-repo only, so the orchestrator can
+    never see these close; the gate holds the issue until the human removes
+    the line or replaces it with a native link.
+    """
+    text = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
+    found: set[str] = set()
+    for line in text.splitlines():
+        if _BLOCKER_DECLARATION.search(line):
+            found.update(
+                f"{owner}#{number}" for owner, number in _CROSS_REPO_REFERENCE.findall(line)
+            )
+    return tuple(sorted(found))
 
 
 def declared_blockers(body: str) -> tuple[int, ...]:
@@ -569,6 +604,25 @@ class Orchestrator:
             # one-shot (notice-deduplicated), not once per poll.
             await self._warn_self_dependency(issue)
             return True
+        cross = cross_repo_blockers(issue.body)
+        if cross:
+            notices = self.state.load_blocker_notices(issue.number)
+            if not notices.get("cross_repo"):
+                listing = "\n".join(f"- {ref}" for ref in cross)
+                await self.github.comment(
+                    issue.number,
+                    "⏳ **Waiting on cross-repository dependencies**\n\n"
+                    "This issue declares blockers in other repositories, which "
+                    "native blocked-by links cannot represent and this "
+                    "orchestrator cannot see:\n\n"
+                    f"{listing}\n\n"
+                    "The issue stays blocked until the lines are removed or "
+                    "replaced with native same-repo blocked-by links.",
+                )
+                self._audit(issue).event("dependency_blocked", blockers=list(cross))
+                notices["cross_repo"] = True
+                self.state.save_blocker_notices(issue.number, notices)
+            return True
         if not issue.blocked_by:
             return False
         missing = [number for number in issue.blocked_by if number not in cache]
@@ -817,6 +871,35 @@ class Orchestrator:
             return
         log.info("waiting for %s active worker(s) to finish", len(self.running))
         await asyncio.gather(*tuple(self.running.values()), return_exceptions=True)
+
+    def acquire_instance_lock(self) -> bool:
+        """Refuse a second orchestrator against the same state DB.
+
+        Nothing in SQLite stops two processes from claiming the same issue, and
+        a second instance's ``recover_interrupted`` would mark the first's
+        in-flight runs as interrupted and reset rows it is actively working. A
+        lock whose owning process is gone is stale and broken automatically.
+        """
+        lock_path = self.config.state_db.with_suffix(self.config.state_db.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if lock_path.exists():
+            try:
+                pid = int(lock_path.read_text(encoding="utf-8").strip() or "0")
+            except ValueError:
+                pid = 0
+            if pid and _pid_alive(pid):
+                self._lock_held_by = pid
+                return False
+            log.warning("breaking stale instance lock (pid %s is gone)", pid)
+        lock_path.write_text(str(os.getpid()), encoding="utf-8")
+        self._instance_lock = lock_path
+        return True
+
+    def release_instance_lock(self) -> None:
+        lock_path = getattr(self, "_instance_lock", None)
+        if lock_path is not None:
+            lock_path.unlink(missing_ok=True)
+            self._instance_lock = None
 
     async def _guarded_process(self, issue: Issue, agent_name: str) -> None:
         if "resource:database-schema" in issue.labels:

@@ -36,6 +36,12 @@ class Result:
     usage: dict[str, Any] | None = field(default=None, compare=False)
 
 
+# A runaway agent streaming gigabytes must not OOM the orchestrator: captures
+# are truncated past this cap (per stream) with an explicit marker.
+_MAX_CAPTURE_BYTES = 10 * 1024 * 1024
+_TRUNCATION_NOTE = "\n...[output truncated: 10 MiB capture cap reached]"
+
+
 async def run(
     command: list[str] | tuple[str, ...],
     *,
@@ -77,9 +83,42 @@ async def run(
                 pass
         await process.wait()
 
+    async def capture(stream: asyncio.StreamReader | None) -> bytes:
+        chunks: list[bytes] = []
+        captured = 0
+        total = 0
+        if stream is not None:
+            while True:
+                chunk = await stream.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if captured <= _MAX_CAPTURE_BYTES:
+                    chunks.append(chunk)
+                    captured += len(chunk)
+        if total > _MAX_CAPTURE_BYTES:
+            chunks.append(_TRUNCATION_NOTE.encode())
+        return b"".join(chunks)
+
+    stdout_task = asyncio.create_task(capture(process.stdout))
+    stderr_task = asyncio.create_task(capture(process.stderr))
+    stdin_task: asyncio.Task[None] | None = None
+    if process.stdin is not None and stdin is not None:
+
+        async def feed() -> None:
+            try:
+                process.stdin.write(stdin.encode())
+                await process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the child exited without reading everything
+            finally:
+                process.stdin.close()
+
+        stdin_task = asyncio.create_task(feed())
+
     try:
         stdout, stderr = await asyncio.wait_for(
-            process.communicate(stdin.encode() if stdin is not None else None), timeout=timeout
+            asyncio.gather(stdout_task, stderr_task), timeout=timeout
         )
     except TimeoutError:
         await terminate_process_tree()
@@ -90,6 +129,9 @@ async def run(
     except asyncio.CancelledError:
         await terminate_process_tree()
         raise
+    finally:
+        if stdin_task is not None and not stdin_task.done():
+            stdin_task.cancel()
     result = Result(
         process.returncode or 0,
         stdout.decode(errors="replace"),

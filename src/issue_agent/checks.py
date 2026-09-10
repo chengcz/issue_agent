@@ -78,6 +78,21 @@ def summarize_output(output: str, new_tests: set[str] | frozenset[str] = frozens
     return summary
 
 
+def _normalized_output(output: str) -> str:
+    """Collapse unstable details so the unchanged-failure comparison survives edits.
+
+    Line/column numbers, ANSI styling, and parenthesized counts change when the
+    agent touches files even though the underlying violations are the same; the
+    raw (returncode, output) fingerprint read those edits as regressions. Other
+    digits (e.g. "Found 3 errors") stay intact so a changed violation count
+    still reads as a regression.
+    """
+    text = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    text = re.sub(r":\d+(?::\d+)?", ":N", text)
+    text = re.sub(r"\(\d+[^)]*\)", "(N)", text)
+    return "\n".join(line.rstrip() for line in text.splitlines())
+
+
 def _write_full_output(workspace: Path, output: str) -> None:
     agent_dir = workspace / ".agent"
     agent_dir.mkdir(parents=True, exist_ok=True)
@@ -161,7 +176,7 @@ async def run_checks(
             and previous is not None
             and not previous.failed_tests
             and item.returncode == previous.returncode
-            and output == previous.output
+            and _normalized_output(output) == _normalized_output(previous.output)
         )
         if (current and not new) or unchanged_generic_failure:
             issue_log.event(

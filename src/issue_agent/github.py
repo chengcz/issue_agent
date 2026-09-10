@@ -24,6 +24,8 @@ ORCHESTRATOR_LABELS: dict[str, tuple[str, str]] = {
 }
 _READY_LABEL_SPEC = ("0e8a16", "Ready for coding-agent implementation")
 _AGENT_ROUTE_COLOR = "a219d8"
+# One gh process per blocker is already wasteful at scale; cap the fan-out.
+_BLOCKER_CONCURRENCY = 4
 # Dry-run issue numbers come from a range GitHub can never hand out, so a
 # recorded fake child can never collide with a real one.
 _DRY_RUN_ISSUE_BASE = 1_000_000_000
@@ -103,13 +105,13 @@ class GitHub:
         raising, so one deleted blocker cannot starve the whole scheduler queue.
         """
         wanted = sorted(set(numbers))
-        outputs = await asyncio.gather(
-            *(
-                self._gh("issue", "view", str(number), "--json", "number,title,state")
-                for number in wanted
-            ),
-            return_exceptions=True,
-        )
+        semaphore = asyncio.Semaphore(_BLOCKER_CONCURRENCY)
+
+        async def lookup(number: int) -> str:
+            async with semaphore:
+                return await self._gh("issue", "view", str(number), "--json", "number,title,state")
+
+        outputs = await asyncio.gather(*(lookup(number) for number in wanted), return_exceptions=True)
         states: dict[int, Blocker] = {}
         for number, output in zip(wanted, outputs):
             if isinstance(output, BaseException):

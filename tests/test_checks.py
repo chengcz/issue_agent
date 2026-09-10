@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from issue_agent.checks import summarize_output
+from issue_agent.checks import capture_baseline, run_checks, summarize_output
 from issue_agent.config import load_config
 from issue_agent.orchestrator import Orchestrator
 from issue_agent.process import CommandError, Result
@@ -223,3 +223,45 @@ def test_empty_task_commands_skip_intermediate_checks_but_not_final(tmp_path, mo
 
     assert calls == ["final"]
     assert ("task_checks_skipped", {"sequence": None, "attempt": None}) in log.events
+
+def test_unchanged_failure_tolerates_shifted_line_numbers(tmp_path, monkeypatch):
+    """A lint failure at a new line/column after legitimate edits is the same
+    pre-existing violation, not a regression."""
+    commands = ("ruff check .",)
+    outputs = iter([
+        (1, "src/app.py:12:1: E501 line too long (95 > 88)\nFound 1 error.\n"),   # baseline
+        (1, "src/app.py:41:1: E501 line too long (95 > 88)\nFound 1 error.\n"),   # same violation, new line
+    ])
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        code, text = next(outputs)
+        return Result(code, text, "")
+
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
+    baseline = asyncio.run(capture_baseline(tmp_path, commands, timeout=10, parallel=False))
+    log = _Log()
+    asyncio.run(run_checks(tmp_path, log, baseline, checks=commands, timeout=10, parallel=False))
+
+    names = [name for name, _ in log.events]
+    assert "check_passed_pre_existing" in names
+
+
+def test_unchanged_failure_still_flags_a_genuinely_new_violation(tmp_path, monkeypatch):
+    commands = ("ruff check .",)
+    outputs = iter([
+        (1, "src/app.py:12:1: E501 line too long (95 > 88)\n"),
+        (1, "src/app.py:12:1: E501 line too long (95 > 88)\nsrc/other.py:3:1: F401 unused import\n"),
+    ])
+
+    async def fake_shell(command, *, cwd, timeout=3600, check=True):
+        code, text = next(outputs)
+        return Result(code, text, "")
+
+    monkeypatch.setattr("issue_agent.checks.shell", fake_shell)
+    baseline = asyncio.run(capture_baseline(tmp_path, commands, timeout=10, parallel=False))
+
+    with pytest.raises(CommandError, match="command failed"):
+        asyncio.run(
+            run_checks(tmp_path, _Log(), baseline, checks=commands, timeout=10, parallel=False)
+        )
+
