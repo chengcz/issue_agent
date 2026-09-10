@@ -214,9 +214,17 @@ class StateStore:
             if row:
                 status = row["status"]
                 if row["plan"]:
-                    if status not in (str(TaskStatus.FAILED), str(TaskStatus.BLOCKED)):
-                        return False
-                    if int(row["failures"]) >= max_attempts:
+                    if status in (str(TaskStatus.FAILED), str(TaskStatus.BLOCKED)):
+                        if int(row["failures"]) >= max_attempts:
+                            return False
+                    elif status in (str(TaskStatus.PENDING), str(TaskStatus.PLANNED)):
+                        # A PENDING/PLANNED row that already carries a plan was
+                        # crash-interrupted between save_plan and publishing it
+                        # (or is stranded there after an older recovery). Reclaim
+                        # so the already-persisted plan is republished without
+                        # another LLM call.
+                        pass
+                    else:
                         return False
                     # Reclaim so a failed GitHub comment/label transition can
                     # republish the already-persisted plan without another LLM call.
@@ -685,12 +693,15 @@ class StateStore:
                     (duration, now, task["issue_number"], task["seq"]),
                 )
             planning = db.execute(
-                "UPDATE tasks SET failures=failures+1, updated_at=?,"
-                " status=CASE WHEN failures+1>=? THEN ? ELSE ? END, last_error=?"
+                "UPDATE tasks SET failures=failures+1, updated_at=?, last_error=?,"
+                " status=CASE WHEN failures+1>=? THEN ?"
+                " WHEN plan IS NOT NULL AND plan != '' THEN ?"
+                " ELSE ? END"
                 " WHERE status=?",
                 (
-                    now, max_attempts, str(TaskStatus.FAILED), str(TaskStatus.PENDING),
-                    "orchestrator restarted during planning", str(TaskStatus.PLANNING),
+                    now, "orchestrator restarted during planning", max_attempts,
+                    str(TaskStatus.FAILED), str(TaskStatus.PLANNED), str(TaskStatus.PENDING),
+                    str(TaskStatus.PLANNING),
                 ),
             )
             resumed = db.execute(

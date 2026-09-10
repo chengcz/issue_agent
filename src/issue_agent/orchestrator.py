@@ -691,7 +691,12 @@ class Orchestrator:
         if status in (str(TaskStatus.FAILED), str(TaskStatus.BLOCKED)):
             return int(row["failures"]) < self.config.max_attempts
         if planning:
-            return status == str(TaskStatus.PENDING) and not row["plan"]
+            # Fresh planning (PENDING, no plan) or republishing a plan that was
+            # persisted before a crash cut publication short (PENDING/PLANNED
+            # with a plan) — the latter skips the LLM entirely.
+            return status == str(TaskStatus.PENDING) or (
+                status == str(TaskStatus.PLANNED) and row["plan"]
+            )
         return status in (str(TaskStatus.PENDING), str(TaskStatus.PLANNED))
 
     async def run_once(self) -> None:

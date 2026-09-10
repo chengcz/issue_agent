@@ -62,3 +62,31 @@ def test_recover_parks_planning_interruption_when_budget_exhausted(tmp_path):
     assert row["failures"] == 1
     assert row["status"] == str(TaskStatus.FAILED)
     assert state.claim_for_planning(issue, "planner", 1) is False
+
+
+def test_recover_sends_a_planning_row_with_a_saved_plan_to_planned(tmp_path):
+    """A crash between save_plan and publishing must not strand the row as
+    PENDING-with-plan (invisible to both pools): recovery routes it to PLANNED,
+    from where the planning pool republishes the saved plan."""
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(9, "Task", "Body")
+    state.claim_for_planning(issue, "planner", 3)
+    state.update(9, TaskStatus.PLANNING)
+    state.save_plan(9, [PlanTask("One", "D")])
+
+    assert state.recover_interrupted(3) == 1
+    row = state.rows()[0]
+    assert row["failures"] == 1
+    assert row["status"] == str(TaskStatus.PLANNED)
+    assert state.claim_for_planning(issue, "planner", 3) is True
+
+
+def test_a_stranded_pending_row_with_a_plan_is_claimable_for_republish(tmp_path):
+    """Legacy stranded rows (PENDING + saved plan) rejoin the planning pool."""
+    state = StateStore(tmp_path / "state.db")
+    issue = Issue(9, "Task", "Body")
+    state.claim_for_planning(issue, "planner", 3)
+    state.save_plan(9, [PlanTask("One", "D")])
+    state.update(9, TaskStatus.PENDING)
+
+    assert state.claim_for_planning(issue, "planner", 3) is True

@@ -553,6 +553,29 @@ def test_run_once_isolates_a_failing_label_reconciliation(tmp_path):
     assert app.github.labels.await_count == 1
 
 
+def test_plan_only_republishes_a_recovered_plan_without_the_planner(tmp_path):
+    """A crash between save_plan and publication recovers to PLANNED; the next
+    planning poll must republish the saved plan without another LLM call."""
+    app = make_orchestrator(tmp_path)
+    issue = Issue(4, "T", "B")
+    app.state.claim_for_planning(issue, "planner", 3)
+    app.state.update(4, TaskStatus.PLANNING)
+    app.state.save_plan(4, [PlanTask(title="One", description="D")])
+
+    assert app.recover() == 1
+    row = next(r for r in app.state.rows() if int(r["issue_number"]) == 4)
+    assert row["status"] == str(TaskStatus.PLANNED)
+    assert app.state.claim_for_planning(issue, "planner", 3) is True
+    planner_execute = app.agents["planner"].execute
+
+    asyncio.run(app.plan_only(issue))
+
+    planner_execute.assert_not_awaited()
+    published = [call.kwargs.get("add") for call in app.github.labels.await_args_list]
+    assert ("agent-planned",) in published
+    assert any("Issue Agent Plan" in body for body in comments(app))
+
+
 def comments(app: Orchestrator) -> list[str]:
     return [call.args[1] for call in app.github.comment.await_args_list]
 

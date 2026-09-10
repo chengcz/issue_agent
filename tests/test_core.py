@@ -185,13 +185,18 @@ def test_state_claim_is_idempotent(tmp_path: Path):
     assert state.claim(issue, "claude") is True
 
 
-def test_unlabeled_issue_is_planned_only_once(tmp_path: Path):
+def test_planned_issue_with_a_plan_is_reclaimed_only_to_republish(tmp_path: Path):
+    """claim_for_planning admits a PLANNED row so a plan whose publication was
+    cut short by a crash gets republished from the persisted JSON. The plan is
+    never regenerated: production keeps fully published plans out of the
+    planning pool via the ``agent-planned`` label, and plan_only skips the LLM
+    when a plan already exists."""
     state = StateStore(tmp_path / "state.db")
     issue = Issue(8, "Needs a plan", "Vague request")
     assert state.claim_for_planning(issue, "planner") is True
     state.save_plan(8, [PlanTask("Clarify implementation", "Acceptance: reviewed")])
     state.update(8, TaskStatus.PLANNED)
-    assert state.claim_for_planning(issue, "planner") is False
+    assert state.claim_for_planning(issue, "planner") is True
 
 
 def test_claim_gates_failed_issue_by_attempt_budget(tmp_path: Path):
