@@ -21,7 +21,7 @@ from .config import Config
 from .formal_review import formal_review
 from .github import GitHub
 from .issue_log import IssueLog
-from .models import Issue, PlanTask, TaskStatus
+from .models import Issue, PlanOutcome, PlanTask, SplitChild, TaskStatus
 from .process import CommandError, Result
 from .schedule import ScheduleConfig
 from .state import StateStore
@@ -201,21 +201,22 @@ def has_detailed_plan(body: str) -> bool:
     return False
 
 
-def parse_plan(stdout: str, max_tasks: int) -> list[PlanTask]:
-    """Parse the planner's fenced JSON block into PlanTasks, validating bounds."""
+def _planner_payload(stdout: str) -> object:
+    """Extract and decode the planner's fenced JSON block."""
     match = re.search(r"```json\s*(.*?)\s*```", stdout, re.DOTALL)
     if not match:
         raise CommandError("plan output contained no fenced ```json block")
     raw = match.group(1)
     try:
-        items = json.loads(_repair_json(raw), strict=False)
+        return json.loads(_repair_json(raw), strict=False)
     except json.JSONDecodeError as exc:
         # Include a context snippet so a future planner regression is
         # diagnosable from the issue comment alone, without re-running the model.
         snippet = raw[max(0, exc.pos - 120): exc.pos + 120].replace("\n", "\\n")
         raise CommandError(f"plan JSON is invalid: {exc} near: {snippet}") from exc
-    if not isinstance(items, list) or not items:
-        raise CommandError("plan must be a non-empty list of tasks")
+
+
+def _plan_tasks(items: list, max_tasks: int) -> list[PlanTask]:
     if len(items) > max_tasks:
         raise CommandError(f"plan has {len(items)} tasks, exceeding max_tasks={max_tasks}")
     plan: list[PlanTask] = []
@@ -224,6 +225,99 @@ def parse_plan(stdout: str, max_tasks: int) -> list[PlanTask]:
             raise CommandError("each plan task needs a title and description")
         plan.append(PlanTask(title=str(item["title"]), description=str(item.get("description", ""))))
     return plan
+
+
+def _split_children(items: list, max_children: int) -> list[SplitChild]:
+    if len(items) > max_children:
+        raise CommandError(
+            f"split has {len(items)} children, exceeding max_split_children={max_children}"
+        )
+    children: list[SplitChild] = []
+    for item in items:
+        if not isinstance(item, dict) or not item.get("title") or not item.get("body"):
+            raise CommandError("each split child needs a title and a body")
+        depends_on = item.get("depends_on") or []
+        if not isinstance(depends_on, list) or not all(
+            isinstance(index, int) and not isinstance(index, bool) for index in depends_on
+        ):
+            raise CommandError("split child 'depends_on' must be a list of sibling indexes")
+        children.append(
+            SplitChild(
+                title=str(item["title"]), body=str(item["body"]), depends_on=tuple(depends_on)
+            )
+        )
+    _validate_split_order(children)
+    return children
+
+
+def _validate_split_order(children: list[SplitChild]) -> None:
+    """Reject sibling dependencies the orchestrator could never create."""
+    for index, child in enumerate(children):
+        for dependency in child.depends_on:
+            if dependency == index:
+                raise CommandError(f"split child {index + 1} depends on itself")
+            if not 0 <= dependency < len(children):
+                raise CommandError(
+                    f"split child {index + 1} depends on index {dependency}, "
+                    "which is outside the proposed batch"
+                )
+    remaining = set(range(len(children)))
+    while remaining:
+        # Peeling off every child whose remaining dependencies are already
+        # placed leaves nothing behind only when the graph has a cycle.
+        ready = {index for index in remaining if not (set(children[index].depends_on) & remaining)}
+        if not ready:
+            raise CommandError("split children have a circular depends_on relationship")
+        remaining -= ready
+
+
+def parse_plan(stdout: str, max_tasks: int) -> list[PlanTask]:
+    """Parse the planner's fenced JSON block into PlanTasks, validating bounds."""
+    payload = _planner_payload(stdout)
+    if not isinstance(payload, list) or not payload:
+        raise CommandError("plan must be a non-empty list of tasks")
+    return _plan_tasks(payload, max_tasks)
+
+
+def parse_plan_output(stdout: str, max_tasks: int, max_children: int) -> PlanOutcome:
+    """Parse whichever of the planner's three output shapes came back.
+
+    A bare array keeps the historical task list. An object carries either the
+    questions that block planning or a proposal to split the issue instead.
+    """
+    payload = _planner_payload(stdout)
+    if isinstance(payload, list):
+        if not payload:
+            raise CommandError("plan must be a non-empty list of tasks")
+        return PlanOutcome(tasks=tuple(_plan_tasks(payload, max_tasks)))
+    if not isinstance(payload, dict):
+        raise CommandError("plan output must be a JSON task array or a JSON object")
+    shapes = [key for key in ("questions", "split") if key in payload]
+    if len(shapes) != 1:
+        raise CommandError("plan object must contain exactly one of 'questions' or 'split'")
+    if shapes[0] == "questions":
+        questions = payload["questions"]
+        if not isinstance(questions, list) or not questions:
+            raise CommandError("'questions' must be a non-empty list of questions")
+        if not all(isinstance(question, str) and question.strip() for question in questions):
+            raise CommandError("every planner question must be a non-empty string")
+        return PlanOutcome(questions=tuple(question.strip() for question in questions))
+    children = payload["split"]
+    if not isinstance(children, list) or not children:
+        raise CommandError("'split' must be a non-empty list of child issues")
+    return PlanOutcome(split=tuple(_split_children(children, max_children)))
+
+
+def require_tasks(outcome: PlanOutcome) -> list[PlanTask]:
+    """Return the planned tasks, refusing an outcome the caller cannot act on."""
+    if outcome.questions:
+        raise CommandError("planner asked for more information: " + " | ".join(outcome.questions))
+    if outcome.split:
+        raise CommandError(
+            "planner proposed splitting this issue into child issues: "
+            + " | ".join(child.title for child in outcome.split)
+        )
+    return list(outcome.tasks)
 
 
 def format_plan(plan: list[PlanTask]) -> str:
@@ -440,11 +534,13 @@ class Orchestrator:
             )
             plan = self.state.load_plan(issue.number)
             if plan is None:
-                plan = await self._plan(
-                    workspace,
-                    issue,
-                    acquire_agent_limit=bool(self.config.planner_agent),
-                    issue_log=issue_log,
+                plan = require_tasks(
+                    await self._plan(
+                        workspace,
+                        issue,
+                        acquire_agent_limit=bool(self.config.planner_agent),
+                        issue_log=issue_log,
+                    )
                 )
                 issue_log.event("plan_generated", tasks=[task.to_dict() for task in plan])
             else:
@@ -518,11 +614,13 @@ class Orchestrator:
 
             plan = self.state.load_plan(issue.number)
             if plan is None:
-                plan = await self._plan(
-                    workspace,
-                    issue,
-                    acquire_agent_limit=bool(self.config.planner_agent),
-                    issue_log=issue_log,
+                plan = require_tasks(
+                    await self._plan(
+                        workspace,
+                        issue,
+                        acquire_agent_limit=bool(self.config.planner_agent),
+                        issue_log=issue_log,
+                    )
                 )
                 await self.github.comment(issue.number, "## Agent Plan\n\n" + format_plan(plan))
                 issue_log.event("plan_generated", tasks=[task.to_dict() for task in plan])
@@ -657,10 +755,10 @@ class Orchestrator:
         *,
         acquire_agent_limit: bool = False,
         issue_log: IssueLog | None = None,
-    ) -> list[PlanTask]:
+    ) -> PlanOutcome:
         existing_plan = bool(self.config.planner_agent) and has_detailed_plan(issue.body)
         if not self.config.planner_agent or existing_plan:
-            plan = [PlanTask(title=issue.title, description=issue.body)]
+            outcome = PlanOutcome(tasks=(PlanTask(title=issue.title, description=issue.body),))
             if existing_plan and issue_log is not None:
                 issue_log.event("planner_skipped", reason="issue_contains_detailed_plan")
         else:
@@ -674,9 +772,12 @@ class Orchestrator:
                 issue_log=issue_log,
                 issue_number=issue.number,
             )
-            plan = parse_plan(result.stdout, self.config.max_tasks)
-        self.state.save_plan(issue.number, plan)
-        return plan
+            outcome = parse_plan_output(
+                result.stdout, self.config.max_tasks, self.config.max_split_children
+            )
+        if outcome.tasks:
+            self.state.save_plan(issue.number, list(outcome.tasks))
+        return outcome
 
     async def _execute_read_only(
         self,

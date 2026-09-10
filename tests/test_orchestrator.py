@@ -14,7 +14,13 @@ from issue_agent.agents import (
 )
 from issue_agent.codegraph import CodegraphConfig
 from issue_agent.models import Issue, PlanTask, TaskStatus
-from issue_agent.orchestrator import Orchestrator, has_detailed_plan, parse_plan, review_verdict
+from issue_agent.orchestrator import (
+    Orchestrator,
+    has_detailed_plan,
+    parse_plan,
+    parse_plan_output,
+    review_verdict,
+)
 from issue_agent.process import CommandError, Result
 from issue_agent.state import StateStore
 
@@ -52,6 +58,11 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         default_agent="worker",
         auto_plan_unlabeled=True,
         auto_plan_limit=20,
+        auto_ready_with_plan=False,
+        allow_split=False,
+        max_split_children=5,
+        max_clarify_rounds=2,
+        clarify_ignore_authors=(),
         log_dir=tmp_path / "logs",
         dry_run=True,
         repo=tmp_path,
@@ -288,6 +299,105 @@ def test_parse_plan_tolerates_prose_quotes_inside_string():
     plan = parse_plan('```json\n[{"title": "call "body" map", "description": "use the "x" filter" }]\n```', 8)
     assert plan[0].title == 'call "body" map'
     assert plan[0].description == 'use the "x" filter'
+
+
+def test_parse_plan_output_keeps_bare_task_lists_working():
+    outcome = parse_plan_output('```json\n[{"title": "A", "description": "B"}]\n```', 8, 5)
+
+    assert [task.title for task in outcome.tasks] == ["A"]
+    assert outcome.questions == ()
+    assert outcome.split == ()
+
+
+def test_parse_plan_output_reads_planner_questions():
+    outcome = parse_plan_output(
+        '```json\n{"questions": ["Which module?", "Which protocol?"]}\n```', 8, 5
+    )
+
+    assert outcome.questions == ("Which module?", "Which protocol?")
+    assert outcome.tasks == ()
+
+
+def test_parse_plan_output_reads_split_children_and_their_order():
+    outcome = parse_plan_output(
+        '```json\n{"split": ['
+        '{"title": "First", "body": "Body one"},'
+        '{"title": "Second", "body": "Body two", "depends_on": [0]}'
+        "]}\n```",
+        8,
+        5,
+    )
+
+    assert [child.title for child in outcome.split] == ["First", "Second"]
+    assert outcome.split[0].depends_on == ()
+    assert outcome.split[1].depends_on == (0,)
+
+
+def test_parse_plan_output_rejects_object_without_a_known_shape():
+    with pytest.raises(CommandError, match="questions"):
+        parse_plan_output('```json\n{"notes": "nothing actionable"}\n```', 8, 5)
+
+
+def test_parse_plan_output_rejects_two_shapes_at_once():
+    with pytest.raises(CommandError):
+        parse_plan_output('```json\n{"questions": ["Q?"], "split": []}\n```', 8, 5)
+
+
+def test_parse_plan_output_rejects_empty_questions():
+    with pytest.raises(CommandError):
+        parse_plan_output('```json\n{"questions": []}\n```', 8, 5)
+
+
+def test_parse_plan_output_requires_split_title_and_body():
+    with pytest.raises(CommandError):
+        parse_plan_output('```json\n{"split": [{"title": "First"}]}\n```', 8, 5)
+
+
+def test_parse_plan_output_rejects_more_children_than_allowed():
+    children = ", ".join(f'{{"title": "C{i}", "body": "B"}}' for i in range(3))
+
+    with pytest.raises(CommandError, match="max_split_children"):
+        parse_plan_output(f'```json\n{{"split": [{children}]}}\n```', 8, 2)
+
+
+def test_parse_plan_output_rejects_dependency_outside_the_batch():
+    with pytest.raises(CommandError):
+        parse_plan_output(
+            '```json\n{"split": [{"title": "A", "body": "B", "depends_on": [3]}]}\n```', 8, 5
+        )
+
+
+def test_parse_plan_output_rejects_self_dependency():
+    with pytest.raises(CommandError):
+        parse_plan_output(
+            '```json\n{"split": [{"title": "A", "body": "B", "depends_on": [0]}]}\n```', 8, 5
+        )
+
+
+def test_parse_plan_output_rejects_dependency_cycles():
+    with pytest.raises(CommandError, match="circular"):
+        parse_plan_output(
+            '```json\n{"split": ['
+            '{"title": "A", "body": "B", "depends_on": [1]},'
+            '{"title": "C", "body": "D", "depends_on": [0]}'
+            "]}\n```",
+            8,
+            5,
+        )
+
+
+def test_plan_only_records_a_failure_when_the_planner_asks_questions(tmp_path):
+    """Interim: the clarify flow lands in a later step; until then questions fail the run."""
+    app = make_orchestrator(tmp_path)
+    app.agents["planner"].execute = AsyncMock(
+        return_value=result('```json\n{"questions": ["Which module?"]}\n```')
+    )
+    issue = Issue(number=4, title="T", body="Ambiguous request")
+    app.state.claim_for_planning(issue, "planner")
+
+    asyncio.run(app.plan_only(issue))
+
+    assert app.state.rows()[0]["status"] == str(TaskStatus.FAILED)
 
 
 def test_parse_plan_error_includes_context_snippet():
