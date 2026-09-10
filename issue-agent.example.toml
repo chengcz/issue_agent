@@ -14,6 +14,9 @@ planner_agent = "claude"
 max_tasks = 8
 auto_plan_unlabeled = true
 auto_plan_limit = 20
+# ready_poll_limit: how many ready/agent-running issues one poll may list.
+#   The merge is sorted by issue number, so the oldest backlog drains first.
+ready_poll_limit = 20
 dry_run = false
 
 # Workflow gates. All default to off; enable per repository.

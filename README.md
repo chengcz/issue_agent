@@ -278,6 +278,8 @@ CLI 启动时会验证 Agent 名称、并发数、重试次数和 timeout；无�
   共用一次 fetch，避免重复网络请求和 Git 锁竞争。
 - `runtime.auto_plan_unlabeled`：是否自动为没有 `agent-*` 工作流标签的新 Issue 生成 Plan；名称为兼容旧配置保留，默认 `false`。
 - `runtime.auto_plan_limit`：每轮最多扫描多少个候选 Issue。
+- `runtime.ready_poll_limit`：每轮最多拉取多少个带 ready / `agent-running` 标签的 Issue，默认 20；
+  合并结果按 Issue 编号排序，旧的积压优先，避免 gh 默认「最新在前」造成饥饿。
 - `runtime.auto_ready_with_plan`：正文已带完整实施计划的 Issue 是否跳过人工放行，直接加
   `agent-ready`，默认 `false`（见「auto-ready」）。
 - `runtime.allow_split`：是否允许 planner 把过大的 Issue 拆成多个子 Issue，默认 `false`

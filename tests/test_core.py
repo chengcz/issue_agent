@@ -666,6 +666,7 @@ timeout_seconds = 17
     assert app.select_agent(Issue(1, "x", "", ("agent:claude",))) == "claude"
     assert app.config.auto_plan_unlabeled is True
     assert app.config.auto_plan_limit == 7
+    assert app.config.ready_poll_limit == 20
     assert app.config.check_timeout_seconds == 17
     assert app.config.baseline_cache_ttl_seconds == 300
 
@@ -1283,6 +1284,27 @@ def test_unassigned_issues_excludes_a_custom_ready_label(tmp_path: Path):
     issues = asyncio.run(github.unassigned_issues(ready_label="todo"))
 
     assert [issue.number for issue in issues] == [2]
+
+
+def test_runnable_issues_merges_and_sorts_by_issue_number(tmp_path: Path):
+    """gh lists newest-first, so the merge is sorted locally: with more ready
+    issues than the limit, the oldest backlog still drains first."""
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(
+        side_effect=[
+            json.dumps([
+                {"number": 9, "title": "New ready", "body": "", "labels": [{"name": "agent-ready"}], "url": "u9"},
+                {"number": 3, "title": "Old ready", "body": "", "labels": [{"name": "agent-ready"}], "url": "u3"},
+            ]),
+            json.dumps([
+                {"number": 5, "title": "Interrupted", "body": "", "labels": [{"name": "agent-running"}], "url": "u5"},
+            ]),
+        ]
+    )
+
+    issues = asyncio.run(github.runnable_issues("agent-ready", limit=20))
+
+    assert [issue.number for issue in issues] == [3, 5, 9]
 
 
 def test_create_pr_reuses_existing_branch_pr(tmp_path: Path):

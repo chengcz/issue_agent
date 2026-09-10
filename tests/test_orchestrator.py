@@ -61,6 +61,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         default_agent="worker",
         auto_plan_unlabeled=True,
         auto_plan_limit=20,
+        ready_poll_limit=20,
         auto_ready_with_plan=False,
         allow_split=False,
         max_split_children=5,

@@ -174,12 +174,18 @@ class GitHub:
         ]
 
     async def runnable_issues(self, ready_label: str, limit: int = 20) -> list[Issue]:
-        """Include interrupted jobs whose ready label was already removed."""
+        """Include interrupted jobs whose ready label was already removed.
+
+        Merged and sorted by issue number: gh lists newest-first by default, so
+        a backlog deeper than the limit would starve its oldest members without
+        the local sort.
+        """
         issues, interrupted = await asyncio.gather(
             self.ready_issues(ready_label, limit),
             self.ready_issues("agent-running", limit),
         )
-        return list({issue.number: issue for issue in (*issues, *interrupted)}.values())
+        merged = {issue.number: issue for issue in (*issues, *interrupted)}
+        return [merged[number] for number in sorted(merged)]
 
     async def label_names(self) -> set[str]:
         """All label names defined in the repository (single read-only call).

@@ -704,7 +704,9 @@ class Orchestrator:
     async def run_once(self) -> None:
         if not self._schedule_allows():
             return
-        runnable_call = self.github.runnable_issues(self.config.ready_label)
+        runnable_call = self.github.runnable_issues(
+            self.config.ready_label, limit=self.config.ready_poll_limit
+        )
         if self.config.auto_plan_unlabeled:
             runnable, planning = await asyncio.gather(
                 runnable_call,

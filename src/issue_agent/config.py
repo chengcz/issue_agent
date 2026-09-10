@@ -50,6 +50,7 @@ class Config:
     max_tasks: int = 8
     auto_plan_unlabeled: bool = False
     auto_plan_limit: int = 20
+    ready_poll_limit: int = 20
     auto_ready_with_plan: bool = False
     allow_split: bool = False
     max_split_children: int = 5
@@ -97,6 +98,7 @@ def validate_config(config: Config) -> None:
         "runtime.max_task_attempts": config.max_task_attempts,
         "runtime.max_tasks": config.max_tasks,
         "runtime.auto_plan_limit": config.auto_plan_limit,
+        "runtime.ready_poll_limit": config.ready_poll_limit,
         "runtime.max_split_children": config.max_split_children,
         "runtime.max_clarify_rounds": config.max_clarify_rounds,
         "checks.timeout_seconds": config.check_timeout_seconds,
@@ -224,6 +226,7 @@ def load_config(path: str | Path) -> Config:
             "runtime.auto_plan_unlabeled", runtime.get("auto_plan_unlabeled", False)
         ),
         auto_plan_limit=int(runtime.get("auto_plan_limit", 20)),
+        ready_poll_limit=int(runtime.get("ready_poll_limit", 20)),
         auto_ready_with_plan=_parse_bool(
             "runtime.auto_ready_with_plan", runtime.get("auto_ready_with_plan", False)
         ),
