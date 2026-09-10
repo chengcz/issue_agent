@@ -978,10 +978,7 @@ class Orchestrator:
         """Create and publish a plan, then wait for the configured ready label."""
         started = time.monotonic()
         run_id = self.state.start_run(issue.number, "planning")
-        run_ids = getattr(self, "_run_ids", None)
-        if run_ids is None:
-            self._run_ids = run_ids = {}
-        run_ids[issue.number] = run_id
+        self._run_ids[issue.number] = run_id
         outcome = str(TaskStatus.BLOCKED)
         issue_log = IssueLog(self.config.log_dir, issue.number)
         issue_log.event("plan_only_started", title=issue.title, labels=issue.labels)
@@ -1085,7 +1082,7 @@ class Orchestrator:
                 outcome,
                 wall_duration_ms=int((time.monotonic() - started) * 1000),
             )
-            run_ids.pop(issue.number, None)
+            self._run_ids.pop(issue.number, None)
 
     async def _complete_split(
         self, issue: Issue, children: list[RecordedChild], *, issue_log: IssueLog
@@ -1168,10 +1165,7 @@ class Orchestrator:
     async def process(self, issue: Issue, agent_name: str) -> None:
         started = time.monotonic()
         run_id = self.state.start_run(issue.number, "implementation")
-        run_ids = getattr(self, "_run_ids", None)
-        if run_ids is None:
-            self._run_ids = run_ids = {}
-        run_ids[issue.number] = run_id
+        self._run_ids[issue.number] = run_id
         outcome = str(TaskStatus.BLOCKED)
         issue_log = IssueLog(self.config.log_dir, issue.number)
         issue_log.event("implementation_started", title=issue.title, agent=agent_name, labels=issue.labels)
@@ -1326,7 +1320,7 @@ class Orchestrator:
                 outcome,
                 wall_duration_ms=int((time.monotonic() - started) * 1000),
             )
-            run_ids.pop(issue.number, None)
+            self._run_ids.pop(issue.number, None)
 
     async def _park_or_requeue(self, issue: Issue, failures: int) -> None:
         """Keep a failed issue in the runnable pool while its retry budget holds.
@@ -1584,7 +1578,7 @@ class Orchestrator:
         if issue_number is not None:
             self.state.record_agent_call(
                 issue_number,
-                run_id=getattr(self, "_run_ids", {}).get(issue_number),
+                run_id=self._run_ids.get(issue_number),
                 seq=seq,
                 attempt=attempt,
                 agent=agent_name,
@@ -1694,9 +1688,7 @@ class Orchestrator:
             )
 
         started = time.monotonic()
-        inflight = getattr(self, "_baseline_inflight", None)
-        if inflight is None:
-            self._baseline_inflight = inflight = {}
+        inflight = self._baseline_inflight
         owner = cache_key is None or cache_key not in inflight
         operation = asyncio.create_task(capture()) if owner else inflight[cache_key]
         if cache_key is not None and owner:

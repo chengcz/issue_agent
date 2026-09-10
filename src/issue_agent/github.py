@@ -60,11 +60,11 @@ class GitHub:
         self.dry_run = dry_run
         self._dry_run_issue_counter = 0
 
-    async def _gh(self, *args: str, check: bool = True, repo: bool = True) -> str:
+    async def _gh(self, *args: str, repo: bool = True) -> str:
         command = ["gh", *args]
         if repo and self.repo and "--repo" not in args:
             command.extend(("--repo", self.repo))
-        result = await run(command, cwd=self.cwd, check=check)
+        result = await run(command, cwd=self.cwd, check=True)
         return result.stdout
 
     async def open_issues(

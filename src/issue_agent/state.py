@@ -407,48 +407,6 @@ class StateStore:
             ).fetchone()
         return str(row["final_approved_commit"]) if row and row["final_approved_commit"] else ""
 
-    def accumulate_usage(
-        self, issue_number: int, usage: dict[str, object] | None, *, duration_ms: int | None
-    ) -> None:
-        """Add one agent call's token/cost/duration to the issue's cumulative totals.
-
-        Missing keys count as zero; unknown issues are silently ignored so a
-        stray call never breaks the execution loop.
-        """
-        usage = usage or {}
-
-        def _int(key: str) -> int:
-            value = usage.get(key)
-            return int(value) if isinstance(value, (int, float)) else 0
-
-        def _float(key: str) -> float:
-            value = usage.get(key)
-            return float(value) if isinstance(value, (int, float)) else 0.0
-
-        cost = _float("total_cost_usd") or _float("cost_usd")
-        with self.connect() as db:
-            db.execute(
-                """UPDATE tasks SET
-                    total_input_tokens = total_input_tokens + ?,
-                    total_output_tokens = total_output_tokens + ?,
-                    total_cache_read_tokens = total_cache_read_tokens + ?,
-                    total_cache_creation_tokens = total_cache_creation_tokens + ?,
-                    total_reasoning_tokens = total_reasoning_tokens + ?,
-                    total_cost_usd = total_cost_usd + ?,
-                    total_duration_ms = total_duration_ms + ?
-                WHERE issue_number=?""",
-                (
-                    _int("input_tokens"),
-                    _int("output_tokens"),
-                    _int("cache_read_input_tokens"),
-                    _int("cache_creation_input_tokens"),
-                    _int("reasoning_output_tokens"),
-                    cost,
-                    int(duration_ms) if duration_ms else 0,
-                    issue_number,
-                ),
-            )
-
     @staticmethod
     def _usage_values(usage: dict[str, object] | None) -> tuple[int, int, int, int, int, float]:
         usage = usage or {}

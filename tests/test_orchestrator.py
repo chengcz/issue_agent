@@ -76,6 +76,8 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
     app.state = StateStore(tmp_path / "state.db")
     app.running = {}
     app._viewer_login = None
+    app._run_ids = {}
+    app._baseline_inflight = {}
     app.github = SimpleNamespace(
         labels=AsyncMock(),
         comment=AsyncMock(),

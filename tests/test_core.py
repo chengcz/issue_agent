@@ -441,62 +441,14 @@ def test_state_reset_restores_the_whole_clarify_budget(tmp_path: Path):
     assert state.clarify_state(4) == (0, "2026-09-10T00:00:00+00:00")
 
 
-# ---------------------------------------------------------------------------
-# usage accumulation tests
-# ---------------------------------------------------------------------------
-
-def test_accumulate_usage_stores_tokens_and_cost(tmp_path: Path):
-    state = StateStore(tmp_path / "state.db")
-    state.claim(Issue(7, "T", "B"), "codex")
-    state.accumulate_usage(
-        7,
-        {"input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 20,
-         "cache_creation_input_tokens": 5, "cost_usd": 0.01},
-        duration_ms=1200,
-    )
-    row = next(r for r in state.rows() if r["issue_number"] == 7)
-    assert row["total_input_tokens"] == 100
-    assert row["total_output_tokens"] == 50
-    assert row["total_cache_read_tokens"] == 20
-    assert row["total_cache_creation_tokens"] == 5
-    assert row["total_cost_usd"] == 0.01
-    assert row["total_duration_ms"] == 1200
-
-
-def test_accumulate_usage_sums_across_calls(tmp_path: Path):
-    state = StateStore(tmp_path / "state.db")
-    state.claim(Issue(7, "T", "B"), "codex")
-    state.accumulate_usage(7, {"input_tokens": 100, "output_tokens": 50, "cost_usd": 0.01}, duration_ms=1000)
-    state.accumulate_usage(7, {"input_tokens": 200, "output_tokens": 80, "cost_usd": 0.02}, duration_ms=2000)
-    row = next(r for r in state.rows() if r["issue_number"] == 7)
-    assert row["total_input_tokens"] == 300
-    assert row["total_output_tokens"] == 130
-    assert abs(row["total_cost_usd"] - 0.03) < 1e-9
-    assert row["total_duration_ms"] == 3000
-
-
-def test_accumulate_usage_treats_missing_keys_as_zero(tmp_path: Path):
-    state = StateStore(tmp_path / "state.db")
-    state.claim(Issue(7, "T", "B"), "codex")
-    state.accumulate_usage(7, {"input_tokens": 42}, duration_ms=None)
-    row = next(r for r in state.rows() if r["issue_number"] == 7)
-    assert row["total_input_tokens"] == 42
-    assert row["total_output_tokens"] == 0
-    assert row["total_cost_usd"] == 0.0
-    assert row["total_duration_ms"] == 0
-
-
-def test_accumulate_usage_ignores_unknown_issue(tmp_path: Path):
-    state = StateStore(tmp_path / "state.db")
-    # no row for issue 99 — must not raise
-    state.accumulate_usage(99, {"input_tokens": 10}, duration_ms=5)
-    assert all(r["issue_number"] != 99 for r in state.rows())
-
-
 def test_status_rows_include_usage_fields(tmp_path: Path):
     state = StateStore(tmp_path / "state.db")
     state.claim(Issue(7, "T", "B"), "codex")
-    state.accumulate_usage(7, {"input_tokens": 10, "output_tokens": 5, "cost_usd": 0.005}, duration_ms=500)
+    state.record_agent_call(
+        7, run_id=None, seq=None, attempt=None, agent="codex", role="worker",
+        success=True, duration_ms=500,
+        usage={"input_tokens": 10, "output_tokens": 5, "cost_usd": 0.005},
+    )
     rows = state.status_rows()
     row = next(r for r in rows if r["issue_number"] == 7)
     assert row["total_input_tokens"] == 10
@@ -523,7 +475,10 @@ def test_usage_columns_migrate_on_existing_db(tmp_path: Path):
         )
 
     state = StateStore(db_path)  # triggers migration
-    state.accumulate_usage(1, {"input_tokens": 7}, duration_ms=99)
+    state.record_agent_call(
+        1, run_id=None, seq=None, attempt=None, agent="codex", role="worker",
+        success=True, duration_ms=99, usage={"input_tokens": 7},
+    )
     row = next(r for r in state.rows() if r["issue_number"] == 1)
     assert row["total_input_tokens"] == 7
     assert row["total_duration_ms"] == 99
