@@ -61,15 +61,39 @@ class GitHub:
             args.extend(("--label", label))
         if search:
             args.extend(("--search", search))
-        args.extend(("--limit", str(limit), "--json", "number,title,body,labels,url"))
+        args.extend(
+            ("--limit", str(limit), "--json", "number,title,body,labels,url,blockedBy,parent")
+        )
         output = await self._gh(*args)
         return [
             Issue(
                 number=item["number"], title=item["title"], body=item.get("body") or "",
                 labels=tuple(label["name"] for label in item.get("labels", [])), url=item.get("url", ""),
+                blocked_by=tuple(
+                    node["number"] for node in (item.get("blockedBy") or {}).get("nodes", [])
+                ),
+                parent=(item.get("parent") or {}).get("number"),
             )
             for item in json.loads(output)
         ]
+
+    async def blocker_states(self, numbers: Iterable[int]) -> dict[int, bool]:
+        """Map each blocker issue number to whether it is closed.
+
+        One ``gh issue view`` per blocker rather than a single GraphQL query:
+        ``gh api`` takes no ``--repo`` flag, so batching would need its own repo
+        plumbing, and blockers are rare enough that the extra calls only happen
+        for the handful of gated candidates. Callers must treat a missing entry
+        as still open.
+        """
+        wanted = sorted(set(numbers))
+        outputs = await asyncio.gather(
+            *(self._gh("issue", "view", str(number), "--json", "number,state") for number in wanted)
+        )
+        return {
+            int(item["number"]): item.get("state") == "CLOSED"
+            for item in (json.loads(output) for output in outputs)
+        }
 
     async def ready_issues(self, label: str, limit: int = 20) -> list[Issue]:
         return await self.open_issues(limit, label=label)

@@ -746,6 +746,51 @@ def test_split_status_is_not_claimable(tmp_path: Path):
     assert state.claim(issue, "codex") is False
 
 
+def test_open_issues_reads_native_blockers_and_parent(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(
+        return_value=json.dumps([
+            {
+                "number": 4,
+                "title": "Blocked",
+                "body": "",
+                "labels": [],
+                "url": "u4",
+                "blockedBy": {"nodes": [{"number": 2}, {"number": 3}], "totalCount": 2},
+                "parent": {"number": 1},
+            },
+            {
+                "number": 5,
+                "title": "Free",
+                "body": "",
+                "labels": [],
+                "url": "u5",
+                "blockedBy": {"nodes": [], "totalCount": 0},
+                "parent": None,
+            },
+        ])
+    )
+
+    issues = asyncio.run(github.open_issues())
+
+    assert issues[0].blocked_by == (2, 3)
+    assert issues[0].parent == 1
+    assert issues[1].blocked_by == ()
+    assert issues[1].parent is None
+
+
+def test_blocker_states_reports_closed_blockers(tmp_path: Path):
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(
+        side_effect=['{"number": 2, "state": "CLOSED"}', '{"number": 3, "state": "OPEN"}']
+    )
+
+    states = asyncio.run(github.blocker_states([3, 2]))
+
+    assert states == {2: True, 3: False}
+    assert github._gh.await_count == 2
+
+
 def test_github_unassigned_issues_keeps_product_labels(tmp_path: Path):
     github = GitHub("owner/repo", tmp_path)
     github._gh = AsyncMock(

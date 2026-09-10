@@ -24,11 +24,14 @@ from .issue_log import IssueLog
 from .models import Issue, PlanOutcome, PlanTask, SplitChild, TaskStatus
 from .process import CommandError, Result
 from .schedule import ScheduleConfig
-from .state import StateStore
+from .state import RUNNING_STATUSES, StateStore
 from .workspace import WorkspaceManager
 
 log = logging.getLogger(__name__)
 _REVIEW_ATTEMPTS = 2
+
+
+_RUNNING_STATUSES = frozenset(str(status) for status in RUNNING_STATUSES)
 
 
 class ReviewRejected(CommandError):
@@ -406,6 +409,28 @@ class Orchestrator:
             self._schedule_open = allowed
         return allowed
 
+    async def _dependency_gate(self, issue: Issue, row, *, cache: dict[int, bool]) -> bool:
+        """True when an issue must wait for its native blockers to close.
+
+        Only first admission is gated. An issue already under way is exempt: a
+        crashed run keeps its ``agent-running`` label precisely so it can be
+        resumed, and a blocker reopening must not strand that recovery. The
+        cache spans one poll so several candidates sharing a blocker cost one
+        lookup.
+        """
+        if not issue.blocked_by:
+            return False
+        if "agent-running" in issue.labels:
+            return False
+        if row is not None and row["status"] in _RUNNING_STATUSES:
+            return False
+        pending = [number for number in issue.blocked_by if number not in cache]
+        if pending:
+            cache.update(await self.github.blocker_states(pending))
+        # An unresolved blocker is treated as still open: blocking is the safe
+        # direction, and the next poll resolves it.
+        return any(not cache.get(number, False) for number in issue.blocked_by)
+
     def _eligible(self, row, *, planning: bool = False) -> bool:
         # Read-only prefilter prevents completed/parked candidates from repeatedly
         # waking serve. The transactional claim remains authoritative at admission.
@@ -429,6 +454,7 @@ class Orchestrator:
         else:
             runnable, planning = await runnable_call, []
         persisted = {int(row["issue_number"]): row for row in self.state.rows()}
+        blocker_cache: dict[int, bool] = {}
         for issue in runnable:
             if issue.number in self.running:
                 continue
@@ -447,6 +473,8 @@ class Orchestrator:
                 continue
             if not self._eligible(row):
                 continue
+            if await self._dependency_gate(issue, row, cache=blocker_cache):
+                continue
             self._track(issue.number, self._guarded_process(issue, agent_name))
 
         planner_name = self.config.planner_agent
@@ -457,6 +485,10 @@ class Orchestrator:
             if issue.number in self.running:
                 continue
             if not self._eligible(persisted.get(issue.number), planning=True):
+                continue
+            if await self._dependency_gate(
+                issue, persisted.get(issue.number), cache=blocker_cache
+            ):
                 continue
             self._track(issue.number, self._guarded_plan_only(issue, planner_name))
 

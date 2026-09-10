@@ -70,10 +70,14 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         review_task_mode="full",
     )
     app.state = StateStore(tmp_path / "state.db")
+    app.running = {}
     app.github = SimpleNamespace(
         labels=AsyncMock(),
         comment=AsyncMock(),
         create_pr=AsyncMock(return_value="dry-run://pr/4"),
+        runnable_issues=AsyncMock(return_value=[]),
+        unassigned_issues=AsyncMock(return_value=[]),
+        blocker_states=AsyncMock(return_value={}),
     )
     app.workspaces = SimpleNamespace(
         create=AsyncMock(return_value=(tmp_path, "agent/4-task")),
@@ -384,6 +388,87 @@ def test_parse_plan_output_rejects_dependency_cycles():
             8,
             5,
         )
+
+
+def test_dependency_gate_blocks_until_every_blocker_closes(tmp_path):
+    app = make_orchestrator(tmp_path)
+    partly_open = Issue(number=4, title="T", body="B", blocked_by=(2, 3))
+
+    app.github.blocker_states = AsyncMock(return_value={2: True, 3: False})
+    assert asyncio.run(app._dependency_gate(partly_open, None, cache={})) is True
+
+    app.github.blocker_states = AsyncMock(return_value={2: True, 3: True})
+    assert asyncio.run(app._dependency_gate(partly_open, None, cache={})) is False
+
+
+def test_dependency_gate_treats_unresolved_blockers_as_open(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.github.blocker_states = AsyncMock(return_value={})
+    issue = Issue(number=4, title="T", body="B", blocked_by=(2,))
+
+    assert asyncio.run(app._dependency_gate(issue, None, cache={})) is True
+
+
+def test_dependency_gate_ignores_issues_that_are_already_under_way(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.github.blocker_states = AsyncMock(return_value={2: False})
+
+    interrupted = Issue(number=4, title="T", body="B", labels=("agent-running",), blocked_by=(2,))
+    resuming = Issue(number=5, title="T", body="B", blocked_by=(2,))
+    coding_row = {"status": str(TaskStatus.CODING)}
+
+    assert asyncio.run(app._dependency_gate(interrupted, None, cache={})) is False
+    assert asyncio.run(app._dependency_gate(resuming, coding_row, cache={})) is False
+
+
+def test_dependency_gate_reuses_the_blocker_cache_across_candidates(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.github.blocker_states = AsyncMock(return_value={2: True})
+    first = Issue(number=4, title="T", body="B", blocked_by=(2,))
+    second = Issue(number=5, title="T", body="B", blocked_by=(2,))
+    cache: dict[int, bool] = {}
+
+    assert asyncio.run(app._dependency_gate(first, None, cache=cache)) is False
+    assert asyncio.run(app._dependency_gate(second, None, cache=cache)) is False
+
+    assert app.github.blocker_states.await_count == 1
+
+
+def track_admissions(app: Orchestrator) -> list[int]:
+    """Record what run_once admits, closing the worker so no task is left pending."""
+    admitted: list[int] = []
+
+    def track(number, coroutine):
+        admitted.append(number)
+        coroutine.close()
+
+    app._track = track
+    return admitted
+
+
+def test_run_once_leaves_a_blocked_ready_issue_unclaimed(tmp_path):
+    app = make_orchestrator(tmp_path)
+    blocked = Issue(number=4, title="T", body="B", labels=("agent-ready",), blocked_by=(2,))
+    app.github.runnable_issues = AsyncMock(return_value=[blocked])
+    app.github.blocker_states = AsyncMock(return_value={2: False})
+    admitted = track_admissions(app)
+
+    asyncio.run(app.run_once())
+
+    assert admitted == []
+    assert app.state.rows() == []
+
+
+def test_run_once_admits_a_ready_issue_once_its_blockers_close(tmp_path):
+    app = make_orchestrator(tmp_path)
+    ready = Issue(number=4, title="T", body="B", labels=("agent-ready",), blocked_by=(2,))
+    app.github.runnable_issues = AsyncMock(return_value=[ready])
+    app.github.blocker_states = AsyncMock(return_value={2: True})
+    admitted = track_admissions(app)
+
+    asyncio.run(app.run_once())
+
+    assert admitted == [4]
 
 
 def test_plan_only_records_a_failure_when_the_planner_asks_questions(tmp_path):
