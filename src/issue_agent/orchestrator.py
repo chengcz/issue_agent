@@ -267,7 +267,9 @@ def _split_comment(issue: Issue, children: list[RecordedChild], ready_label: str
     """The parent's report: what was created and what happens next.
 
     Written for a human deciding what to do with the children, so it names the
-    label that releases one and the reset that undoes the whole split.
+    label that releases each child and the reset that undoes the whole split.
+    Reset is the only path back for the parent: a SPLIT row is claimable by
+    neither pool, so re-adding the ready label would silently do nothing.
     """
     return (
         "## Issue Agent Split\n\n"
@@ -279,8 +281,8 @@ def _split_comment(issue: Issue, children: list[RecordedChild], ready_label: str
         "should start. Blocked-by links between the children keep them in order, so "
         "releasing the first is enough.\n\n"
         "This issue is parked for human review and is neither planned nor implemented while "
-        f"it stays that way. To have it run as one unit instead, add the `{ready_label}` "
-        f"label — or run `issue-agent reset {issue.number}` — and close the children you do "
+        "it stays that way. To have it planned and run as one unit again, run "
+        f"`issue-agent reset {issue.number}` — and close the children you do "
         "not want."
     )
 

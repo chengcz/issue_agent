@@ -1140,6 +1140,11 @@ def test_plan_only_creates_the_children_and_parks_the_parent(tmp_path):
     body = app.github.comment.await_args.args[1]
     assert "#12" in body and "#13" in body
     assert "agent-ready" in body
+    # The parent's only recovery path is reset: adding the ready label to a
+    # SPLIT parent is a no-op neither pool ever picks up, so the comment must
+    # not suggest it.
+    assert f"issue-agent reset {issue.number}" in body
+    assert "add the `agent-ready` label — or run" not in body
 
 
 def test_split_children_never_inherit_workflow_labels(tmp_path):
