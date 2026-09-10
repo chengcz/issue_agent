@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import sys
+import tomllib
 import unicodedata
 from functools import lru_cache
 
@@ -322,7 +323,20 @@ async def preflight_labels(config) -> int:
 
 
 async def async_main(args: argparse.Namespace) -> int:
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except FileNotFoundError:
+        print(f"error: config file not found: {args.config}", file=sys.stderr)
+        return 2
+    except tomllib.TOMLDecodeError as exc:
+        print(f"error: config file is not valid TOML ({args.config}): {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"error: invalid configuration ({args.config}): {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: cannot read config file {args.config}: {exc}", file=sys.stderr)
+        return 2
     if args.command == "status":
         rows = StateStore(config.state_db).status_rows(active_only=args.active)
         print(json.dumps(rows, ensure_ascii=False, indent=2) if args.json else format_status(rows))

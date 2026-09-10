@@ -1,5 +1,6 @@
 import asyncio
 import json
+from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -941,6 +942,37 @@ repo = "a/b"
     )
     with pytest.raises(ValueError, match="no agents configured"):
         load_config(config_file)
+
+
+def test_config_errors_exit_with_a_one_line_message(tmp_path, capsys):
+    """Every subcommand pays the same clean error: no raw tracebacks for a
+    missing file, broken TOML, or invalid values (status/report need the
+    config too, so they cannot be exempt)."""
+    from issue_agent import cli
+
+    def run(command):
+        return asyncio.run(
+            cli.async_main(
+                Namespace(command=command, config=str(path), active=False, json=False)
+            )
+        )
+
+    path = tmp_path / "missing.toml"
+    assert run("status") == 2
+    assert "config file not found" in capsys.readouterr().err
+
+    path = tmp_path / "broken.toml"
+    path.write_text("[runtime\n")
+    assert run("status") == 2
+    assert "not valid TOML" in capsys.readouterr().err
+
+    path = tmp_path / "invalid.toml"
+    path.write_text(
+        '[runtime]\nrepo = "."\nmax_workers = 0\n'
+        '[agents.codex]\ncommand = "codex exec -"\n'
+    )
+    assert run("status") == 2
+    assert "invalid configuration" in capsys.readouterr().err
 
 
 def test_issue_defaults_have_no_blockers_or_parent():
