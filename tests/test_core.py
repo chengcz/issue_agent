@@ -789,6 +789,7 @@ timeout_seconds = 17
     assert app.config.auto_plan_unlabeled is True
     assert app.config.auto_plan_limit == 7
     assert app.config.ready_poll_limit == 20
+    assert app.config.max_active_issues == 1
     assert app.config.check_timeout_seconds == 17
     assert app.config.baseline_cache_ttl_seconds == 300
 

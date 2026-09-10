@@ -32,6 +32,10 @@ class Config:
     poll_seconds: int = 60
     fetch_ttl_seconds: int = 30
     max_workers: int = 3
+    # Issues driven through implementation at the same time. 1 = finish one
+    # issue end to end before starting the next (default); higher values spread
+    # agent capacity across several in-flight issues.
+    max_active_issues: int = 1
     max_attempts: int = 3
     max_task_attempts: int = 2
     checks: tuple[str, ...] = ("pytest -q",)
@@ -94,6 +98,7 @@ def validate_config(config: Config) -> None:
     positive = {
         "runtime.poll_seconds": config.poll_seconds,
         "runtime.max_workers": config.max_workers,
+        "runtime.max_active_issues": config.max_active_issues,
         "runtime.max_attempts": config.max_attempts,
         "runtime.max_task_attempts": config.max_task_attempts,
         "runtime.max_tasks": config.max_tasks,
@@ -195,6 +200,7 @@ def load_config(path: str | Path) -> Config:
         poll_seconds=int(runtime.get("poll_seconds", 60)),
         fetch_ttl_seconds=int(runtime.get("fetch_ttl_seconds", 30)),
         max_workers=int(runtime.get("max_workers", 3)),
+        max_active_issues=int(runtime.get("max_active_issues", 1)),
         max_attempts=int(runtime.get("max_attempts", 3)),
         max_task_attempts=int(runtime.get("max_task_attempts", 2)),
         checks=_string_list("checks.commands", checks_section.get("commands", ["pytest -q"])),

@@ -278,6 +278,10 @@ CLI 启动时会验证 Agent 名称、并发数、重试次数和 timeout；无�
   检查/执行失败的重试，不会延长审查返修轮数。
 - `runtime.fetch_ttl_seconds`：同一仓库 base branch fetch 的短期复用窗口，默认 30 秒；并发 Issue
   共用一次 fetch，避免重复网络请求和 Git 锁竞争。
+- `runtime.max_active_issues`：同时处于实现阶段（编码→审查→PR）的 Issue 数上限，默认 **1**。
+  编排器把实现容量优先用于完成当前 Issue——已开工的 Issue（重启恢复、预算内重试）先于全新 Issue
+  被领取，当前 Issue 完成前其余候选等待后续轮询；规划（plan-only）不受此限制，不阻塞完成进度。
+  调大该值即回到「把容量摊给多个 Issue 并行推进」的行为。
 - `runtime.auto_plan_unlabeled`：是否自动为没有 `agent-*` 工作流标签的新 Issue 生成 Plan；名称为兼容旧配置保留，默认 `false`。
 - `runtime.auto_plan_limit`：每轮最多扫描多少个候选 Issue。
 - `runtime.ready_poll_limit`：每轮最多拉取多少个带 ready / `agent-running` 标签的 Issue，默认 20；
@@ -727,7 +731,7 @@ issue-agent --config /etc/issue-agent/repo-a.toml status --json
 
 ### 6. 多 Worker 与容量
 
-`runtime.max_workers` 限制单仓库同时处理的 Issue 数，`agents.<name>.max_workers` 只限制该 Agent
+`runtime.max_workers` 限制单仓库同时运行的 Agent 调用数，`runtime.max_active_issues`（默认 1）限制同时实现的 Issue 数——两者配合实现「优先完成单个 Issue」；`agents.<name>.max_workers` 只限制该 Agent
 CLI 的同时调用数；checks、Git 和 GitHub 操作不会继续占用 Agent 配额。一台机器上所有实例的
 Worker 总数还应受 CPU、内存、磁盘 I/O 和 API 限额约束。
 Planner 和 Reviewer 使用与其 Agent 名称对应的同一配额；当实现 Agent 与 Reviewer 不同时，不会绕过

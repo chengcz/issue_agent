@@ -516,6 +516,9 @@ class Orchestrator:
         }
         self.database_lock = asyncio.Lock()
         self.running: dict[int, asyncio.Task[None]] = {}
+        # What each tracked task is doing: "implementation" tasks count against
+        # max_active_issues, "planning" tasks do not.
+        self._kinds: dict[int, str] = {}
         self._baseline_cache: OrderedDict[
             tuple[str, tuple[str, ...]], tuple[float, dict[str, CheckBaseline]]
         ] = OrderedDict()
@@ -774,6 +777,28 @@ class Orchestrator:
             runnable, planning = await runnable_call, []
         persisted = {int(row["issue_number"]): row for row in self.state.rows()}
         blocker_cache: dict[int, Blocker] = {}
+
+        def completion_rank(issue: Issue) -> tuple[int, int]:
+            """Started issues sort before fresh ones, numbers ascending within.
+
+            Finishing an issue that is already under way (resumed after a
+            restart, retried under budget) yields a completed issue sooner than
+            spreading agent capacity across every runnable task. The
+            ``agent-running`` label is the marker recovery left behind; a
+            running/retrying row says the same thing from SQLite.
+            """
+            row = persisted.get(issue.number)
+            started = "agent-running" in issue.labels or (
+                row is not None
+                and (
+                    row["status"] in _RUNNING_STATUSES
+                    or row["status"] in (str(TaskStatus.FAILED), str(TaskStatus.BLOCKED))
+                )
+            )
+            return (0 if started else 1, issue.number)
+
+        runnable.sort(key=completion_rank)
+        active = sum(1 for kind in self._kinds.values() if kind == "implementation")
         for issue in runnable:
             if issue.number in self.running:
                 continue
@@ -815,7 +840,13 @@ class Orchestrator:
                 # rate limit) must not starve every candidate behind it.
                 log.error("issue #%s: admission failed; skipping candidate this poll: %s", issue.number, exc)
                 continue
-            self._track(issue.number, self._guarded_process(issue, agent_name))
+            if active >= self.config.max_active_issues:
+                # Implementation capacity is spent on finishing the issue
+                # already in flight; this candidate waits for a later poll.
+                # Planning below still runs: it does not delay completion.
+                continue
+            active += 1
+            self._track(issue.number, self._guarded_process(issue, agent_name), kind="implementation")
 
         planner_name = self.config.planner_agent
         if planner_name and planner_name not in self.agents:
@@ -834,16 +865,18 @@ class Orchestrator:
             except CommandError as exc:
                 log.error("issue #%s: admission failed; skipping candidate this poll: %s", issue.number, exc)
                 continue
-            self._track(issue.number, self._guarded_plan_only(issue, planner_name))
+            self._track(issue.number, self._guarded_plan_only(issue, planner_name), kind="planning")
 
         await self._release_answered_clarifications(persisted)
 
-    def _track(self, issue_number: int, coroutine) -> None:
+    def _track(self, issue_number: int, coroutine, *, kind: str) -> None:
         task = asyncio.create_task(coroutine)
         self.running[issue_number] = task
+        self._kinds[issue_number] = kind
 
         def done(_task, number=issue_number):
             self.running.pop(number, None)
+            self._kinds.pop(number, None)
             wake = getattr(self, "_wake", None)
             if wake is not None:
                 wake.set()

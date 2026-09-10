@@ -6,6 +6,10 @@ log_dir = "/opt/agent-dev/logs"
 poll_seconds = 60
 fetch_ttl_seconds = 30
 max_workers = 3
+# max_active_issues: how many issues may be implemented at once. 1 (default)
+#   finishes one issue end to end before starting the next; raise it to spread
+#   agent capacity across several in-flight issues.
+max_active_issues = 1
 max_attempts = 3
 max_task_attempts = 2
 default_agent = "codex"

@@ -62,6 +62,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
         auto_plan_unlabeled=True,
         auto_plan_limit=20,
         ready_poll_limit=20,
+        max_active_issues=1,
         auto_ready_with_plan=False,
         allow_split=False,
         max_split_children=5,
@@ -75,6 +76,7 @@ def make_orchestrator(tmp_path: Path, *, attempts: int = 2, reviewer: str = "rev
     )
     app.state = StateStore(tmp_path / "state.db")
     app.running = {}
+    app._kinds = {}
     app._viewer_login = None
     app._run_ids = {}
     app._baseline_inflight = {}
@@ -517,9 +519,9 @@ def test_dependency_gate_reuses_the_blocker_cache_across_candidates(tmp_path):
 
 
 def _track_recorder(admitted: list[int]):
-    def fake_track(number, coroutine):
+    def fake_track(number, coroutine, *, kind=""):
         coroutine.close()
-        admitted.append(number)
+        admitted.append((number, kind))
 
     return fake_track
 
@@ -536,7 +538,7 @@ def test_run_once_isolates_a_failing_candidate_from_the_ones_behind_it(tmp_path)
 
     asyncio.run(app.run_once())
 
-    assert admitted == [5]
+    assert admitted == [(5, "implementation")]
 
 
 def test_run_once_isolates_a_failing_label_reconciliation(tmp_path):
@@ -552,7 +554,7 @@ def test_run_once_isolates_a_failing_label_reconciliation(tmp_path):
 
     asyncio.run(app.run_once())
 
-    assert admitted == [5]
+    assert admitted == [(5, "implementation")]
     assert app.github.labels.await_count == 1
 
 
@@ -840,7 +842,7 @@ def track_admissions(app: Orchestrator) -> list[int]:
     """Record what run_once admits, closing the worker so no task is left pending."""
     admitted: list[int] = []
 
-    def track(number, coroutine):
+    def track(number, coroutine, *, kind=""):
         admitted.append(number)
         coroutine.close()
 
@@ -859,6 +861,76 @@ def test_run_once_leaves_a_blocked_ready_issue_unclaimed(tmp_path):
 
     assert admitted == []
     assert app.state.rows() == []
+
+
+def test_run_once_finishes_one_issue_before_starting_the_next(tmp_path):
+    """Default max_active_issues=1: agent capacity is spent finishing the first
+    issue end to end, not spread across every runnable task."""
+    app = make_orchestrator(tmp_path)
+    first = Issue(number=4, title="First", body="B", labels=("agent-ready",))
+    second = Issue(number=5, title="Second", body="B", labels=("agent-ready",))
+    app.github.runnable_issues = AsyncMock(return_value=[first, second])
+    app._dependency_gate = AsyncMock(return_value=False)
+    admitted: list[int] = []
+    app._track = _track_recorder(admitted)
+
+    asyncio.run(app.run_once())
+
+    assert admitted == [(4, "implementation")]
+
+
+def test_run_once_admits_up_to_the_active_issue_cap(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.config.max_active_issues = 2
+    first = Issue(number=4, title="First", body="B", labels=("agent-ready",))
+    second = Issue(number=5, title="Second", body="B", labels=("agent-ready",))
+    app.github.runnable_issues = AsyncMock(return_value=[first, second])
+    app._dependency_gate = AsyncMock(return_value=False)
+    admitted: list[int] = []
+    app._track = _track_recorder(admitted)
+
+    asyncio.run(app.run_once())
+
+    assert [number for number, _ in admitted] == [4, 5]
+
+
+def test_run_once_resumes_a_started_issue_before_a_fresh_one(tmp_path):
+    """An issue already under way (agent-running after a restart) is admitted
+    ahead of a fresh ready issue with a smaller number."""
+    app = make_orchestrator(tmp_path)
+    # Post-recovery shape: the row was reset to PLANNED, the agent-running
+    # label survived the restart.
+    app.state.claim(Issue(number=7, title="Started", body="B"), "worker")
+    app.state.update(7, TaskStatus.PLANNED)
+    fresh = Issue(number=3, title="Fresh", body="B", labels=("agent-ready",))
+    resumed = Issue(number=7, title="Started", body="B", labels=("agent-running",))
+    # gh lists newest first; the orchestrator must re-sort by completion rank.
+    app.github.runnable_issues = AsyncMock(return_value=[fresh, resumed])
+    app._dependency_gate = AsyncMock(return_value=False)
+    admitted: list[int] = []
+    app._track = _track_recorder(admitted)
+
+    asyncio.run(app.run_once())
+
+    assert admitted == [(7, "implementation")]
+
+
+def test_coding_cap_does_not_delay_planning(tmp_path):
+    """The active-issue cap throttles implementation only: planning another
+    issue while one is coded does not delay the in-flight issue's completion."""
+    app = make_orchestrator(tmp_path)
+    app._kinds = {4: "implementation"}
+    app.running = {4: Mock()}
+    issue = Issue(9, "Needs planning", "A vague request")
+    app.github.runnable_issues = AsyncMock(return_value=[])
+    app.github.unassigned_issues = AsyncMock(return_value=[issue])
+    app._dependency_gate = AsyncMock(return_value=False)
+    admitted: list[int] = []
+    app._track = _track_recorder(admitted)
+
+    asyncio.run(app.run_once())
+
+    assert admitted == [(9, "planning")]
 
 
 def test_run_once_admits_a_ready_issue_once_its_blockers_close(tmp_path):
@@ -2823,7 +2895,7 @@ def test_tracked_worker_completion_wakes_scheduler(tmp_path):
     app._wake = asyncio.Event()
 
     async def run():
-        app._track(4, asyncio.sleep(0))
+        app._track(4, asyncio.sleep(0), kind="implementation")
         await asyncio.gather(*tuple(app.running.values()))
         await asyncio.sleep(0)
         return app._wake.is_set()
