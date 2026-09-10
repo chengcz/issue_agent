@@ -513,6 +513,46 @@ def test_dependency_gate_reuses_the_blocker_cache_across_candidates(tmp_path):
     assert app.github.blocker_states.await_count == 1
 
 
+def _track_recorder(admitted: list[int]):
+    def fake_track(number, coroutine):
+        coroutine.close()
+        admitted.append(number)
+
+    return fake_track
+
+
+def test_run_once_isolates_a_failing_candidate_from_the_ones_behind_it(tmp_path):
+    """One candidate's gate failure must not starve every candidate after it."""
+    app = make_orchestrator(tmp_path)
+    first = Issue(number=4, title="First", body="B", labels=("agent-ready",))
+    second = Issue(number=5, title="Second", body="B", labels=("agent-ready",))
+    app.github.runnable_issues = AsyncMock(return_value=[first, second])
+    app._dependency_gate = AsyncMock(side_effect=[CommandError("gh exploded"), False])
+    admitted: list[int] = []
+    app._track = _track_recorder(admitted)
+
+    asyncio.run(app.run_once())
+
+    assert admitted == [5]
+
+
+def test_run_once_isolates_a_failing_label_reconciliation(tmp_path):
+    app = make_orchestrator(tmp_path)
+    app.state.claim(Issue(number=4, title="Stuck", body="B"), "worker")
+    app.state.update(4, TaskStatus.HUMAN_REVIEW)
+    stuck = Issue(number=4, title="Stuck", body="B", labels=("human-review",))
+    ready = Issue(number=5, title="Second", body="B", labels=("agent-ready",))
+    app.github.runnable_issues = AsyncMock(return_value=[stuck, ready])
+    app.github.labels = AsyncMock(side_effect=CommandError("gh: rate limited"))
+    admitted: list[int] = []
+    app._track = _track_recorder(admitted)
+
+    asyncio.run(app.run_once())
+
+    assert admitted == [5]
+    assert app.github.labels.await_count == 1
+
+
 def comments(app: Orchestrator) -> list[str]:
     return [call.args[1] for call in app.github.comment.await_args_list]
 

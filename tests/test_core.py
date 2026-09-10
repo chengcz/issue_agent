@@ -1006,6 +1006,21 @@ def test_blocker_states_reports_closed_blockers_and_their_titles(tmp_path: Path)
     assert github._gh.await_count == 2
 
 
+def test_blocker_states_treats_a_failed_lookup_as_missing(tmp_path: Path):
+    """One deleted/unreadable blocker must not raise the lookup away."""
+    github = GitHub("owner/repo", tmp_path)
+    github._gh = AsyncMock(
+        side_effect=[
+            CommandError("command failed (1): gh\nissue #3 not found"),
+            '{"number": 2, "title": "First", "state": "OPEN"}',
+        ]
+    )
+
+    states = asyncio.run(github.blocker_states([3, 2]))
+
+    assert states == {2: Blocker(2, "First", False)}
+
+
 def test_gh_omits_the_repo_flag_when_told_to(tmp_path: Path, monkeypatch):
     github = GitHub("owner/repo", tmp_path)
     commands: list[list[str]] = []

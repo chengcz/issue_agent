@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Iterable
 from pathlib import Path
 
 from .formal_review import redact_secrets
 from .models import Blocker, Comment, Issue
 from .process import CommandError, run
+
+log = logging.getLogger(__name__)
 
 # Labels the orchestrator applies itself, with recommended colors and
 # descriptions used to generate `gh label create` guidance at startup.
@@ -92,23 +95,33 @@ class GitHub:
         plumbing, and blockers are rare enough that the extra calls only happen
         for the handful of gated candidates. Titles come along because the gate
         names its blockers in a comment. Callers must treat a missing entry as
-        still open.
+        still open. A failing lookup stays missing (with a log line) instead of
+        raising, so one deleted blocker cannot starve the whole scheduler queue.
         """
         wanted = sorted(set(numbers))
         outputs = await asyncio.gather(
             *(
                 self._gh("issue", "view", str(number), "--json", "number,title,state")
                 for number in wanted
-            )
+            ),
+            return_exceptions=True,
         )
-        return {
-            int(item["number"]): Blocker(
+        states: dict[int, Blocker] = {}
+        for number, output in zip(wanted, outputs):
+            if isinstance(output, BaseException):
+                # A deleted/transferred blocker or a transient gh failure must
+                # not raise through the scheduler: the documented contract is
+                # that callers treat a missing entry as still open, so a failed
+                # lookup simply stays missing.
+                log.warning("blocker #%s lookup failed; treating it as still open: %s", number, output)
+                continue
+            item = json.loads(output)
+            states[int(item["number"])] = Blocker(
                 number=int(item["number"]),
                 title=str(item.get("title") or ""),
                 closed=item.get("state") == "CLOSED",
             )
-            for item in (json.loads(output) for output in outputs)
-        }
+        return states
 
     async def viewer_login(self) -> str:
         """This machine's GitHub login, or "" when it cannot be asked.

@@ -710,21 +710,26 @@ class Orchestrator:
             if issue.number in self.running:
                 continue
             row = persisted.get(issue.number)
-            if row and row["status"] == str(TaskStatus.HUMAN_REVIEW):
-                await self.github.labels(
-                    issue.number,
-                    add=("human-review",),
-                    remove=("agent-running", "agent-failed", self.config.ready_label),
-                )
-                continue
             try:
+                if row and row["status"] == str(TaskStatus.HUMAN_REVIEW):
+                    await self.github.labels(
+                        issue.number,
+                        add=("human-review",),
+                        remove=("agent-running", "agent-failed", self.config.ready_label),
+                    )
+                    continue
                 agent_name = self.select_agent(issue)
+                if not self._eligible(row):
+                    continue
+                if await self._dependency_gate(issue, row, cache=blocker_cache):
+                    continue
             except ValueError as exc:
                 log.error("issue #%s: %s", issue.number, exc)
                 continue
-            if not self._eligible(row):
-                continue
-            if await self._dependency_gate(issue, row, cache=blocker_cache):
+            except CommandError as exc:
+                # One candidate's GitHub failure (deleted blocker, label churn,
+                # rate limit) must not starve every candidate behind it.
+                log.error("issue #%s: admission failed; skipping candidate this poll: %s", issue.number, exc)
                 continue
             self._track(issue.number, self._guarded_process(issue, agent_name))
 
@@ -735,11 +740,15 @@ class Orchestrator:
         for issue in planning:
             if issue.number in self.running:
                 continue
-            if not self._eligible(persisted.get(issue.number), planning=True):
-                continue
-            if await self._dependency_gate(
-                issue, persisted.get(issue.number), cache=blocker_cache
-            ):
+            try:
+                if not self._eligible(persisted.get(issue.number), planning=True):
+                    continue
+                if await self._dependency_gate(
+                    issue, persisted.get(issue.number), cache=blocker_cache
+                ):
+                    continue
+            except CommandError as exc:
+                log.error("issue #%s: admission failed; skipping candidate this poll: %s", issue.number, exc)
                 continue
             self._track(issue.number, self._guarded_plan_only(issue, planner_name))
 
