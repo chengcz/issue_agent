@@ -1599,6 +1599,23 @@ def test_run_once_comments_once_about_an_unknown_agent_route(tmp_path):
     assert "nobody" in route_notes[0]
 
 
+def test_a_task_whose_commit_stages_nothing_is_not_named_as_the_commit(tmp_path):
+    """When git finds nothing to commit for a task, the task produced no work:
+    it must fail retryably rather than record the previous task's commit as its
+    own, which is what naming a hash for a commit that never happened did."""
+    app = make_orchestrator(tmp_path)
+    app.workspaces.commit.side_effect = [False, False]  # both attempts stage nothing
+    issue = Issue(4, "Task", "Body")
+
+    run_process(app, issue)
+
+    assert app.state.plan_task_statuses(4) == [TaskStatus.PENDING, TaskStatus.PENDING]
+    row = app.state.rows()[0]
+    assert row["status"] == str(TaskStatus.FAILED)
+    assert "without changing files" in row["last_error"]
+    app.workspaces.push.assert_not_awaited()
+
+
 def test_single_task_fallback_without_planner(tmp_path):
     app = make_orchestrator(tmp_path)
     app.config.planner_agent = ""
@@ -1792,6 +1809,45 @@ def test_final_review_changes_produce_a_fix_commit(tmp_path):
     worker_prompts = [call.args[1] for call in app.agents["worker"].execute.await_args_list]
     assert "Missing docs" in worker_prompts[1]
     app.workspaces.push.assert_awaited_once()
+
+
+def issue_events(tmp_path: Path, issue_number: int = 4) -> list[str]:
+    path = tmp_path / "logs" / f"issue-{issue_number}.jsonl"
+    return [
+        json.loads(line)["event"] for line in path.read_text(encoding="utf-8").splitlines() if line
+    ]
+
+
+def test_a_final_fix_that_changes_nothing_is_not_recorded_as_a_commit(tmp_path):
+    """#36: the fixer left the branch exactly as it was — its only "changes" were
+    artifacts the check run then regenerated. The round must carry on to the next
+    review, which rejects the branch honestly, instead of failing as an
+    implementation error from the commit step, and no commit hash may be recorded
+    for a commit that never happened.
+    """
+    app = make_orchestrator(tmp_path, attempts=3)
+    app.agents["reviewer"].execute.side_effect = [
+        result(APPROVE),  # task one
+        result("Need docs.\nVERDICT: REQUEST_CHANGES\n"),  # final review
+        result("Still missing docs.\nVERDICT: REQUEST_CHANGES\n"),  # final re-review
+    ]
+    app.workspaces.changed.side_effect = [True, True]
+    app.workspaces.commit.side_effect = [True, False]  # the fix commit found nothing
+    issue = Issue(4, "Task", "Body")
+    app.state.claim(issue, "worker")
+    app.state.save_plan(4, [PlanTask("One", "D")])
+
+    asyncio.run(app.process(issue, "worker"))
+
+    assert [call.args[1] for call in app.workspaces.commit.await_args_list] == [
+        "feat: One (#4)",
+        "feat: final review fixes (#4)",
+    ]
+    assert app.state.final_context(4)[0] is None
+    events = issue_events(tmp_path)
+    assert "final_fix_no_changes" in events
+    assert "final_fix_committed" not in events
+    app.workspaces.push.assert_not_awaited()
 
 
 def test_final_checks_failure_triggers_a_fix_commit(tmp_path, monkeypatch):

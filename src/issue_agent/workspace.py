@@ -128,9 +128,23 @@ class WorkspaceManager:
         )
         return result.stdout.strip()
 
-    async def commit(self, path: Path, message: str) -> None:
+    async def commit(self, path: Path, message: str) -> bool:
+        """Stage and commit everything; ``False`` when there was nothing to commit.
+
+        The index decides, because it is what ``git commit`` reads. A preceding
+        :meth:`changed` call can disagree with it: an agent that deletes a
+        tracked artifact and a check that regenerates it byte-identically leave
+        a staged deletion that ``changed`` reports as work, while ``git add
+        --all`` puts the index straight back on HEAD. Committing then failed
+        with "nothing to commit, working tree clean" and marked an issue failed
+        after every one of its checks had passed.
+        """
         await run(("git", "add", "--all", "--", "."), cwd=path)
+        staged = await run(("git", "diff", "--cached", "--quiet"), cwd=path, check=False)
+        if staged.returncode == 0:
+            return False
         await run(("git", "commit", "-m", message), cwd=path)
+        return True
 
     async def amend(self, path: Path) -> None:
         await run(("git", "add", "--all", "--", "."), cwd=path)

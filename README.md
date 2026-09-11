@@ -131,7 +131,9 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
    - `off`：跳过任务级审查（功能审查仍由最终阶段的整分支 Review 兜底）。
    - 任一模式下不通过 → 实现 Agent 修复并 amend 同一 commit 再审；第二次仍不通过立即停止
      （不再自动返修），等人工检查 review 日志后重试。
-6. 通过后该 plan 任务标记 `done`，记录 commit hash。
+6. 通过后该 plan 任务标记 `done`，记录 commit hash。提交与否以 `git` 的索引为准：若 `git add
+   --all` 之后与 HEAD 无差异（例如 Agent 只删掉了被 checks 重新生成的构建产物），按“无改动”
+   失败重试，而不是把上一个任务的 commit 记成这个任务的。
 
 > 设计取舍：per-task 的功能性深度审查收敛到最终阶段（整分支 Review），任务级只保留确定性
 > 形式审查 + checks（测试）兜底，每个任务省去一次 LLM review 调用。若任务 1 存在设计缺陷，
@@ -147,7 +149,11 @@ task 失败时整个 Issue 标记失败并保留已完成任务的分支；重�
 - 全部任务通过后，reviewer 对整条分支 diff 做整体 Review（同样最多 2 轮）。
 - 要求修改 → 实现 Agent 修复并产生独立 commit：`feat: final review fixes (#N)`
   （与任务内的 amend 不同）。
-- 通过后再完整执行一遍 `checks.commands`，若仍产生改动则再提交。
+- 通过后再完整执行一遍 `checks.commands`，若仍产生改动则再提交。是否“产生改动”以提交时的索引
+  为准，不以 `git status` 为准：Agent 删掉某个被后续 check 逐字节重新生成的已跟踪文件（如
+  `__pycache__/*.pyc`）时，`git status` 会一直显示这条已暂存的删除，而 `git add --all` 又把索引
+  放回 HEAD——此时按“无可提交内容”处理，记 `final_fix_no_changes` 事件并进入下一轮终审，不会把
+  这一轮判为实施失败。
 - 最终修复后 checks 已通过且只读 Reviewer 未改变 HEAD 时，复用该结果，不对同一 commit 连续执行
   两次完整 checks。
 - finalize 通过后记录**已批准的 commit**（`final_approved_commit`）：push/PR 失败后的重试只要

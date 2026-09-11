@@ -2189,7 +2189,7 @@ command = "fake -"
         return True
 
     async def fake_commit(path, message):
-        return None
+        return True  # the task's work is committed
 
     async def fake_head_commit(path):
         return "abc1234"

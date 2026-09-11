@@ -2086,7 +2086,14 @@ class Orchestrator:
                     await self.workspaces.amend(workspace)
                     issue_log.event("task_commit_amended", sequence=seq, attempt=attempt)
                 else:
-                    await self.workspaces.commit(workspace, f"feat: {task.title} (#{issue.number})")
+                    committed = await self.workspaces.commit(
+                        workspace, f"feat: {task.title} (#{issue.number})"
+                    )
+                    if not committed:
+                        # Same condition as the guard above, seen from git: the
+                        # agent's work is not in the branch, so there is no task
+                        # commit to name and no hash to record for it.
+                        raise CommandError("agent completed without changing files")
                     task_committed = True
                     issue_log.event("task_committed", sequence=seq, attempt=attempt)
 
@@ -2188,8 +2195,13 @@ class Orchestrator:
                     checks_current = True
                 else:
                     issue_log.event("final_check_reused", attempt=attempt)
-                if await self.workspaces.changed(workspace):
-                    await self.workspaces.commit(workspace, f"feat: final review fixes (#{issue.number})")
+                # The commit decides whether there is anything to record, not
+                # the check before it: an approved review with nothing left to
+                # commit is the normal case on this branch (and the two can
+                # disagree — see WorkspaceManager.commit).
+                if await self.workspaces.changed(workspace) and await self.workspaces.commit(
+                    workspace, f"feat: final review fixes (#{issue.number})"
+                ):
                     self.state.update_final_context(
                         issue.number,
                         commit_hash=await self.workspaces.head_commit(workspace),
@@ -2226,10 +2238,18 @@ class Orchestrator:
                 self.state.update_final_context(issue.number, last_error=str(exc))
                 raise
             if await self.workspaces.changed(workspace):
-                await self.workspaces.commit(workspace, f"feat: final review fixes (#{issue.number})")
-                self.state.update_final_context(
-                    issue.number,
-                    commit_hash=await self.workspaces.head_commit(workspace),
-                )
-                issue_log.event("final_fix_committed", attempt=attempt)
+                if await self.workspaces.commit(
+                    workspace, f"feat: final review fixes (#{issue.number})"
+                ):
+                    self.state.update_final_context(
+                        issue.number,
+                        commit_hash=await self.workspaces.head_commit(workspace),
+                    )
+                    issue_log.event("final_fix_committed", attempt=attempt)
+                else:
+                    # The fixer's round left the branch exactly as it was, so
+                    # there is nothing for the next review to look at. Record
+                    # that and go round again — the review is what judges the
+                    # work, not this step.
+                    issue_log.event("final_fix_no_changes", attempt=attempt)
         raise CommandError(last_error or "maximum attempts exceeded")
