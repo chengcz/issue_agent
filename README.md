@@ -337,12 +337,19 @@ error: no issue-agent.toml found in /srv/app/src/api, /srv/app/src, /srv/app; pa
 报错，避免误跑到另一份配置上。部署里同时管理多个仓库时（如 `/etc/issue-agent/repo-a.toml`）
 仍应显式指定。
 
-`status` 输出列：`ISSUE`、`STATUS`、`CURRENT TASK`、`AGENT`、`TOKENS`（输入+输出 token 合计，
-k/M 紧凑格式）、`COST`（累计美元开销）、`TIME`（累计 Agent 壁钟耗时）与 `UPDATED`。TOKENS/COST
+`status` 输出列：`ISSUE`、`STATUS`、`BLOCKED BY`、`CURRENT TASK`、`AGENT`、`TOKENS`（输入+输出
+token 合计，k/M 紧凑格式）、`COST`（累计美元开销）、`TIME`（累计 Agent 壁钟耗时）与 `UPDATED`。TOKENS/COST
 需要 Agent CLI 输出 JSON envelope（如 Claude CLI 加 `--output-format json`）才有数据，否则仅
 TIME 有值；无数据时显示 `-`。`--json` 输出含全部累积字段（`total_input_tokens`、
 `total_output_tokens`、`total_cache_read_tokens`、`total_cache_creation_tokens`、
 `total_cost_usd`、`total_duration_ms`）。
+
+`BLOCKED BY` 显示该 Issue 还在等的依赖（`#34` 或 `#34,#35`，没有则 `-`），回答“这条为什么
+没被领取、`reset` 了为什么还是不动”。数据取自本地 SQLite 里最后一条依赖公告（即
+`blocker_notices` 的 `pending`），因此 `status`/`report` 不联网、不调用 `gh`；代价是有人在
+GitHub 上直接删掉 blocked-by 链接时，这一列要等编排器下次记录到新的依赖集合才更新。完全被阻塞、
+从未被领取的 Issue 没有 task 行，不出现在 `status` 里。`--json` 里对应的字段是
+`blocked_by`（Issue 号数组）；`report` 的 Issue 行只在被阻塞时附带 `blocked_by=#34`。
 
 表格自动适配终端宽度：`CURRENT TASK` 最多占 60 个显示列，长内容自动换行；
 中文和全角字符按两列计算，英文优先在单词边界换行。其他过长列也会换行并保持对齐。
@@ -364,7 +371,7 @@ TIME 有值；无数据时显示 `-`。`--json` 输出含全部累积字段（`t
 着色只作用于 `STATUS` 列，且在列宽计算之后套用，因此不影响其他列的对齐与自动换行。
 
 `report` 同时输出 Issue 的 `queue`/`wall` 以及各 plan task 的累计 `wall`、`agent`、`checks`、
-token、cost 和 attempts；
+token、cost 和 attempts（被依赖阻塞时，Issue 行还会带上 `blocked_by=#34`）；
 `--json` 还包含逐次 `issue_runs`，适合后续导入监控系统。失败和超时的 Agent 调用也计入统计。
 
 确认无误后，可在当前终端持续轮询；按 `Ctrl+C` 停止：

@@ -48,11 +48,31 @@ _STATUS_CODES: dict[str, str] = {
 # Both tables put STATUS second; the compact layout keys off the heading text.
 _STATUS_COLUMN = 1
 _STATUS_HEADING = "STATUS"
+# The status table's CURRENT TASK column, the only one capped by hand.
+_CURRENT_TASK_COLUMN = 3
 
 
 def _status_code(cell: str) -> str:
     """The SGR code for a status cell, or "" when the cell is not a status."""
     return _STATUS_CODES.get(cell.strip().lower(), "")
+
+
+def _format_blockers(numbers: object) -> str:
+    """`#34,#35` for the issues blocking this one, or `-` when nothing does."""
+    if not isinstance(numbers, list) or not numbers:
+        return "-"
+    return ",".join(f"#{number}" for number in numbers)
+
+
+def _blocker_note(row: dict[str, object]) -> str:
+    """`blocked_by=#34  ` for the report summary, empty when unblocked.
+
+    The report has no BLOCKED BY column, and dashing the field on every
+    unblocked issue would bury the ones that are waiting. Omitting it keeps an
+    unblocked issue's line exactly as it read before the field existed.
+    """
+    numbers = row.get("blocked_by")
+    return f"blocked_by={_format_blockers(numbers)}  " if numbers else ""
 
 
 def _paint(text: str, code: str) -> str:
@@ -180,9 +200,11 @@ def _wrap_display(text: str, width: int) -> list[str]:
     for char in text:
         size = _char_width(char)
         if used + size > width and line:
-            # Prefer word boundaries for English; CJK and long identifiers can
-            # still break at any character. Preserve the original whitespace.
-            boundary = line.rfind(" ") + 1
+            # Prefer word boundaries for English, and commas so a list of issue
+            # numbers breaks between entries instead of through one; CJK and
+            # long identifiers can still break at any character. Preserve the
+            # original whitespace.
+            boundary = max(line.rfind(" "), line.rfind(",")) + 1
             if 0 < boundary < len(line):
                 lines.append(line[:boundary])
                 line = line[boundary:]
@@ -223,11 +245,15 @@ def format_status(
 ) -> str:
     if not rows:
         return "No matching tasks."
-    headings = ("ISSUE", "STATUS", "CURRENT TASK", "AGENT", "TOKENS", "COST", "TIME", "UPDATED")
+    headings = (
+        "ISSUE", "STATUS", "BLOCKED BY", "CURRENT TASK", "AGENT", "TOKENS", "COST", "TIME",
+        "UPDATED",
+    )
     values = [
         (
             f"#{row['issue_number']}",
             str(row["status"]),
+            _format_blockers(row.get("blocked_by")),
             str(row.get("current_task") or row.get("title") or "-"),
             str(row.get("agent") or "-"),
             _format_tokens(row),
@@ -250,8 +276,14 @@ def format_status(
     gaps = 2 * (len(headings) - 1)
     if sum(minimums) + gaps > terminal_width:
         return _compact_status(headings, values, terminal_width, color=color)
-    fixed_width = sum(widths) - widths[2] + 2 * (len(headings) - 1)
-    widths[2] = min(widths[2], max(len(headings[2]), min(60, terminal_width - fixed_width)))
+    fixed_width = sum(widths) - widths[_CURRENT_TASK_COLUMN] + 2 * (len(headings) - 1)
+    widths[_CURRENT_TASK_COLUMN] = min(
+        widths[_CURRENT_TASK_COLUMN],
+        max(
+            len(headings[_CURRENT_TASK_COLUMN]),
+            min(60, terminal_width - fixed_width),
+        ),
+    )
     # Long agent names/statuses must not force the terminal to wrap the whole row.
     while sum(widths) + gaps > terminal_width:
         column = max(range(len(widths)), key=lambda i: widths[i] - minimums[i])
@@ -290,6 +322,7 @@ def format_report(rows: list[dict[str, object]], *, color: bool = False) -> str:
         summary = (
             f"#{row['issue_number']} {row['title']} "
             f"[{_paint(str(row['status']), _status_code(str(row['status'])) if color else '')}]  "
+            f"{_blocker_note(row)}"
             f"wall={_format_duration({'total_duration_ms': row.get('total_wall_duration_ms')})}  "
             f"queue={_format_duration({'total_duration_ms': row.get('total_queue_duration_ms')})}  "
             f"agent={_format_duration(row)}  "

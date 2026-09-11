@@ -26,6 +26,32 @@ RUNNING_STATUSES = (
 )
 
 
+def _pending_blockers(payload: object) -> list[int]:
+    """The blocker numbers a stored notice lists, sorted and deduplicated.
+
+    Anything unreadable — a hand-edited row, a shape an older version wrote —
+    reads as "nothing blocks this issue" rather than raising: a display command
+    must not be taken down by one bad row.
+    """
+    if not isinstance(payload, str):
+        return []
+    try:
+        notices = json.loads(payload)
+    except json.JSONDecodeError:
+        return []
+    pending = notices.get("pending") if isinstance(notices, dict) else None
+    if not isinstance(pending, list):
+        return []
+    # ``bool`` is an ``int`` subclass, and issue #True would render as #1.
+    return sorted(
+        {
+            number
+            for number in pending
+            if isinstance(number, int) and not isinstance(number, bool)
+        }
+    )
+
+
 class StateStore:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -580,6 +606,7 @@ class StateStore:
                         (issue["issue_number"],),
                     )
                 ]
+        self._annotate_blockers(issues)
         return issues
 
     def load_session(self, issue_number: int, agent: str, role: str) -> str:
@@ -638,7 +665,9 @@ class StateStore:
             parameters = tuple(str(status) for status in RUNNING_STATUSES)
         sql += " ORDER BY tasks.updated_at DESC"
         with self.connect() as db:
-            return [dict(row) for row in db.execute(sql, parameters)]
+            rows = [dict(row) for row in db.execute(sql, parameters)]
+        self._annotate_blockers(rows)
+        return rows
 
     def recover_interrupted(self, max_attempts: int = 3) -> int:
         """Make work interrupted by a process restart claimable again.
@@ -716,6 +745,30 @@ class StateStore:
                 (str(TaskStatus.PENDING), "orchestrator restarted", now, *active),
             )
             return planning.rowcount + resumed.rowcount + failed.rowcount
+
+    def blockers_by_issue(self) -> dict[int, list[int]]:
+        """The blocker numbers each issue was last recorded as waiting on.
+
+        Read from the same local notice the dependency comment was written
+        from, so ``status``/``report`` stay offline commands. Only non-empty
+        sets are listed: an issue whose blockers all closed reads as unblocked,
+        which is also what an issue with no notice row at all reads as.
+        """
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT issue_number, blockers_notified FROM blocker_notices"
+            ).fetchall()
+        return {
+            int(row["issue_number"]): pending
+            for row in rows
+            if (pending := _pending_blockers(row["blockers_notified"]))
+        }
+
+    def _annotate_blockers(self, issues: list[dict[str, object]]) -> None:
+        """Add the recorded blocker numbers to each row, in place."""
+        blockers = self.blockers_by_issue()
+        for issue in issues:
+            issue["blocked_by"] = blockers.get(int(issue["issue_number"]), [])
 
     def load_blocker_notices(self, issue_number: int) -> dict[str, object]:
         """Read back which dependency comments were already posted for an issue.
