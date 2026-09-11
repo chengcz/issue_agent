@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import shutil
 import sys
 import tomllib
@@ -24,6 +25,58 @@ from .state import StateStore
 # SPLIT parent is included for the same reason: resetting it is how a human
 # overrules the split and asks for the issue to be planned again as one unit.
 _RESETTABLE = frozenset({"pending", "planned", "failed", "blocked", "split", "human_review"})
+
+# One color per workflow *meaning*, not per status: the STATUS column answers
+# "whose turn is it", and thirteen distinct colors would be noise. The five
+# groups are a running worker, a queue waiting for a human, a human decision
+# that is already owed, success, and trouble.
+_ACTIVE = "36"  # cyan
+_WAITING = "33"  # yellow
+_HUMAN = "35"  # magenta
+_OK = "32"  # green
+_BAD = "31"  # red
+_RESET = "\033[0m"
+
+_STATUS_CODES: dict[str, str] = {
+    "claimed": _ACTIVE, "planning": _ACTIVE, "coding": _ACTIVE,
+    "testing": _ACTIVE, "reviewing": _ACTIVE, "pushing": _ACTIVE,
+    "pending": _WAITING, "planned": _WAITING,
+    "human_review": _HUMAN, "split": _HUMAN,
+    "done": _OK,
+    "failed": _BAD, "blocked": _BAD,
+}
+# Both tables put STATUS second; the compact layout keys off the heading text.
+_STATUS_COLUMN = 1
+_STATUS_HEADING = "STATUS"
+
+
+def _status_code(cell: str) -> str:
+    """The SGR code for a status cell, or "" when the cell is not a status."""
+    return _STATUS_CODES.get(cell.strip().lower(), "")
+
+
+def _paint(text: str, code: str) -> str:
+    """Wrap one **already padded** cell. Width math must run on the plain text."""
+    return f"\033[{code}m{text}{_RESET}" if code else text
+
+
+def _color_enabled(choice: str, *, stream=None, environ=None) -> bool:
+    """Whether the STATUS column may carry escape codes.
+
+    ``always`` wins over everything and ``never`` loses to nothing, so an
+    explicit flag beats the environment. ``auto`` asks the terminal, because a
+    pipe, a log file, or CI would keep the codes as literal garbage. ``NO_COLOR``
+    (any non-empty value) and a dumb terminal are honored for the same reason.
+    """
+    if choice == "never":
+        return False
+    if choice == "always":
+        return True
+    environ = os.environ if environ is None else environ
+    if environ.get("NO_COLOR") or environ.get("TERM") == "dumb":
+        return False
+    stream = sys.stdout if stream is None else stream
+    return bool(stream.isatty())
 
 
 def parser() -> argparse.ArgumentParser:
@@ -51,6 +104,13 @@ def parser() -> argparse.ArgumentParser:
     )
     report.add_argument("--issue", type=int, help="limit the report to one GitHub Issue")
     report.add_argument("--json", action="store_true", help="output machine-readable JSON")
+    for table in (status, report):
+        table.add_argument(
+            "--color",
+            choices=("auto", "always", "never"),
+            default="auto",
+            help="color the STATUS column (default: only on a terminal)",
+        )
     reset = sub.add_parser(
         "reset", help="reset a task so it can be claimed and run again", parents=[trailing]
     )
@@ -130,7 +190,9 @@ def _wrap_display(text: str, width: int) -> list[str]:
     return [*lines, line]
 
 
-def _compact_status(headings: tuple[str, ...], rows: list[tuple[str, ...]], width: int) -> str:
+def _compact_status(
+    headings: tuple[str, ...], rows: list[tuple[str, ...]], width: int, *, color: bool = False
+) -> str:
     """Keep all fields readable when the terminal cannot fit the table headers."""
     label_width = max(map(len, headings)) + 2
     lines: list[str] = []
@@ -138,17 +200,22 @@ def _compact_status(headings: tuple[str, ...], rows: list[tuple[str, ...]], widt
         if lines:
             lines.append("")
         for heading, value in zip(headings, row):
+            # The status is painted per wrapped line, after wrapping, so the
+            # escape codes never reach _display_width.
+            code = _status_code(value) if color and heading == _STATUS_HEADING else ""
             if width < label_width + 2:
                 lines.extend(_wrap_display(heading + ":", width))
-                lines.extend(_wrap_display(value, width))
+                lines.extend(_paint(part, code) for part in _wrap_display(value, width))
                 continue
             for index, part in enumerate(_wrap_display(value, width - label_width)):
                 label = (heading + ":").ljust(label_width) if index == 0 else " " * label_width
-                lines.append(label + part)
+                lines.append(label + _paint(part, code))
     return "\n".join(lines)
 
 
-def format_status(rows: list[dict[str, object]], *, terminal_width: int | None = None) -> str:
+def format_status(
+    rows: list[dict[str, object]], *, terminal_width: int | None = None, color: bool = False
+) -> str:
     if not rows:
         return "No matching tasks."
     headings = ("ISSUE", "STATUS", "CURRENT TASK", "AGENT", "TOKENS", "COST", "TIME", "UPDATED")
@@ -177,7 +244,7 @@ def format_status(rows: list[dict[str, object]], *, terminal_width: int | None =
     minimums = list(map(_display_width, headings))
     gaps = 2 * (len(headings) - 1)
     if sum(minimums) + gaps > terminal_width:
-        return _compact_status(headings, values, terminal_width)
+        return _compact_status(headings, values, terminal_width, color=color)
     fixed_width = sum(widths) - widths[2] + 2 * (len(headings) - 1)
     widths[2] = min(widths[2], max(len(headings[2]), min(60, terminal_width - fixed_width)))
     # Long agent names/statuses must not force the terminal to wrap the whole row.
@@ -186,29 +253,38 @@ def format_status(rows: list[dict[str, object]], *, terminal_width: int | None =
         excess = sum(widths) + gaps - terminal_width
         widths[column] -= min(excess, widths[column] - minimums[column])
 
+    def pad(cells: list[str]) -> list[str]:
+        return [
+            cell + " " * (widths[i] - _display_width(cell)) for i, cell in enumerate(cells)
+        ]
+
     def render(row: tuple[str, ...]) -> str:
-        return "  ".join(value + " " * (widths[i] - _display_width(value))
-                         for i, value in enumerate(row))
+        return "  ".join(pad(list(row)))
 
     header = render(headings)
     separator = "  ".join("-" * width for width in widths)
     body: list[str] = []
     for row in values:
         wrapped = [_wrap_display(cell, width) for cell, width in zip(row, widths)]
+        # Pad first, paint second: escape codes must never reach _display_width,
+        # or every column to the right of STATUS would shift.
+        code = _status_code(row[_STATUS_COLUMN]) if color else ""
         for index in range(max(map(len, wrapped))):
-            cells = [parts[index] if index < len(parts) else "" for parts in wrapped]
-            body.append(render(tuple(cells)))
+            cells = pad([parts[index] if index < len(parts) else "" for parts in wrapped])
+            cells[_STATUS_COLUMN] = _paint(cells[_STATUS_COLUMN], code)
+            body.append("  ".join(cells))
     return "\n".join((header, separator, *body))
 
 
-def format_report(rows: list[dict[str, object]]) -> str:
+def format_report(rows: list[dict[str, object]], *, color: bool = False) -> str:
     """Render cumulative wall/agent/check time and tokens for Issues and plan tasks."""
     if not rows:
         return "No matching tasks."
     sections: list[str] = []
     for row in rows:
         summary = (
-            f"#{row['issue_number']} {row['title']} [{row['status']}]  "
+            f"#{row['issue_number']} {row['title']} "
+            f"[{_paint(str(row['status']), _status_code(str(row['status'])) if color else '')}]  "
             f"wall={_format_duration({'total_duration_ms': row.get('total_wall_duration_ms')})}  "
             f"queue={_format_duration({'total_duration_ms': row.get('total_queue_duration_ms')})}  "
             f"agent={_format_duration(row)}  "
@@ -238,16 +314,22 @@ def format_report(rows: list[dict[str, object]]) -> str:
             for index in range(len(headings))
         ]
 
-        def render(cells: tuple[str, ...], *, widths: list[int] = widths) -> str:
-            return "  ".join(
+        def pad(item: tuple[str, ...], *, widths: list[int] = widths) -> list[str]:
+            return [
                 cell + " " * (widths[index] - _display_width(cell))
-                for index, cell in enumerate(cells)
-            )
+                for index, cell in enumerate(item)
+            ]
+
+        def render(item: tuple[str, ...], *, row_color: bool = False) -> str:
+            cells = pad(item)
+            if row_color:
+                cells[_STATUS_COLUMN] = _paint(cells[_STATUS_COLUMN], _status_code(item[_STATUS_COLUMN]))
+            return "  ".join(cells)
 
         table = [
             render(headings),
             "  ".join("-" * width for width in widths),
-            *(render(item) for item in values),
+            *(render(item, row_color=color) for item in values),
         ]
         sections.append(summary + "\n" + "\n".join(table))
     return "\n\n".join(sections)
@@ -360,13 +442,23 @@ async def async_main(args: argparse.Namespace) -> int:
     except OSError as exc:
         print(f"error: cannot read config file {args.config}: {exc}", file=sys.stderr)
         return 2
+    # Only the human-readable tables get a color decision; the JSON branch is
+    # consumed by scripts that would choke on escape codes.
     if args.command == "status":
         rows = StateStore(config.state_db).status_rows(active_only=args.active)
-        print(json.dumps(rows, ensure_ascii=False, indent=2) if args.json else format_status(rows))
+        print(
+            json.dumps(rows, ensure_ascii=False, indent=2)
+            if args.json
+            else format_status(rows, color=_color_enabled(args.color))
+        )
         return 0
     if args.command == "report":
         rows = StateStore(config.state_db).report_rows(args.issue)
-        print(json.dumps(rows, ensure_ascii=False, indent=2) if args.json else format_report(rows))
+        print(
+            json.dumps(rows, ensure_ascii=False, indent=2)
+            if args.json
+            else format_report(rows, color=_color_enabled(args.color))
+        )
         return 0
     if args.command == "reset":
         return await reset_issue(config, args.issue, no_label=args.no_label)

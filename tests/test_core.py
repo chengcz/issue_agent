@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -1585,6 +1586,172 @@ def test_report_parser_and_human_format():
     assert "#7 Improve runner [done]" in output
     assert "Add metrics" in output
     assert "tokens=120" in output
+
+
+ANSI_SGR = re.compile(r"\033\[[0-9;]*m")
+
+
+def strip_color(text: str) -> str:
+    return ANSI_SGR.sub("", text)
+
+
+def painted_codes(text: str, status: str) -> list[str]:
+    """The SGR codes wrapped around `status` where the STATUS column rendered it."""
+    return [
+        code
+        for code, value in re.findall(r"\033\[([0-9;]+)m(.*?)\033\[0m", text)
+        if value.strip() == status
+    ]
+
+
+def status_row(status: str, number: int = 7) -> dict[str, object]:
+    return {
+        "issue_number": number,
+        "status": status,
+        "title": "Check CLI",
+        "agent": "codex",
+        "updated_at": "2026-08-28T12:34:56+00:00",
+    }
+
+
+def report_row(status: str = "done", task_status: str = "done") -> dict[str, object]:
+    return {
+        "issue_number": 7,
+        "title": "Improve runner",
+        "status": status,
+        "total_input_tokens": 100,
+        "total_output_tokens": 20,
+        "total_duration_ms": 1000,
+        "total_check_duration_ms": 2000,
+        "total_wall_duration_ms": 4000,
+        "total_cost_usd": 0.01,
+        "tasks": [
+            {
+                "seq": 0,
+                "title": "Add metrics",
+                "status": task_status,
+                "attempts": 1,
+                "total_input_tokens": 100,
+                "total_output_tokens": 20,
+                "total_duration_ms": 1000,
+                "total_check_duration_ms": 2000,
+                "total_wall_duration_ms": 3500,
+            }
+        ],
+    }
+
+
+def test_status_color_is_off_unless_it_is_asked_for():
+    assert "\033[" not in format_status([status_row("coding")])
+    assert painted_codes(format_status([status_row("coding")], color=True), "coding")
+
+
+def test_status_color_groups_the_workflow_states_by_meaning():
+    statuses = [str(status) for status in TaskStatus]
+    text = format_status(
+        [status_row(status, number) for number, status in enumerate(statuses, 1)], color=True
+    )
+    codes = {status: painted_codes(text, status) for status in statuses}
+
+    assert all(len(found) == 1 for found in codes.values()), codes
+    for group in (
+        ("claimed", "planning", "coding", "testing", "reviewing", "pushing"),
+        ("pending", "planned"),
+        ("human_review", "split"),
+        ("done",),
+        ("failed", "blocked"),
+    ):
+        assert len({codes[status][0] for status in group}) == 1, group
+    # Five meanings must be five distinguishable colors, or the column says nothing.
+    assert len({codes[status][0] for status in ("coding", "pending", "human_review", "done", "failed")}) == 5
+
+
+def test_status_color_never_moves_a_column():
+    rows = [status_row(status, number) for number, status in enumerate(("pending", "coding", "done"), 1)]
+    assert strip_color(format_status(rows, color=True)) == format_status(rows)
+
+
+def test_status_color_survives_the_narrow_layout():
+    rows = [status_row("failed")]
+    colored = format_status(rows, terminal_width=20, color=True)
+
+    assert strip_color(colored) == format_status(rows, terminal_width=20)
+    assert painted_codes(colored, "failed")
+
+
+def test_report_colors_the_summary_and_the_task_table():
+    rows = [report_row()]
+    colored = format_report(rows, color=True)
+
+    assert strip_color(colored) == format_report(rows)
+    # The `[status]` bracket in the summary plus the STATUS cell in the task table.
+    assert len(painted_codes(colored, "done")) == 2
+
+
+def test_color_choice_and_environment_decide_whether_codes_are_emitted():
+    from issue_agent.cli import _color_enabled
+
+    tty = SimpleNamespace(isatty=lambda: True)
+    pipe = SimpleNamespace(isatty=lambda: False)
+
+    assert _color_enabled("auto", stream=tty, environ={}) is True
+    assert _color_enabled("auto", stream=pipe, environ={}) is False
+    assert _color_enabled("always", stream=pipe, environ={}) is True
+    assert _color_enabled("never", stream=tty, environ={}) is False
+    # NO_COLOR is honored, but an explicit --color=always is a stronger request.
+    assert _color_enabled("auto", stream=tty, environ={"NO_COLOR": "1"}) is False
+    assert _color_enabled("always", stream=tty, environ={"NO_COLOR": "1"}) is True
+    assert _color_enabled("auto", stream=tty, environ={"TERM": "dumb"}) is False
+
+
+def test_color_flag_is_accepted_by_status_and_report_only():
+    assert parser().parse_args(["status"]).color == "auto"
+    assert parser().parse_args(["report", "--color", "never"]).color == "never"
+    with pytest.raises(SystemExit):
+        parser().parse_args(["status", "--color", "sometimes"])
+
+
+CONFIG_TEMPLATE = """\
+[runtime]
+repo = "."
+state_db = "state.db"
+log_dir = "logs"
+dry_run = false
+[github]
+repo = "a/b"
+ready_label = "go-agent"
+[agents.codex]
+command = "codex exec -"
+"""
+
+
+def test_json_output_is_never_painted_even_when_color_is_forced(tmp_path, monkeypatch, capsys):
+    from issue_agent.cli import async_main
+
+    config_file = tmp_path / "issue-agent.toml"
+    config_file.write_text(CONFIG_TEMPLATE)
+    config = load_config(config_file)
+    monkeypatch.setattr("issue_agent.cli.load_config", lambda path: config)
+    state = StateStore(config.state_db)
+    state.claim(Issue(7, "Check CLI", "Body"), "codex")
+    state.update(7, TaskStatus.CODING)
+
+    def render(*, as_json: bool) -> str:
+        args = Namespace(
+            command="status", json=as_json, active=False, color="always",
+            config=str(config_file), verbose=False,
+        )
+        assert asyncio.run(async_main(args)) == 0
+        return capsys.readouterr().out
+
+    machine = render(as_json=True)
+    assert json.loads(machine)[0]["status"] == "coding"
+    assert "\033[" not in machine
+
+    # Same flags, human format: the color machinery must actually be reachable,
+    # so the machine-readable assertion above cannot pass for the wrong reason.
+    human = render(as_json=False)
+    assert "coding" in human and "\033[" in human
 
 
 def test_state_records_issue_task_and_failed_call_metrics(tmp_path):

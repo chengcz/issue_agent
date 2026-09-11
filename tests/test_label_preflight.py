@@ -173,9 +173,9 @@ def test_non_startup_commands_skip_label_preflight(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "preflight_labels", forbidden_preflight)
 
     base = {"config": str(config_file), "verbose": False}
-    status_args = Namespace(command="status", active=False, json=False, **base)
+    status_args = Namespace(command="status", active=False, json=False, color="auto", **base)
     assert asyncio.run(cli.async_main(status_args)) == 0
-    report_args = Namespace(command="report", issue=None, json=False, **base)
+    report_args = Namespace(command="report", issue=None, json=False, color="auto", **base)
     assert asyncio.run(cli.async_main(report_args)) == 0
     # no task row for #99 -> reset exits 1, but only after skipping the preflight
     reset_args = Namespace(command="reset", issue=99, no_label=True, **base)

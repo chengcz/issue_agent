@@ -334,6 +334,21 @@ TIME 有值；无数据时显示 `-`。`--json` 输出含全部累积字段（`t
 中文和全角字符按两列计算，英文优先在单词边界换行。其他过长列也会换行并保持对齐。
 终端窄到无法容纳表头时，自动改为逐条 Issue 的字段列表，保留所有字段；`--json` 不受影响。
 
+`status` 与 `report` 的 `STATUS` 列会按工作流含义着色，一眼看出该谁动：
+
+| 类别 | 颜色 | 状态 |
+|---|---|---|
+| worker 正在跑 | 青 | `claimed`、`planning`、`coding`、`testing`、`reviewing`、`pushing` |
+| 等人工加 `agent-ready` | 黄 | `pending`、`planned` |
+| 已欠人工决策 | 品红 | `human_review`、`split` |
+| 已完成 | 绿 | `done` |
+| 出错，需 `reset` | 红 | `failed`、`blocked` |
+
+默认 `--color auto`：只在输出是终端时上色，管道、重定向到文件、CI 里都不产生转义码；
+`NO_COLOR` 与 `TERM=dumb` 同样视为要求无色。需要强制时用 `--color always`（例如
+`... | less -R`），关掉用 `--color never`。`--json` 永远不带颜色，不受该选项影响。
+着色只作用于 `STATUS` 列，且在列宽计算之后套用，因此不影响其他列的对齐与自动换行。
+
 `report` 同时输出 Issue 的 `queue`/`wall` 以及各 plan task 的累计 `wall`、`agent`、`checks`、
 token、cost 和 attempts；
 `--json` 还包含逐次 `issue_runs`，适合后续导入监控系统。失败和超时的 Agent 调用也计入统计。
