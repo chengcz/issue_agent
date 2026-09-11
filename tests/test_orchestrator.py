@@ -1345,6 +1345,37 @@ def test_split_retry_creates_only_the_missing_children(tmp_path):
     assert "split_created" in names(app)
 
 
+@pytest.mark.parametrize("failure_stage", ["creation", "linking"])
+def test_implementation_split_retry_reuses_recorded_children(tmp_path, failure_stage):
+    app = split_app(tmp_path)
+    proposes_split(app)
+    issue = Issue(4, "Too big", "Do everything", labels=("agent-ready",))
+    if failure_stage == "creation":
+        app.github.create_issue.side_effect = [(12, "u12"), CommandError("temporary failure")]
+    else:
+        app.github.link_parent.side_effect = [None, CommandError("temporary failure")]
+
+    run_process(app, issue)
+    assert app.state.rows()[0]["status"] == str(TaskStatus.FAILED)
+    assert app.state.load_split(4)[0].number == 12
+
+    proposes_split(app, '{"split": [{"title": "Different proposal", "body": "B"}]}')
+    app.github.create_issue.reset_mock()
+    app.github.create_issue.side_effect = [(13, "u13")]
+    app.github.link_parent.reset_mock()
+    app.github.link_parent.side_effect = None
+    run_process(app, issue)
+
+    app.agents["planner"].execute.assert_not_awaited()
+    assert [child.number for child in app.state.load_split(4)] == [12, 13]
+    assert app.github.create_issue.await_count == (1 if failure_stage == "creation" else 0)
+    if failure_stage == "linking":
+        app.github.link_parent.assert_awaited_once_with(13, 4)
+    app.github.add_blocked_by.assert_awaited_once_with(13, 12)
+    assert app.state.rows()[0]["status"] == str(TaskStatus.SPLIT)
+    assert "split_reused" in names(app)
+
+
 def test_split_without_a_usable_issue_number_fails_the_plan(tmp_path):
     app = split_app(tmp_path, children=[(0, "")])
     proposes_split(app)

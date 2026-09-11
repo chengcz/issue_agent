@@ -117,8 +117,8 @@ async def run(
         stdin_task = asyncio.create_task(feed())
 
     try:
-        stdout, stderr = await asyncio.wait_for(
-            asyncio.gather(stdout_task, stderr_task), timeout=timeout
+        stdout, stderr, returncode = await asyncio.wait_for(
+            asyncio.gather(stdout_task, stderr_task, process.wait()), timeout=timeout
         )
     except TimeoutError:
         await terminate_process_tree()
@@ -133,7 +133,7 @@ async def run(
         if stdin_task is not None and not stdin_task.done():
             stdin_task.cancel()
     result = Result(
-        process.returncode or 0,
+        returncode,
         stdout.decode(errors="replace"),
         stderr.decode(errors="replace"),
         duration_ms=int((time.monotonic() - started) * 1000),

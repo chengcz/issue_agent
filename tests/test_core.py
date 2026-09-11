@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sys
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -562,7 +563,7 @@ def test_result_has_duration_and_usage_fields():
 
 def test_run_measures_duration(tmp_path: Path):
     """process.run() always populates duration_ms with wall-clock milliseconds."""
-    result = asyncio.run(shell("sleep 0.05", cwd=tmp_path))
+    result = asyncio.run(run([sys.executable, "-c", "import time; time.sleep(0.05)"], cwd=tmp_path))
     assert result.duration_ms is not None
     assert result.duration_ms >= 40  # allow small timing slack
 
@@ -571,9 +572,10 @@ def test_run_caps_captured_output_for_runaway_commands(tmp_path: Path):
     """A command streaming ~11 MiB is truncated at the capture cap with an
     explicit marker instead of buffering gigabytes in memory."""
 
-    big = tmp_path / "big.txt"
-    big.write_text("x" * (10 * 1024 * 1024 + 1_000_000))
-    result = asyncio.run(run(["cat", str(big)], cwd=tmp_path, check=False, timeout=120))
+    result = asyncio.run(run(
+        [sys.executable, "-c", "import sys; sys.stdout.write('x' * 11534336)"],
+        cwd=tmp_path, check=False, timeout=120,
+    ))
 
     assert result.returncode == 0
     assert len(result.stdout) < 11 * 1024 * 1024
@@ -584,7 +586,7 @@ def test_run_feeds_stdin_and_reads_output(tmp_path: Path):
     """The bounded-capture rewrite still pumps stdin and collects stdout."""
     result = asyncio.run(
         run(
-            ["/bin/sh", "-c", "tr a-z A-Z"],
+            [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read().upper())"],
             cwd=tmp_path,
             stdin="hello issue-agent",
             timeout=30,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -45,20 +46,6 @@ _REVIEW_ATTEMPTS = 2
 
 
 _RUNNING_STATUSES = frozenset(str(status) for status in RUNNING_STATUSES)
-
-
-def _pid_alive(pid: int) -> bool:
-    if os.name == "nt":
-        # os.kill(pid, 0) is not a safe probe on Windows; assume alive so two
-        # instances never fight over one DB.
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # alive, owned by someone else
-    return True
 
 
 class ReviewRejected(CommandError):
@@ -911,27 +898,51 @@ class Orchestrator:
         Nothing in SQLite stops two processes from claiming the same issue, and
         a second instance's ``recover_interrupted`` would mark the first's
         in-flight runs as interrupted and reset rows it is actively working. A
-        lock whose owning process is gone is stale and broken automatically.
+        kernel lock is released automatically if its owning process exits.
+        Keep the file in place: unlinking it lets contenders lock different
+        inodes. The first byte is reserved for Windows byte-range locking;
+        the remaining bytes hold the PID for diagnostics only.
         """
+        if getattr(self, "_instance_lock", None) is not None:
+            return True
         lock_path = self.config.state_db.with_suffix(self.config.state_db.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
-        if lock_path.exists():
+        handle = lock_path.open("a+b", buffering=0)
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
             try:
-                pid = int(lock_path.read_text(encoding="utf-8").strip() or "0")
-            except ValueError:
-                pid = 0
-            if pid and _pid_alive(pid):
-                self._lock_held_by = pid
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                handle.seek(1)
+                try:
+                    self._lock_held_by = int(handle.read().strip() or b"0")
+                except (ValueError, OSError):
+                    self._lock_held_by = 0
                 return False
-            log.warning("breaking stale instance lock (pid %s is gone)", pid)
-        lock_path.write_text(str(os.getpid()), encoding="utf-8")
-        self._instance_lock = lock_path
+            finally:
+                handle.close()
+        try:
+            handle.truncate(0)
+            handle.write(b" " + str(os.getpid()).encode("ascii"))
+        except BaseException:
+            handle.close()
+            raise
+        self._instance_lock = handle
         return True
 
     def release_instance_lock(self) -> None:
-        lock_path = getattr(self, "_instance_lock", None)
-        if lock_path is not None:
-            lock_path.unlink(missing_ok=True)
+        handle = getattr(self, "_instance_lock", None)
+        if handle is not None:
+            handle.close()
             self._instance_lock = None
 
     async def _guarded_process(self, issue: Issue, agent_name: str) -> None:
@@ -1312,6 +1323,13 @@ class Orchestrator:
                 add=("agent-running",),
                 remove=(self.config.ready_label, "agent-planned"),
             )
+
+            recorded_split = self.state.load_split(issue.number)
+            if recorded_split:
+                issue_log.event("split_reused", children=len(recorded_split))
+                await self._complete_split(issue, recorded_split, issue_log=issue_log)
+                outcome = str(TaskStatus.SPLIT)
+                return
 
             plan = self.state.load_plan(issue.number)
             if plan is None:
