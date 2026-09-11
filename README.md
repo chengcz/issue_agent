@@ -315,13 +315,27 @@ CLI 启动时会验证 Agent 名称、并发数、重试次数和 timeout；无�
 先运行一次：
 
 ```bash
-issue-agent --config issue-agent.toml once
-issue-agent --config issue-agent.toml status
-issue-agent --config issue-agent.toml status --active
-issue-agent --config issue-agent.toml status --json
-issue-agent --config issue-agent.toml report
-issue-agent --config issue-agent.toml report --issue 42 --json
+issue-agent once
+issue-agent status
+issue-agent status --active
+issue-agent status --json
+issue-agent report
+issue-agent report --issue 42 --json
 ```
+
+配置文件不必每次写出来：不带 `-c`/`--config` 时，issue-agent 按「当前目录 → 上一级 →
+再上一级」的顺序查找 `issue-agent.toml`，取最近的一个。所以从项目的任意子目录里运行都能
+找到同一份配置，`state.db`、`logs/` 等相对路径始终相对配置文件所在目录解析。三层都没有
+就报错退出（退出码 2），并列出实际找过的目录：
+
+```
+error: no issue-agent.toml found in /srv/app/src/api, /srv/app/src, /srv/app; pass --config/-c to point at one
+```
+
+`-c` 是 `--config` 的同义写法，放在子命令前后都行（`-c bioagent.toml status` 与
+`status -c bioagent.toml` 等价）。显式给出的路径**不会被再向上搜索**：文件不存在就直接
+报错，避免误跑到另一份配置上。部署里同时管理多个仓库时（如 `/etc/issue-agent/repo-a.toml`）
+仍应显式指定。
 
 `status` 输出列：`ISSUE`、`STATUS`、`CURRENT TASK`、`AGENT`、`TOKENS`（输入+输出 token 合计，
 k/M 紧凑格式）、`COST`（累计美元开销）、`TIME`（累计 Agent 壁钟耗时）与 `UPDATED`。TOKENS/COST

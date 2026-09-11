@@ -1863,7 +1863,9 @@ def test_format_status_handles_missing_usage_keys():
 def test_cli_uses_public_issue_agent_name():
     command = parser()
     assert command.prog == "issue-agent"
-    assert command.parse_args(["status"]).config == "issue-agent.toml"
+    # No flag -> discovery, not a literal default: the file is looked up in the
+    # current directory and the two above it (see test_config_discovery.py).
+    assert command.parse_args(["status"]).config is None
 
 
 # --- baseline-aware checks -------------------------------------------------

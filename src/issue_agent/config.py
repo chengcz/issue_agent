@@ -152,6 +152,29 @@ def validate_config(config: Config) -> None:
         )
 
 
+DEFAULT_CONFIG_NAME = "issue-agent.toml"
+
+# How many directories a default-config lookup visits: the starting one and the
+# two above it. Deep enough to run from a nested source dir, shallow enough that
+# an unrelated issue-agent.toml far up the tree cannot capture an invocation.
+_CONFIG_SEARCH_LEVELS = 3
+
+
+def config_search_paths(start: Path | None = None) -> list[Path]:
+    """The directories a default-config lookup visits, nearest first."""
+    directory = (Path.cwd() if start is None else Path(start)).resolve()
+    return [directory, *directory.parents][:_CONFIG_SEARCH_LEVELS]
+
+
+def find_config(start: Path | None = None, *, name: str = DEFAULT_CONFIG_NAME) -> Path | None:
+    """The nearest ``name`` among :func:`config_search_paths`, or ``None``."""
+    for directory in config_search_paths(start):
+        path = directory / name
+        if path.is_file():
+            return path
+    return None
+
+
 def load_config(path: str | Path) -> Config:
     config_path = Path(path).resolve()
     with config_path.open("rb") as handle:

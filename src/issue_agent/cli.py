@@ -11,7 +11,7 @@ import tomllib
 import unicodedata
 from functools import lru_cache
 
-from .config import load_config
+from .config import DEFAULT_CONFIG_NAME, config_search_paths, find_config, load_config
 from .github import GitHub, required_label_specs
 from .orchestrator import Orchestrator
 from .process import CommandError
@@ -84,10 +84,15 @@ def parser() -> argparse.ArgumentParser:
     # and — with SUPPRESS defaults so they never clobber already-parsed values —
     # on every subparser, because `status --config x` is the natural CLI order.
     leading = argparse.ArgumentParser(add_help=False)
-    leading.add_argument("--config", default="issue-agent.toml")
+    leading.add_argument(
+        "-c",
+        "--config",
+        help=f"config file to use (default: the nearest {DEFAULT_CONFIG_NAME}, searched from "
+        "the current directory up two levels)",
+    )
     leading.add_argument("--verbose", action="store_true")
     trailing = argparse.ArgumentParser(add_help=False)
-    trailing.add_argument("--config", default=argparse.SUPPRESS)
+    trailing.add_argument("-c", "--config", default=argparse.SUPPRESS)
     trailing.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS)
 
     result = argparse.ArgumentParser(prog="issue-agent", parents=[leading])
@@ -428,19 +433,34 @@ async def preflight_labels(config) -> int:
 
 
 async def async_main(args: argparse.Namespace) -> int:
+    # `-c`/`--config` is an answer, not a hint: when it is set, a missing file is
+    # a plain error. Only the default is looked up, so running from a nested
+    # directory finds the project's config without the user spelling out a path.
+    config_path = args.config
+    if config_path is None:
+        discovered = find_config()
+        if discovered is None:
+            searched = ", ".join(str(directory) for directory in config_search_paths())
+            print(
+                f"error: no {DEFAULT_CONFIG_NAME} found in {searched}; "
+                f"pass --config/-c to point at one",
+                file=sys.stderr,
+            )
+            return 2
+        config_path = str(discovered)
     try:
-        config = load_config(args.config)
+        config = load_config(config_path)
     except FileNotFoundError:
-        print(f"error: config file not found: {args.config}", file=sys.stderr)
+        print(f"error: config file not found: {config_path}", file=sys.stderr)
         return 2
     except tomllib.TOMLDecodeError as exc:
-        print(f"error: config file is not valid TOML ({args.config}): {exc}", file=sys.stderr)
+        print(f"error: config file is not valid TOML ({config_path}): {exc}", file=sys.stderr)
         return 2
     except ValueError as exc:
-        print(f"error: invalid configuration ({args.config}): {exc}", file=sys.stderr)
+        print(f"error: invalid configuration ({config_path}): {exc}", file=sys.stderr)
         return 2
     except OSError as exc:
-        print(f"error: cannot read config file {args.config}: {exc}", file=sys.stderr)
+        print(f"error: cannot read config file {config_path}: {exc}", file=sys.stderr)
         return 2
     # Only the human-readable tables get a color decision; the JSON branch is
     # consumed by scripts that would choke on escape codes.
