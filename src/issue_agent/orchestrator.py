@@ -830,7 +830,8 @@ class Orchestrator:
             if active >= self.config.max_active_issues:
                 # Implementation capacity is spent on finishing the issue
                 # already in flight; this candidate waits for a later poll.
-                # Planning below still runs: it does not delay completion.
+                # (Human-released work is still honored immediately — the
+                # lookahead throttle lives in the planning gate below.)
                 continue
             active += 1
             self._track(issue.number, self._guarded_process(issue, agent_name), kind="implementation")
@@ -839,8 +840,31 @@ class Orchestrator:
         if planner_name and planner_name not in self.agents:
             log.error("unknown or disabled planner agent: %s", planner_name)
             return
+        # The machine's lookahead budget: every issue it already owns — being
+        # planned, planned and awaiting release, being implemented, or waiting
+        # on a budgeted retry — plus anything tracked this poll. Linear mode
+        # (the default, max_active_issues = 1) plans nothing new while any
+        # issue is inside the machine, so planner tokens are spent only when
+        # the queue can actually reach that work next, instead of burning a
+        # planner run on every unlabeled issue up front.
+        busy = {
+            number
+            for number, row in persisted.items()
+            if row["status"] in _RUNNING_STATUSES
+            or row["status"] == str(TaskStatus.PLANNED)
+            or (
+                row["status"] in (str(TaskStatus.FAILED), str(TaskStatus.BLOCKED))
+                and int(row["failures"]) < self.config.max_attempts
+            )
+        } | set(self.running)
+        planning.sort(key=completion_rank)
         for issue in planning:
             if issue.number in self.running:
+                continue
+            # A candidate that is itself part of the pipeline (a stranded
+            # PLANNED row republishing, a retry re-planning) must not count
+            # against its own admission.
+            if len(busy - {issue.number}) >= self.config.max_active_issues:
                 continue
             try:
                 if not self._eligible(persisted.get(issue.number), planning=True):
@@ -852,6 +876,7 @@ class Orchestrator:
             except CommandError as exc:
                 log.error("issue #%s: admission failed; skipping candidate this poll: %s", issue.number, exc)
                 continue
+            busy.add(issue.number)
             self._track(issue.number, self._guarded_plan_only(issue, planner_name), kind="planning")
 
         await self._release_answered_clarifications(persisted)

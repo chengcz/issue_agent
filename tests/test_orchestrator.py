@@ -915,9 +915,10 @@ def test_run_once_resumes_a_started_issue_before_a_fresh_one(tmp_path):
     assert admitted == [(7, "implementation")]
 
 
-def test_coding_cap_does_not_delay_planning(tmp_path):
-    """The active-issue cap throttles implementation only: planning another
-    issue while one is coded does not delay the in-flight issue's completion."""
+def test_planning_waits_while_the_machine_is_busy(tmp_path):
+    """Linear mode: while an issue is inside the machine, no planner tokens are
+    spent preparing the next one — planning resumes only once the machine has
+    room (in-flight task finished, no pipeline rows)."""
     app = make_orchestrator(tmp_path)
     app._kinds = {4: "implementation"}
     app.running = {4: Mock()}
@@ -930,7 +931,57 @@ def test_coding_cap_does_not_delay_planning(tmp_path):
 
     asyncio.run(app.run_once())
 
+    assert admitted == []
+
+    # Machine empty again: the candidate is planned on the next poll.
+    app.running = {}
+    app._kinds = {}
+    asyncio.run(app.run_once())
     assert admitted == [(9, "planning")]
+
+
+def test_planning_lookahead_is_capped_by_issues_already_owned(tmp_path):
+    """A row parked at PLANNED (plan published, awaiting human release) still
+    occupies the machine's quota, so no second issue is planned behind it."""
+    app = make_orchestrator(tmp_path)
+    app.state.claim_for_planning(Issue(number=7, title="Waiting", body="B"), "planner")
+    app.state.update(7, TaskStatus.PLANNED)
+    candidate = Issue(9, "Needs planning", "A vague request")
+    app.github.runnable_issues = AsyncMock(return_value=[])
+    app.github.unassigned_issues = AsyncMock(return_value=[candidate])
+    app._dependency_gate = AsyncMock(return_value=False)
+    admitted: list[int] = []
+    app._track = _track_recorder(admitted)
+
+    asyncio.run(app.run_once())
+
+    assert admitted == []
+
+    # With room for two, the lookahead may prepare one more.
+    app.config.max_active_issues = 2
+    asyncio.run(app.run_once())
+    assert admitted == [(9, "planning")]
+
+
+def test_a_retrying_issue_does_not_block_planning_beyond_the_quota(tmp_path):
+    """A FAILED row still under its retry budget occupies the quota, but the
+    retry candidate itself is never blocked by its own row."""
+    app = make_orchestrator(tmp_path)
+    app.state.claim(Issue(number=7, title="Retry", body="B"), "worker")
+    app.state.record_failure(7, TaskStatus.FAILED, "boom")  # failures=1 < 2
+    candidate = Issue(7, "Retry", body="B", labels=("agent-ready",))
+    fresh = Issue(9, "Needs planning", "A vague request")
+    app.github.runnable_issues = AsyncMock(return_value=[candidate])
+    app.github.unassigned_issues = AsyncMock(return_value=[fresh])
+    app._dependency_gate = AsyncMock(return_value=False)
+    admitted: list[int] = []
+    app._track = _track_recorder(admitted)
+
+    asyncio.run(app.run_once())
+
+    # The retry is admitted (its own row never counts against it); the fresh
+    # planning candidate waits — the machine is at its quota of one.
+    assert admitted == [(7, "implementation")]
 
 
 def test_run_once_admits_a_ready_issue_once_its_blockers_close(tmp_path):

@@ -6,9 +6,12 @@ log_dir = "/opt/agent-dev/logs"
 poll_seconds = 60
 fetch_ttl_seconds = 30
 max_workers = 3
-# max_active_issues: how many issues may be implemented at once. 1 (default)
-#   finishes one issue end to end before starting the next; raise it to spread
-#   agent capacity across several in-flight issues.
+# max_active_issues: how many issues the machine may own at once — being
+#   planned, planned-and-awaiting-release, or being implemented. 1 (default)
+#   is fully linear: one issue runs end to end (plan -> code -> review -> PR)
+#   and the planner stays idle until the machine is empty again, so no planner
+#   tokens are spent preparing work the queue cannot reach yet. Raise it to
+#   spread capacity across several in-flight issues.
 max_active_issues = 1
 max_attempts = 3
 max_task_attempts = 2
